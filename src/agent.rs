@@ -22,10 +22,17 @@ fn read_file(path: String) -> Result<String, rig::tool::ToolExecutionError> {
 pub const PREAMBLE: &str = "You are a helpful assistant.";
 pub const DEFAULT_MODEL: &str = "openai/gpt-5.6-luna";
 
-pub fn build() -> Result<impl Chat> {
-    let model = std::env::var("AGENT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
+/// The model this process will use, after the `AGENT_MODEL` override.
+///
+/// Recorded on every run so a session's cost can be attributed to the model
+/// that produced it.
+pub fn model() -> String {
+    std::env::var("AGENT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into())
+}
+
+pub fn build(model: &str) -> Result<rig::agent::Agent> {
     Ok(rig::core::providers::openrouter::Client::from_env()?
-        .agent(&model)
+        .agent(model)
         .preamble(PREAMBLE)
         .tool(Add)
         .tool(ReadFile)

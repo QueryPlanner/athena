@@ -17,3 +17,8 @@ echo
 echo "-- stored messages --"
 sqlite3 agent.db "SELECT seq, substr(json,1,110) FROM messages WHERE session_id='testsess' ORDER BY seq;" \
   || echo "(sqlite3 not installed - skip)"
+
+echo
+echo "-- run telemetry --"
+sqlite3 agent.db "SELECT model_calls, first_seq, last_seq, input_tokens, output_tokens, status
+                  FROM runs ORDER BY started_at;" || echo "(sqlite3 not installed - skip)"
