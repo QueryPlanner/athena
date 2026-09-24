@@ -13,9 +13,13 @@ Edit `src/agent.rs`. That is the only file that changes.
     pub const PREAMBLE: &str = "...";       // set the system prompt
     pub const DEFAULT_MODEL: &str = "...";  // set the model
 
-    pub fn build() -> Result<impl Chat> {
-        ... .tool(MyTool) ...               // register them
+    pub fn configure(builder: AgentBuilder) -> Agent {
+        builder ... .tool(MyTool) ...       // register them
     }
+
+`configure` is the agent's whole definition. Production wraps it around the
+OpenRouter client; the tests wrap it around Rig's mock model, so they run the
+same preamble and tools you ship.
 
 Everything else — session storage, the turn loop, the CLI — stays as is.
 
@@ -29,16 +33,27 @@ Everything else — session storage, the turn loop, the CLI — stays as is.
     cargo run -- research "some prompt"       # one-shot, same session
     cargo run -- sessions                     # list sessions
     cargo run -- usage                        # per-session token totals
-    ./test.sh                                 # persistence test, two processes
+    ATHENA_DB=/tmp/x.db cargo run -- ...      # use another database file
 
 Same session name resumes the conversation, tool history included.
 
 ## Layout
 
     src/agent.rs    <- you edit this
-    src/store.rs       open / load / save / save_run   (two tables)
-    src/runner.rs      the Run trait, turn() and the REPL
-    src/main.rs        arg parsing and wiring
+    src/store.rs       open + migrations / load / save / save_run
+    src/runner.rs      the Run trait and turn()
+    src/cli.rs         argument dispatch and the REPL
+    src/main.rs        wiring: real database, provider, stdin/stdout
+    tests/             integration tests, upgrade fixtures, schema snapshot
+    scripts/           coverage gate and live end-to-end test
+
+## Test
+
+    ./scripts/coverage.sh                     # all tests + 100% line coverage
+    ./scripts/e2e.sh                          # live, against OpenRouter
+
+[TESTING.md](TESTING.md) covers the three test layers, the rules for schema
+changes, and how an AI agent runs and extends the end-to-end test.
 
 `runner::turn()` is load -> chat -> save. That function is the entire service;
 an HTTP handler would be a wrapper around it.
@@ -74,12 +89,20 @@ fatal: losing a cost row must never cost you a reply.
 
 ## How persistence works
 
-`agent.chat(input, &mut history)` appends the user message, every tool call,
-every tool result and the assistant reply into `history`. That vec is
-serialised into one SQLite table, one row per message, stored as opaque Rig
-JSON. There is no item taxonomy of our own because Rig's `Message` already
-encodes tool calls and results — and keeping it opaque means a rig upgrade
-can't break the database.
+A turn returns every message it produced: the user message, each tool call,
+each tool result and the assistant reply. `runner::turn` appends them to the
+loaded history and saves it to one SQLite table, one row per message, stored
+as opaque Rig JSON. There is no item taxonomy of our own because Rig's
+`Message` already encodes tool calls and results, and keeping it opaque means
+a Rig upgrade does not need a schema change. `tests/upgrade.rs` checks that
+rows written by earlier builds still load and survive the next save byte for
+byte.
+
+The schema is versioned with `PRAGMA user_version`. `store::open` applies any
+missing migrations in one transaction, refuses a database written by a newer
+build, and refuses a table whose columns it does not expect. Existing
+`agent.db` files upgrade in place. The rules for adding a migration are in
+TESTING.md.
 
 Inspect a session:
 

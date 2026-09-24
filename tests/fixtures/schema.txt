@@ -1,0 +1,28 @@
+user_version 2
+
+table messages
+  session_id TEXT NOT NULL PK1
+  seq INTEGER NOT NULL PK2
+  json TEXT NOT NULL
+
+table runs
+  run_id TEXT PK1
+  session_id TEXT NOT NULL
+  started_at INTEGER NOT NULL
+  ended_at INTEGER NOT NULL
+  model TEXT NOT NULL
+  status TEXT NOT NULL
+  error TEXT
+  first_seq INTEGER NOT NULL
+  last_seq INTEGER NOT NULL
+  input_tokens INTEGER NOT NULL DEFAULT 0
+  output_tokens INTEGER NOT NULL DEFAULT 0
+  total_tokens INTEGER NOT NULL DEFAULT 0
+  cached_input_tokens INTEGER NOT NULL DEFAULT 0
+  cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0
+  reasoning_tokens INTEGER NOT NULL DEFAULT 0
+  tool_use_prompt_tokens INTEGER NOT NULL DEFAULT 0
+  model_calls INTEGER NOT NULL DEFAULT 0
+  calls_json TEXT NOT NULL
+
+index runs_by_session ON runs (session_id, started_at)

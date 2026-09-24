@@ -6,7 +6,6 @@ use rig_agent::agent::{Agent, PromptResponse};
 use rig_agent::completion::PromptError;
 use rig_agent::prelude::{Message, Prompt};
 use rusqlite::Connection;
-use std::io::{BufRead, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One agent run, returning everything Rig reports rather than just the reply.
@@ -51,19 +50,19 @@ fn now_millis() -> i64 {
 /// the response and it dominates row size. On by default, off via
 /// `RUNS_STORE_RAW=0` for deployments where either matters.
 fn store_raw() -> bool {
-    !matches!(
-        std::env::var("RUNS_STORE_RAW").as_deref(),
-        Ok("0") | Ok("false")
-    )
+    keep_raw(std::env::var("RUNS_STORE_RAW").ok().as_deref())
+}
+
+fn keep_raw(setting: Option<&str>) -> bool {
+    !matches!(setting, Some("0" | "false"))
 }
 
 /// Serialise the run's completion calls, dropping `raw` unless it is wanted.
 fn calls_json(response: &PromptResponse, keep_raw: bool) -> String {
-    let mut value = match serde_json::to_value(&response.completion_calls) {
-        Ok(value) => value,
-        // Telemetry must never fail a turn that already succeeded.
-        Err(e) => return format!(r#"{{"serialize_error":"{e}"}}"#),
-    };
+    // Cannot fail: CompletionCall is plain structs, numbers and strings, and
+    // `raw` is already a serde_json::Value. Every map key is a string.
+    let mut value = serde_json::to_value(&response.completion_calls)
+        .expect("CompletionCall always serialises to JSON");
     if !keep_raw && let Some(calls) = value.as_array_mut() {
         for call in calls {
             if let Some(obj) = call.as_object_mut() {
@@ -163,27 +162,6 @@ pub async fn turn<R: Run>(
     reply
 }
 
-pub async fn repl<R: Run>(agent: &R, db: &Connection, session: &str, model: &str) -> Result<()> {
-    let stdin = std::io::stdin();
-    loop {
-        print!("> ");
-        std::io::stdout().flush()?;
-        let mut line = String::new();
-        if stdin.lock().read_line(&mut line)? == 0 {
-            break;
-        }
-        let input = line.trim();
-        if input.is_empty() {
-            continue;
-        }
-        if input == "exit" {
-            break;
-        }
-        println!("{}\n", turn(agent, db, session, model, input).await?);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +255,15 @@ mod tests {
     }
 
     #[test]
+    fn runs_store_raw_is_on_unless_set_to_0_or_false() {
+        assert!(keep_raw(None));
+        assert!(keep_raw(Some("1")));
+        assert!(keep_raw(Some("true")));
+        assert!(!keep_raw(Some("0")));
+        assert!(!keep_raw(Some("false")));
+    }
+
+    #[test]
     fn raw_payloads_are_kept_when_enabled_and_dropped_when_not() {
         let response = tool_using_response();
 
@@ -304,23 +291,7 @@ mod tests {
     }
 
     fn test_db() -> Connection {
-        let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(
-            "CREATE TABLE messages (session_id TEXT NOT NULL, seq INTEGER NOT NULL,
-                 json TEXT NOT NULL, PRIMARY KEY (session_id, seq));
-             CREATE TABLE runs (run_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
-                 started_at INTEGER NOT NULL, ended_at INTEGER NOT NULL, model TEXT NOT NULL,
-                 status TEXT NOT NULL, error TEXT, first_seq INTEGER NOT NULL,
-                 last_seq INTEGER NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0,
-                 output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0,
-                 cached_input_tokens INTEGER NOT NULL DEFAULT 0,
-                 cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
-                 reasoning_tokens INTEGER NOT NULL DEFAULT 0,
-                 tool_use_prompt_tokens INTEGER NOT NULL DEFAULT 0,
-                 model_calls INTEGER NOT NULL DEFAULT 0, calls_json TEXT NOT NULL);",
-        )
-        .unwrap();
-        db
+        store::open_in_memory().unwrap()
     }
 
     #[tokio::test]
@@ -367,5 +338,17 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "error");
         assert!(rows[0].1.as_ref().unwrap().contains("max turns"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_telemetry_write_still_returns_the_reply_and_saves_the_transcript() {
+        let db = test_db();
+        db.execute_batch("DROP TABLE runs").unwrap();
+        let agent = FakeAgent(std::cell::RefCell::new(Some(Ok(tool_using_response()))));
+
+        let reply = turn(&agent, &db, "s", "m", "add 21 and 21").await.unwrap();
+
+        assert_eq!(reply, "42");
+        assert_eq!(store::load(&db, "s").unwrap().len(), 4);
     }
 }
