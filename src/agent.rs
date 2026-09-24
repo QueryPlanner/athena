@@ -41,8 +41,14 @@ pub fn client() -> Result<Client> {
     Ok(Client::from_env()?)
 }
 
-pub fn build(client: &Client, model: &str) -> rig::agent::Agent {
-    configure(client.agent(model))
+/// The production agent. `memory` is where Rig loads and saves each
+/// conversation: `service.memory()`.
+pub fn build(
+    client: &Client,
+    model: &str,
+    memory: impl rig::core::memory::ConversationMemory + 'static,
+) -> rig::agent::Agent {
+    configure(client.agent(model).memory(memory))
 }
 
 /// Everything that makes this agent this agent, independent of the provider.
@@ -90,6 +96,7 @@ mod tests {
         // this needs a real key. Behaviour is covered through `configure`
         // against the mock model in tests/agent_loop.rs.
         let client = Client::new("test-key").unwrap();
-        let _agent = build(&client, DEFAULT_MODEL);
+        let memory = rig::core::memory::InMemoryConversationMemory::new();
+        let _agent = build(&client, DEFAULT_MODEL, memory);
     }
 }

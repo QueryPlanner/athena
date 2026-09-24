@@ -1,46 +1,44 @@
-//! The agent loop. Load history, run a turn, save history and telemetry.
+//! The agent side of a turn: how one is run, and what it cost.
+//!
+//! Loading and saving the transcript is not here. Rig does both through the
+//! conversation memory the agent was built with (`store::SqliteMemory`);
+//! `service::Service::send` wraps the run with ownership, locking and
+//! telemetry.
 
-use crate::store::{self, RunRecord};
-use anyhow::Result;
+use crate::store::{RunRecord, now_millis};
 use rig_agent::agent::{Agent, PromptResponse};
 use rig_agent::completion::PromptError;
-use rig_agent::prelude::{Message, Prompt};
-use rusqlite::Connection;
-use std::time::{SystemTime, UNIX_EPOCH};
+use rig_agent::prelude::Prompt;
+use std::future::Future;
 
-/// One agent run, returning everything Rig reports rather than just the reply.
+/// One agent run in a conversation, returning everything Rig reports rather
+/// than just the reply.
 ///
 /// `Chat::chat` is Rig's convenience surface: it hands back the assistant text
 /// and drops `usage`, `completion_calls` and `content` on the way out. This
 /// template needs those for the `runs` table, so it drives the underlying
-/// request directly. The trait exists so `turn` stays testable without a
-/// provider behind it.
-pub trait Run {
+/// request directly. The trait exists so the service stays testable without
+/// a provider behind it.
+///
+/// `Send + Sync` and a `Send` future, so a transport can share one agent
+/// across tasks and spawn turns on it.
+pub trait Run: Send + Sync {
+    /// Run `prompt` in `conversation`, the session id. The agent's memory
+    /// loads that conversation's history first and appends the turn after.
     fn run(
         &self,
         prompt: &str,
-        history: Vec<Message>,
-    ) -> impl std::future::Future<Output = Result<PromptResponse, PromptError>>;
+        conversation: &str,
+    ) -> impl Future<Output = Result<PromptResponse, PromptError>> + Send;
 }
 
 impl Run for Agent {
-    async fn run(
-        &self,
-        prompt: &str,
-        history: Vec<Message>,
-    ) -> Result<PromptResponse, PromptError> {
+    async fn run(&self, prompt: &str, conversation: &str) -> Result<PromptResponse, PromptError> {
         self.prompt(prompt)
-            .history(history)
+            .conversation(conversation)
             .extended_details()
             .await
     }
-}
-
-fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or_default()
 }
 
 /// Whether to keep each completion call's raw provider response.
@@ -73,25 +71,38 @@ fn calls_json(response: &PromptResponse, keep_raw: bool) -> String {
     value.to_string()
 }
 
-fn record(
-    run_id: String,
-    session: &str,
-    model: &str,
-    started_at: i64,
-    first_seq: i64,
-    outcome: &Result<PromptResponse, PromptError>,
+/// The fields of a run record that do not depend on how it ended.
+pub(crate) struct RunStart<'a> {
+    pub run_id: String,
+    pub session_id: &'a str,
+    pub model: &'a str,
+    pub started_at: i64,
+    /// The seq the run's first message would get.
+    pub first_seq: i64,
+}
+
+/// The telemetry row for one finished run.
+///
+/// `response` is what the model returned, if it returned; its usage is
+/// recorded even when the transcript then failed to save, because those
+/// tokens were paid for. `stored` is the last seq written, or why the run
+/// wrote nothing.
+pub(crate) fn record(
+    start: RunStart<'_>,
+    response: Option<&PromptResponse>,
+    stored: Result<i64, String>,
 ) -> RunRecord {
     let mut rec = RunRecord {
-        run_id,
-        session_id: session.to_string(),
-        started_at,
+        run_id: start.run_id,
+        session_id: start.session_id.to_string(),
+        started_at: start.started_at,
         ended_at: now_millis(),
-        model: model.to_string(),
+        model: start.model.to_string(),
         status: "ok".into(),
         error: None,
-        first_seq,
+        first_seq: start.first_seq,
         // A run that appends nothing leaves last_seq below first_seq.
-        last_seq: first_seq - 1,
+        last_seq: start.first_seq - 1,
         input_tokens: 0,
         output_tokens: 0,
         total_tokens: 0,
@@ -103,69 +114,33 @@ fn record(
         calls_json: "[]".into(),
     };
 
-    match outcome {
-        Ok(response) => {
-            let u = &response.usage;
-            rec.input_tokens = u.input_tokens as i64;
-            rec.output_tokens = u.output_tokens as i64;
-            rec.total_tokens = u.total_tokens as i64;
-            rec.cached_input_tokens = u.cached_input_tokens as i64;
-            rec.cache_creation_input_tokens = u.cache_creation_input_tokens as i64;
-            rec.reasoning_tokens = u.reasoning_tokens as i64;
-            rec.tool_use_prompt_tokens = u.tool_use_prompt_tokens as i64;
-            rec.model_calls = response.completion_calls.len() as i64;
-            rec.calls_json = calls_json(response, store_raw());
-            let appended = response.messages.as_ref().map_or(0, Vec::len) as i64;
-            rec.last_seq = first_seq + appended - 1;
-        }
+    if let Some(response) = response {
+        let u = &response.usage;
+        rec.input_tokens = u.input_tokens as i64;
+        rec.output_tokens = u.output_tokens as i64;
+        rec.total_tokens = u.total_tokens as i64;
+        rec.cached_input_tokens = u.cached_input_tokens as i64;
+        rec.cache_creation_input_tokens = u.cache_creation_input_tokens as i64;
+        rec.reasoning_tokens = u.reasoning_tokens as i64;
+        rec.tool_use_prompt_tokens = u.tool_use_prompt_tokens as i64;
+        rec.model_calls = response.completion_calls.len() as i64;
+        rec.calls_json = calls_json(response, store_raw());
+    }
+    match stored {
+        Ok(last_seq) => rec.last_seq = last_seq,
         Err(e) => {
             rec.status = "error".into();
-            rec.error = Some(e.to_string());
+            rec.error = Some(e);
         }
     }
     rec
-}
-
-/// One turn: load, run, save transcript, save telemetry.
-///
-/// The telemetry write is last and its failure is reported but not fatal —
-/// losing a cost row must not cost the user their reply.
-pub async fn turn<R: Run>(
-    agent: &R,
-    db: &Connection,
-    session: &str,
-    model: &str,
-    prompt: &str,
-) -> Result<String> {
-    let started_at = now_millis();
-    let run_id = uuid::Uuid::new_v4().to_string();
-    let mut history = store::load(db, session)?;
-    let first_seq = history.len() as i64;
-
-    let outcome = agent.run(prompt, history.clone()).await;
-    let rec = record(run_id, session, model, started_at, first_seq, &outcome);
-
-    let reply = match outcome {
-        Ok(response) => {
-            if let Some(messages) = response.messages {
-                history.extend(messages);
-            }
-            store::save(db, session, &history)?;
-            Ok(response.output)
-        }
-        Err(e) => Err(anyhow::Error::from(e)),
-    };
-
-    if let Err(e) = store::save_run(db, &rec) {
-        eprintln!("warning: run telemetry not saved: {e}");
-    }
-    reply
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rig_agent::agent::CompletionCall;
+    use rig_agent::prelude::Message;
     use rig_core::completion::Usage;
 
     fn usage() -> Usage {
@@ -197,24 +172,19 @@ mod tests {
         response
     }
 
-    fn max_turns_error() -> PromptError {
-        PromptError::MaxTurnsError {
-            max_turns: 20,
-            chat_history: Box::new(vec![]),
-            prompt: Box::new(Message::user("x")),
+    fn start(first_seq: i64) -> RunStart<'static> {
+        RunStart {
+            run_id: "run".into(),
+            session_id: "s",
+            model: "test/model",
+            started_at: 0,
+            first_seq,
         }
     }
 
     #[test]
     fn record_copies_every_usage_field() {
-        let rec = record(
-            "run".into(),
-            "s",
-            "test/model",
-            0,
-            0,
-            &Ok(tool_using_response()),
-        );
+        let rec = record(start(0), Some(&tool_using_response()), Ok(3));
         assert_eq!(rec.status, "ok");
         assert_eq!(rec.input_tokens, 100);
         assert_eq!(rec.output_tokens, 20);
@@ -224,34 +194,38 @@ mod tests {
         assert_eq!(rec.tool_use_prompt_tokens, 2);
         assert_eq!(rec.reasoning_tokens, 8);
         assert_eq!(rec.model, "test/model");
+        assert_eq!(rec.session_id, "s");
     }
 
     #[test]
     fn model_calls_are_counted_separately_from_messages() {
-        let response = tool_using_response();
-        let appended = response.messages.as_ref().unwrap().len();
-        let rec = record("run".into(), "s", "m", 0, 0, &Ok(response));
+        let rec = record(start(10), Some(&tool_using_response()), Ok(13));
         // Two HTTP requests produced four transcript rows. Conflating the two
         // is the mistake the runs table exists to prevent.
         assert_eq!(rec.model_calls, 2);
-        assert_eq!(appended, 4);
-        assert_eq!(rec.last_seq - rec.first_seq + 1, appended as i64);
-    }
-
-    #[test]
-    fn seq_range_is_offset_by_existing_history() {
-        let rec = record("run".into(), "s", "m", 0, 10, &Ok(tool_using_response()));
         assert_eq!((rec.first_seq, rec.last_seq), (10, 13));
     }
 
     #[test]
     fn a_failed_run_is_recorded_with_its_error_and_no_messages() {
-        let rec = record("run".into(), "s", "m", 0, 7, &Err(max_turns_error()));
+        let rec = record(start(7), None, Err("max turns reached".into()));
         assert_eq!(rec.status, "error");
-        assert!(rec.error.unwrap().contains("max turns"));
+        assert_eq!(rec.error.as_deref(), Some("max turns reached"));
         assert_eq!(rec.model_calls, 0);
         // Nothing was appended, so the range is empty rather than one row.
         assert!(rec.last_seq < rec.first_seq);
+    }
+
+    #[test]
+    fn a_reply_whose_transcript_was_lost_still_records_what_it_cost() {
+        let rec = record(
+            start(4),
+            Some(&tool_using_response()),
+            Err("transcript not saved".into()),
+        );
+        assert_eq!(rec.status, "error");
+        assert_eq!((rec.input_tokens, rec.model_calls), (100, 2));
+        assert_eq!((rec.first_seq, rec.last_seq), (4, 3));
     }
 
     #[test]
@@ -276,79 +250,5 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&dropped).unwrap();
         assert_eq!(parsed.as_array().unwrap().len(), 2);
         assert_eq!(parsed[0]["usage"]["input_tokens"], 100);
-    }
-
-    struct FakeAgent(std::cell::RefCell<Option<Result<PromptResponse, PromptError>>>);
-
-    impl Run for FakeAgent {
-        async fn run(
-            &self,
-            _prompt: &str,
-            _history: Vec<Message>,
-        ) -> Result<PromptResponse, PromptError> {
-            self.0.borrow_mut().take().expect("run called twice")
-        }
-    }
-
-    fn test_db() -> Connection {
-        store::open_in_memory().unwrap()
-    }
-
-    #[tokio::test]
-    async fn turn_persists_transcript_and_telemetry_together() {
-        let db = test_db();
-        let agent = FakeAgent(std::cell::RefCell::new(Some(Ok(tool_using_response()))));
-
-        let reply = turn(&agent, &db, "s", "test/model", "add 21 and 21")
-            .await
-            .unwrap();
-
-        assert_eq!(reply, "42");
-        assert_eq!(store::load(&db, "s").unwrap().len(), 4);
-        let rows = store::usage(&db).unwrap();
-        assert_eq!(rows.len(), 1);
-        let u = &rows[0];
-        assert_eq!((u.session_id.as_str(), u.runs, u.model_calls), ("s", 1, 2));
-        assert_eq!(
-            (u.input_tokens, u.output_tokens, u.cached_input_tokens),
-            (100, 20, 64)
-        );
-    }
-
-    #[tokio::test]
-    async fn a_failed_turn_leaves_the_transcript_untouched_but_is_still_recorded() {
-        let db = test_db();
-        store::save(&db, "s", &[Message::user("earlier")]).unwrap();
-        let agent = FakeAgent(std::cell::RefCell::new(Some(Err(max_turns_error()))));
-
-        assert!(turn(&agent, &db, "s", "m", "boom").await.is_err());
-
-        // The conversation is exactly as it was.
-        assert_eq!(
-            store::load(&db, "s").unwrap(),
-            vec![Message::user("earlier")]
-        );
-        // But the failure is visible in telemetry.
-        let mut q = db.prepare("SELECT status, error FROM runs").unwrap();
-        let rows: Vec<(String, Option<String>)> = q
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, "error");
-        assert!(rows[0].1.as_ref().unwrap().contains("max turns"));
-    }
-
-    #[tokio::test]
-    async fn a_failed_telemetry_write_still_returns_the_reply_and_saves_the_transcript() {
-        let db = test_db();
-        db.execute_batch("DROP TABLE runs").unwrap();
-        let agent = FakeAgent(std::cell::RefCell::new(Some(Ok(tool_using_response()))));
-
-        let reply = turn(&agent, &db, "s", "m", "add 21 and 21").await.unwrap();
-
-        assert_eq!(reply, "42");
-        assert_eq!(store::load(&db, "s").unwrap().len(), 4);
     }
 }

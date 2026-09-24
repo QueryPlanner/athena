@@ -1,9 +1,10 @@
-//! The real Rig agent loop, production tools included, against a scripted
-//! model and a real database file. No network.
+//! The real Rig agent loop, production tools and conversation memory
+//! included, through the service, against a scripted model and a real
+//! database file. No network.
 
 mod common;
 
-use athena::{agent, runner, store};
+use athena::agent;
 use common::*;
 use rig_agent::prelude::Message;
 use rig_core::test_utils::MockTurn;
@@ -17,18 +18,23 @@ fn is_preamble(m: &Message) -> bool {
 #[tokio::test]
 async fn a_tool_turn_runs_the_real_tool_and_records_what_it_cost() {
     let tmp = TempDb::new();
-    let db = tmp.open();
-    let (agent, model) = mock_agent(add_turns());
+    let (service, warnings) = tmp.service();
+    let user = cli_user(&service).await;
+    let s = session(&service, &user, "s").await;
+    let (agent, model) = mock_agent(&service, add_turns());
 
-    let reply = runner::turn(&agent, &db, "s", "mock/model", "add 21 and 21")
+    let turn = service
+        .send(&agent, &user, &s.id, "add 21 and 21")
         .await
         .unwrap();
 
-    assert_eq!(reply, "42");
+    assert_eq!(turn.reply, "42");
+    assert_eq!((turn.run.first_seq, turn.run.last_seq), (0, 3));
 
     // Prompt, tool call, tool result, reply. The result came from the real
     // `add` tool: the mock only asked for it.
-    let rows = raw_rows(&db, "s");
+    let db = tmp.raw();
+    let rows = raw_rows(&db, &s.id);
     assert_eq!(rows.len(), 4);
     assert!(rows[1].contains(r#""type":"toolcall""#), "{}", rows[1]);
     assert!(rows[2].contains(r#""type":"toolresult""#), "{}", rows[2]);
@@ -43,45 +49,53 @@ async fn a_tool_turn_runs_the_real_tool_and_records_what_it_cost() {
     assert_eq!(tools, ["add", "read_file"]);
 
     // One run, two model calls, four messages, and the summed token counts.
-    assert_eq!(runs(&db, "s"), [run_row(0, 3, 2, "ok")]);
-    let totals = &store::usage(&db).unwrap()[0];
+    assert_eq!(runs(&db, &s.id), [run_row(0, 3, 2, "ok")]);
+    let totals = &service.usage(&user).await.unwrap()[0];
     assert_eq!((totals.input_tokens, totals.output_tokens), (256, 26));
+    assert!(warnings.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn history_survives_a_restart_and_the_next_turn_builds_on_it() {
     let tmp = TempDb::new();
-    {
-        let db = tmp.open();
-        let (agent, _) = mock_agent(add_turns());
-        runner::turn(&agent, &db, "s", "m", "add 21 and 21")
+    let id = {
+        let (service, _) = tmp.service();
+        let user = cli_user(&service).await;
+        let s = session(&service, &user, "s").await;
+        let (agent, _) = mock_agent(&service, add_turns());
+        service
+            .send(&agent, &user, &s.id, "add 21 and 21")
             .await
             .unwrap();
-    } // Connection closed, as when the CLI process exits.
+        s.id
+    }; // Store dropped, as when the CLI process exits.
 
-    let db = tmp.open();
-    let before = raw_rows(&db, "s");
-    let restored = store::load(&db, "s").unwrap();
-    let (agent, model) = mock_agent([MockTurn::text("21 and 21")]);
+    let (service, _) = tmp.service();
+    let user = cli_user(&service).await;
+    let before = raw_rows(&tmp.raw(), &id);
+    let restored = service.history(&user, &id).await.unwrap();
+    let (agent, model) = mock_agent(&service, [MockTurn::text("21 and 21")]);
 
-    runner::turn(&agent, &db, "s", "m", "what did I add?")
+    service
+        .send(&agent, &user, &id, "what did I add?")
         .await
         .unwrap();
 
     // The model saw preamble, the whole earlier exchange (tool call and
-    // result included), then the new prompt.
+    // result included), then the new prompt. Rig loaded it from memory.
     let sent = &model.requests()[0].chat_history;
     assert_eq!(sent.len(), restored.len() + 2, "{sent:?}");
     assert!(is_preamble(&sent[0]));
     assert_eq!(&sent[1..=restored.len()], &restored[..]);
     assert_eq!(sent.last().unwrap(), &Message::user("what did I add?"));
 
-    // save() rewrites the session; the earlier rows must come back unchanged.
-    let after = raw_rows(&db, "s");
+    // Appended, not rewritten: the earlier rows are the same bytes.
+    let db = tmp.raw();
+    let after = raw_rows(&db, &id);
     assert_eq!(after.len(), 6);
     assert_eq!(&after[..4], &before[..]);
     assert_eq!(
-        runs(&db, "s"),
+        runs(&db, &id),
         [run_row(0, 3, 2, "ok"), run_row(4, 5, 1, "ok")]
     );
 }
@@ -89,42 +103,108 @@ async fn history_survives_a_restart_and_the_next_turn_builds_on_it() {
 #[tokio::test]
 async fn a_provider_error_leaves_the_transcript_alone_and_is_recorded() {
     let tmp = TempDb::new();
-    let db = tmp.open();
-    let (agent, _) = mock_agent(add_turns());
-    runner::turn(&agent, &db, "s", "m", "add 21 and 21")
+    let (service, _) = tmp.service();
+    let user = cli_user(&service).await;
+    let s = session(&service, &user, "s").await;
+    let (agent, _) = mock_agent(&service, add_turns());
+    service
+        .send(&agent, &user, &s.id, "add 21 and 21")
         .await
         .unwrap();
-    let before = raw_rows(&db, "s");
+    let before = raw_rows(&tmp.raw(), &s.id);
 
-    let (agent, _) = mock_agent([MockTurn::error("upstream unavailable")]);
-    let err = runner::turn(&agent, &db, "s", "m", "again")
+    let (agent, _) = mock_agent(&service, [MockTurn::error("upstream unavailable")]);
+    let err = service
+        .send(&agent, &user, &s.id, "again")
         .await
         .unwrap_err();
 
     assert!(err.to_string().contains("upstream unavailable"), "{err}");
-    assert_eq!(raw_rows(&db, "s"), before);
+    let db = tmp.raw();
+    assert_eq!(raw_rows(&db, &s.id), before);
     // An empty range starting where the next message would have gone.
-    assert_eq!(runs(&db, "s")[1], run_row(4, 3, 0, "error"));
+    assert_eq!(runs(&db, &s.id)[1], run_row(4, 3, 0, "error"));
 }
 
 #[tokio::test]
 async fn sessions_do_not_see_each_other() {
     let tmp = TempDb::new();
-    let db = tmp.open();
-    let (agent, _) = mock_agent(add_turns());
-    runner::turn(&agent, &db, "a", "m", "add 21 and 21")
+    let (service, _) = tmp.service();
+    let user = cli_user(&service).await;
+    let a = session(&service, &user, "a").await;
+    let b = session(&service, &user, "b").await;
+    let (agent, _) = mock_agent(&service, add_turns());
+    service
+        .send(&agent, &user, &a.id, "add 21 and 21")
         .await
         .unwrap();
 
-    let (agent, model) = mock_agent([MockTurn::text("hello")]);
-    runner::turn(&agent, &db, "b", "m", "hi").await.unwrap();
+    let (agent, model) = mock_agent(&service, [MockTurn::text("hello")]);
+    service.send(&agent, &user, &b.id, "hi").await.unwrap();
 
     // Session b's request carried the preamble and its own prompt, nothing of a.
     let sent = &model.requests()[0].chat_history;
     assert_eq!(sent.len(), 2, "{sent:?}");
     assert!(is_preamble(&sent[0]));
     assert_eq!(sent[1], Message::user("hi"));
-    assert_eq!(raw_rows(&db, "a").len(), 4);
-    assert_eq!(raw_rows(&db, "b").len(), 2);
-    assert_eq!(runs(&db, "b"), [run_row(0, 1, 1, "ok")]);
+    let db = tmp.raw();
+    assert_eq!(raw_rows(&db, &a.id).len(), 4);
+    assert_eq!(raw_rows(&db, &b.id).len(), 2);
+    assert_eq!(runs(&db, &b.id), [run_row(0, 1, 1, "ok")]);
+}
+
+#[tokio::test]
+async fn two_users_with_the_same_session_name_have_separate_conversations() {
+    let tmp = TempDb::new();
+    let (service, _) = tmp.service();
+    let alice = service.user("telegram", "1001").await.unwrap();
+    let bob = service.user("telegram", "1002").await.unwrap();
+    let hers = session(&service, &alice, "default").await;
+    let his = session(&service, &bob, "default").await;
+    let (agent, _) = mock_agent(&service, [MockTurn::text("noted")]);
+    service
+        .send(&agent, &alice, &hers.id, "my code word is ZEBRA-7391")
+        .await
+        .unwrap();
+
+    let (agent, model) = mock_agent(&service, [MockTurn::text("no idea")]);
+    service
+        .send(&agent, &bob, &his.id, "what is my code word?")
+        .await
+        .unwrap();
+
+    assert_ne!(hers.id, his.id);
+    let sent = format!("{:?}", model.requests()[0].chat_history);
+    assert!(!sent.contains("ZEBRA"), "{sent}");
+    // And Bob cannot reach Alice's session by id.
+    assert!(service.history(&bob, &hers.id).await.is_err());
+    assert_eq!(service.sessions(&bob).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn two_messages_arriving_together_on_one_session_run_in_turn() {
+    let tmp = TempDb::new();
+    let (service, _) = tmp.service();
+    let user = service.user("telegram", "42").await.unwrap();
+    let s = session(&service, &user, "chat").await;
+    let (agent, model) = mock_agent(&service, [MockTurn::text("one"), MockTurn::text("two")]);
+
+    // Both in flight at once, as two Telegram updates for one chat would be.
+    let (a, b) = tokio::join!(
+        service.send(&agent, &user, &s.id, "first"),
+        service.send(&agent, &user, &s.id, "second"),
+    );
+
+    a.unwrap();
+    b.unwrap();
+    // Whichever ran second was sent the other's whole exchange.
+    let requests = model.requests();
+    assert_eq!(requests[0].chat_history.len(), 2);
+    assert_eq!(requests[1].chat_history.len(), 4);
+    let db = tmp.raw();
+    assert_eq!(raw_rows(&db, &s.id).len(), 4);
+    assert_eq!(
+        runs(&db, &s.id),
+        [run_row(0, 1, 1, "ok"), run_row(2, 3, 1, "ok")]
+    );
 }
