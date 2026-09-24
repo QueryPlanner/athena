@@ -4,4 +4,5 @@
 pub mod agent;
 pub mod cli;
 pub mod runner;
+pub mod service;
 pub mod store;
