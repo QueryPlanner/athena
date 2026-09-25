@@ -28,8 +28,7 @@ as is.
 
 ## Run
 
-    source ~/.zshrc                          # OPENROUTER_API_KEY
-    export AGENT_MODEL=openai/gpt-5.6-luna   # optional override
+    cp .env.example .env                     # then fill in OPENROUTER_API_KEY
 
     cargo run                                # REPL, session "default"
     cargo run -- research                    # REPL, session "research"
@@ -41,6 +40,11 @@ as is.
     ATHENA_DB=/tmp/x.db cargo run -- ...     # use another database file
     cargo run -- serve                       # HTTP API on 127.0.0.1:8080
     cargo run -- serve --addr 127.0.0.1:9000 # or ATHENA_ADDR=...
+
+`athena` reads `.env` from the directory you run it in. Variables already
+set in your shell win over the file, so `ATHENA_DB=/tmp/x.db athena ...`
+still works. `.env` is git-ignored; `.env.example` lists every setting. A
+malformed `.env` stops `athena` before it touches the database.
 
 A session name is created on first use and resumes the conversation after
 that, tool history included. `sessions new NAME` creates one explicitly and

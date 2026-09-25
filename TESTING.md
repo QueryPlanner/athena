@@ -42,6 +42,11 @@ what it did does not count.
 
 ## Integration tests
 
+Tests that run the real binary must run it in an empty directory, as
+`athena_in` in `tests/cli.rs` does. The binary loads `.env` from its working
+directory, and in the repository that file holds a developer's real keys:
+a "no API key" test would find one and call the provider.
+
 `tests/common/mod.rs` has the helpers:
 
 - `TempDb`: a real database file that is deleted on drop. `tmp.service()`
@@ -137,8 +142,7 @@ or a chat app.
 ### Running it
 
 ```
-source ~/.zshrc          # or export OPENROUTER_API_KEY
-./scripts/e2e.sh
+./scripts/e2e.sh         # key from .env, or export OPENROUTER_API_KEY
 ```
 
 It builds the binary, points `ATHENA_DB` at a throwaway file, and prints one

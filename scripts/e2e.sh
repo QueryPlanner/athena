@@ -5,15 +5,21 @@
 # phrases things differently does not fail it. The two checks that do depend
 # on the model (it chose the tool; it repeated a code word) retry once.
 #
-# Needs OPENROUTER_API_KEY and sqlite3. Costs a few cents. Not run in CI.
-# See TESTING.md for what each check proves and how to extend it.
+# Needs OPENROUTER_API_KEY, in the shell or in .env, and sqlite3. Costs a few
+# cents. Not run in CI. See TESTING.md for what each check proves and how to
+# extend it.
 set -euo pipefail
 
-: "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY not set}"
+cd "$(dirname "$0")/.."
+# The binary runs from here, so it loads ./.env itself. This only checks that
+# a key is available one way or the other; the script never reads it.
+if [ -z "${OPENROUTER_API_KEY:-}" ] && ! grep -q '^OPENROUTER_API_KEY=..*' .env 2>/dev/null; then
+    echo "OPENROUTER_API_KEY not set: export it or add it to .env"
+    exit 1
+fi
 export AGENT_MODEL="${AGENT_MODEL:-openai/gpt-5.6-luna}"
 command -v sqlite3 >/dev/null || { echo "sqlite3 is required"; exit 1; }
 
-cd "$(dirname "$0")/.."
 cargo build --quiet --locked
 BIN="$PWD/target/debug/athena"
 

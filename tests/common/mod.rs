@@ -56,6 +56,35 @@ impl Drop for TempDb {
     }
 }
 
+/// An empty directory to run the binary in, removed on drop.
+///
+/// The binary loads `.env` from its working directory, so it must never run
+/// in the repository, where a developer's real `.env` holds real keys.
+pub struct WorkDir(PathBuf);
+
+impl WorkDir {
+    pub fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("athena-cwd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        Self(dir)
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+
+    /// Write `contents` as this directory's `.env`.
+    pub fn env_file(&self, contents: &str) {
+        std::fs::write(self.0.join(".env"), contents).unwrap();
+    }
+}
+
+impl Drop for WorkDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 pub type Warnings = Arc<Mutex<Vec<String>>>;
 
 pub fn usage(input: u64, output: u64) -> Usage {

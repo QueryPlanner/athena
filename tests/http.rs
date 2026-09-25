@@ -822,11 +822,19 @@ async fn a_second_interrupt_quits_without_waiting_for_turns_in_flight() {
 
 // ---- the real binary ----
 
-fn athena_serve(tmp: &TempDb, args: &[&str], key: Option<&str>) -> std::process::Command {
+/// `athena serve` in `dir`, an empty directory, so a developer's `.env` in
+/// the repository can never reach it.
+fn athena_serve(
+    dir: &WorkDir,
+    tmp: &TempDb,
+    args: &[&str],
+    key: Option<&str>,
+) -> std::process::Command {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_athena"));
     command
         .arg("serve")
         .args(args)
+        .current_dir(dir.path())
         .env("ATHENA_DB", tmp.path())
         .env_remove("AGENT_MODEL")
         .env_remove("ATHENA_ADDR")
@@ -848,8 +856,9 @@ fn blocking_request(addr: &str, request: &str) -> String {
 #[test]
 fn the_binary_serves_until_ctrl_c_and_then_exits_cleanly() {
     let tmp = TempDb::new();
+    let dir = WorkDir::new();
     // A key that is never used: nothing here reaches the model.
-    let mut child = athena_serve(&tmp, &["--addr", "127.0.0.1:0"], Some("unused-key"))
+    let mut child = athena_serve(&dir, &tmp, &["--addr", "127.0.0.1:0"], Some("unused-key"))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -916,7 +925,9 @@ fn the_binary_refuses_to_serve_without_a_key_or_with_bad_arguments() {
             "listening on not an address",
         ),
     ] {
-        let out = athena_serve(&tmp, args, key).output().unwrap();
+        let out = athena_serve(&WorkDir::new(), &tmp, args, key)
+            .output()
+            .unwrap();
         let stderr = String::from_utf8(out.stderr).unwrap();
         assert!(!out.status.success(), "{args:?}");
         assert!(stderr.contains(why), "{args:?}: {stderr}");
