@@ -21,8 +21,8 @@ CI (`.github/workflows/ci-cd.yml`) runs the same three commands on every pull
 request. `coverage.sh` also runs the unit and integration tests. CI also runs:
 
 - `shellcheck scripts/*.sh`, `scripts/setup-host.sh --dry-run` (no root), and
-  `scripts/test-analytics.sh` (every DuckDB query against fixtures);
-- the collector config through `otelcol-contrib validate`;
+  `scripts/test-analytics.sh` (every DuckDB query against fixtures laid out
+  like `/var/lib/athena/<env>/telemetry/`; it passes on DuckDB 1.4 and 1.5);
 - `scripts/smoke-binary.sh target/release/athena`: the release binary serving
   on loopback with a temp database (`/health`, `/version`, a session, the Host
   allowlist, SIGTERM, `athena backup`), with no model calls.
@@ -82,8 +82,14 @@ a "no API key" test would find one and call the provider.
 `tests/telemetry.rs` installs the tracing layers for one thread with
 exporters that keep what they are sent, runs real turns through the router
 and the service, and checks the spans, their nesting and the log records.
-It also runs `athena serve` against a fake OTLP collector on loopback and
-checks that SIGTERM flushes traces and logs to it.
+A prod variant checks that content capture never reaches an exporter. It
+also runs `athena serve` against a fake OTLP backend on loopback, shaped like
+OpenObserve (an `/api/default` path and a basic-auth header), with
+`ATHENA_TELEMETRY_DIR` set, and checks that SIGTERM flushes traces and logs to
+both. The JSONL writer's schema, daily rotation and retention are unit-tested
+in `src/telemetry/jsonl.rs` with a fake clock and temp directories; one of
+those tests also checks that `analytics/testdata/traces-*.jsonl` has exactly
+the fields the writer produces, so the SQL fixtures cannot drift from it.
 
 `tests/http.rs` drives the HTTP API in-process through the router
 (`tower::ServiceExt::oneshot`), the server over real loopback TCP, and

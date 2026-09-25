@@ -25,6 +25,7 @@ TimeoutStopSec=120
 MemoryMax=128M
 NoNewPrivileges=yes
 ProtectSystem=strict
+# agent.db, backups/ and telemetry/ (ATHENA_TELEMETRY_DIR) live here.
 ReadWritePaths=/var/lib/athena/%i
 ProtectHome=yes
 PrivateTmp=yes

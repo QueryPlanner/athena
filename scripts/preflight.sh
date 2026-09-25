@@ -10,7 +10,7 @@
 set -euo pipefail
 
 VM=""
-PORTS=(18080 18081 5080 4317 4318)
+PORTS=(18080 18081 5080)
 while [ $# -gt 0 ]; do
     case "$1" in
         --vm) VM="${2:?--vm needs USER@HOST}"; shift ;;
@@ -71,9 +71,9 @@ if [ -r /proc/meminfo ]; then
     mem_total_mb=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo)
     mem_avail_mb=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo)
     # MemoryMax caps: athena-serve x2 + athena-telegram@prod at 128M each
-    # (each uses ~15 MB), otelcol-contrib 256M, OpenObserve 512M.
-    [ "${mem_avail_mb:-0}" -ge 1152 ] ||
-        WARNINGS+=("only ${mem_avail_mb} MB available; Athena's services can use up to 1152 MB at their MemoryMax caps (serve x2 and telegram at 128M, otelcol 256M, OpenObserve 512M); if the host runs out, the kernel OOM-kills its largest process, which may be another app")
+    # (each uses ~15 MB), and OpenObserve 512M.
+    [ "${mem_avail_mb:-0}" -ge 896 ] ||
+        WARNINGS+=("only ${mem_avail_mb} MB available; Athena's services can use up to 896 MB at their MemoryMax caps (serve x2 and telegram at 128M, OpenObserve 512M); if the host runs out, the kernel OOM-kills its largest process, which may be another app")
 fi
 disk_free_mb=$(df -Pm / 2>/dev/null | awk 'NR==2 {print $4}')
 [ "${disk_free_mb:-0}" -ge 2048 ] || WARNINGS+=("under 2 GB free on /; deploy-gate refuses deploys under 1 GB")
@@ -105,7 +105,7 @@ for port in "${PORTS[@]}"; do
             owner=$(ss -Hltnp "sport = :$port" 2>/dev/null | grep -o 'users:(("[^"]*"' | head -n1 | cut -d'"' -f2 || true)
             state="in use on $line${owner:+ by $owner}"
             case "$owner" in
-                athena|openobserve|otelcol-contrib) state="$state (Athena's own)" ;;
+                athena|openobserve) state="$state (Athena's own)" ;;
                 *) CONFLICTS+=("port $port is $state") ;;
             esac
         fi
@@ -143,7 +143,6 @@ env_state() {
     if [ -e "$f" ]; then stat -c 'present %a %U:%G' "$f" 2>/dev/null || echo present; else echo missing; fi
 }
 oras_v=$( (oras version 2>/dev/null || /usr/local/bin/oras version 2>/dev/null) | sed -n 's/^Version: *//p' | head -n1 || true)
-otel_v=$(dpkg-query -W -f='${Version}' otelcol-contrib 2>/dev/null || true)
 o2_v=$( (/usr/local/bin/openobserve --version 2>/dev/null || true) | head -n1)
 duck_v=$( (duckdb --version 2>/dev/null || /usr/local/bin/duckdb --version 2>/dev/null || true) | awk '{print $1}' | head -n1)
 
@@ -166,7 +165,7 @@ cat <<EOF
  "docker":{"installed":$(jbool "$docker_installed"),"publicly_published":$docker_public},
  "caddy":{"installed":$(jbool "$caddy_installed"),"active":$(jbool "$caddy_active")},
  "athena":{"opt_athena":$(jbool "$opt_athena"),"units_installed":$(jbool "$units"),"deploy_gate":$(jbool "$gate"),"staging_env":$(js "$(env_state staging)"),"prod_env":$(js "$(env_state prod)")},
- "tools":{"oras":$(jsn "$oras_v"),"otelcol_contrib":$(jsn "$otel_v"),"openobserve":$(jsn "$o2_v"),"duckdb":$(jsn "$duck_v")},
+ "tools":{"oras":$(jsn "$oras_v"),"openobserve":$(jsn "$o2_v"),"duckdb":$(jsn "$duck_v")},
  "conflicts":$(list_json ${CONFLICTS[@]+"${CONFLICTS[@]}"}),
  "warnings":$(list_json ${WARNINGS[@]+"${WARNINGS[@]}"})}
 EOF

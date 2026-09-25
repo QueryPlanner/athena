@@ -52,8 +52,14 @@ jobs:
           ssh-keygen -q -t ed25519 -N '' -C ci-prod -f prod
           "$GITHUB_WORKSPACE/scripts/setup-host.sh" --dry-run --tailnet-ip 100.64.0.1 \
             --ci-staging-pubkey staging.pub --ci-prod-pubkey prod.pub \
-            --gate-digest "sha256:$(printf '%064d' 0)" | tee summary.txt
+            --gate-digest "sha256:$(printf '%064d' 0)" 2>details.txt | tee summary.txt
           grep -q 'would create /etc/athena/prod.env' summary.txt
+          # Telemetry goes to files and straight to OpenObserve; no collector.
+          grep -q 'ATHENA_TELEMETRY_DIR=/var/lib/athena/prod/telemetry' details.txt
+          grep -q 'OTEL_EXPORTER_OTLP_ENDPOINT=http://100.64.0.1:5080/api/default' details.txt
+          if grep -q '127.0.0.1:4318' details.txt; then
+            echo "::error::an env file still points at the collector"; exit 1
+          fi
           # Bad input is refused before anything else happens.
           if "$GITHUB_WORKSPACE/scripts/setup-host.sh" --dry-run --gate-digest sha256:nothex; then
             echo "::error::setup-host accepted a malformed digest"; exit 1
@@ -71,14 +77,6 @@ jobs:
           echo "$DUCKDB_SHA256  $RUNNER_TEMP/duckdb.gz" | sha256sum -c -
           gunzip "$RUNNER_TEMP/duckdb.gz" && chmod +x "$RUNNER_TEMP/duckdb"
           PATH="$RUNNER_TEMP:$PATH" ./scripts/test-analytics.sh
-      - name: Validate the collector config
-        run: |
-          docker run --rm \
-            -e OPENOBSERVE_OTLP_ENDPOINT=http://100.64.0.1:5080/api/default \
-            -e OPENOBSERVE_AUTH='Basic eA==' \
-            -v "$PWD/deploy/otel/config.yaml:/config.yaml:ro" \
-            otel/opentelemetry-collector-contrib:0.161.0@sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1 \
-            validate --config=/config.yaml
 
   unit:
     if: github.event_name == 'pull_request'

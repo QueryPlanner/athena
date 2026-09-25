@@ -1,27 +1,38 @@
--- Shared view: one row per span from the collector's JSONL files
--- (deploy/otel/config.yaml, file/traces exporter, OTLP/JSON encoding).
--- Plain read_json rather than the otlp community extension, so it works
--- offline and does not depend on that extension's column names.
+-- Shared view: one row per span from the JSONL files Athena writes itself
+-- (ATHENA_TELEMETRY_DIR, src/telemetry/jsonl.rs documents the schema).
+-- The columns are declared rather than inferred, so every file reads the
+-- same way; attributes and resource stay JSON because their keys vary.
 CREATE OR REPLACE TEMP VIEW spans AS
-WITH files AS (
-    SELECT unnest(resourceSpans) AS rs
-    FROM read_json('{{OTEL_DIR}}/traces*.jsonl', format = 'newline_delimited',
-                   maximum_object_size = 104857600, union_by_name = true)
-),
-scoped AS (
-    SELECT rs.resource.attributes AS resource_attrs, unnest(rs.scopeSpans) AS ss FROM files
-),
-flat AS (
-    SELECT resource_attrs, unnest(ss.spans) AS s FROM scoped
-)
 SELECT
-    list_extract(list_filter(resource_attrs, lambda a: a.key = 'deployment.environment.name'), 1).value.stringValue AS env,
-    s.traceId AS trace_id,
-    s.spanId AS span_id,
-    s.name AS span_name,
-    to_timestamp(CAST(s.startTimeUnixNano AS HUGEINT) / 1e9) AS started_at,
-    (CAST(s.endTimeUnixNano AS HUGEINT) - CAST(s.startTimeUnixNano AS HUGEINT)) / 1e6 AS duration_ms,
-    coalesce(s.status.code, 0) = 2 AS is_error,
-    s.status.message AS status_message,
-    list_extract(list_filter(s.attributes, lambda a: a.key = 'gen_ai.tool.name'), 1).value.stringValue AS tool_name
-FROM flat;
+    json_extract_string(resource, '$."deployment.environment.name"') AS env,
+    json_extract_string(resource, '$."service.version"') AS version,
+    trace_id,
+    span_id,
+    parent_span_id,
+    name AS span_name,
+    to_timestamp(start_unix_nano / 1e9) AS started_at,
+    duration_ms,
+    status = 'error' AS is_error,
+    status_message,
+    json_extract_string(attributes, '$."gen_ai.tool.name"') AS tool_name,
+    attributes
+FROM read_json('{{TELEMETRY_DIR}}/traces-*.jsonl',
+               format = 'newline_delimited',
+               -- A staging span with content capture on can be large.
+               maximum_object_size = 104857600,
+               columns = {
+                   'trace_id': 'VARCHAR',
+                   'span_id': 'VARCHAR',
+                   'parent_span_id': 'VARCHAR',
+                   'name': 'VARCHAR',
+                   'kind': 'VARCHAR',
+                   'start_unix_nano': 'UBIGINT',
+                   'end_unix_nano': 'UBIGINT',
+                   'duration_ms': 'DOUBLE',
+                   'status': 'VARCHAR',
+                   'status_message': 'VARCHAR',
+                   'attributes': 'JSON',
+                   'events': 'JSON',
+                   'scope': 'VARCHAR',
+                   'resource': 'JSON'
+               });

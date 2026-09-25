@@ -9,19 +9,19 @@ fn main() -> Result<()> {
     // Before the runtime exists: setting environment variables is only
     // sound while this is the only thread.
     dotenv::load(".env")?;
-    let telemetry = telemetry::init()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let telemetry = telemetry::init(telemetry::Role::from_args(&args))?;
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run());
+        .block_on(run(args));
     // After `run`: servers return only once their turns have drained, so
     // the last batch of spans and logs includes them.
     telemetry.shutdown();
     result
 }
 
-async fn run() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+async fn run(args: Vec<String>) -> Result<()> {
     if ops::requested(&args) {
         return ops::run(&args, &mut std::io::stdout());
     }

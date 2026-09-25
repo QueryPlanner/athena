@@ -247,6 +247,8 @@ Caddy or Tailscale settings, and never overwrites a file holding secrets.
     src/http.rs        the HTTP transport: JSON API, SSE streaming, `serve`
     src/telegram.rs    the Telegram transport: commands, sessions, the bot
     src/ops.rs         deployment: version, online backup, absolute ATHENA_DB
+    src/telemetry.rs   tracing and OpenTelemetry; telemetry/ has the JSONL
+                       files exporter and the prod content filter
     src/eval/          `athena eval`: cases, cassettes, graders, judge, results
     src/bench.rs       `athena bench`: load check against a running server
     src/main.rs        wiring: real database, provider, stdin/stdout
@@ -255,7 +257,7 @@ Caddy or Tailscale settings, and never overwrites a file holding secrets.
     evals/             eval cases and their recorded cassettes
     tests/             integration tests, upgrade fixtures, schema snapshot
     scripts/           coverage gate, live end-to-end test, VM and GitHub setup
-    deploy/            systemd units, collector config, Tailscale policy
+    deploy/            systemd units, OpenObserve settings, Tailscale policy
     analytics/         DuckDB queries over runs, traces and eval results
 
 ## Test
@@ -584,19 +586,44 @@ one per event, with a timestamp and level. `RUST_LOG` picks what stderr shows;
 the default is `warn,athena=info`. The CLI's own output (replies, `warning:`
 lines) still prints directly, so the REPL looks the same as before.
 
-OpenTelemetry is off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set. When it is,
-spans and log events also go over OTLP/HTTP (protobuf) to that endpoint, to
-`/v1/traces` and `/v1/logs`. The other standard `OTEL_EXPORTER_OTLP_*`
-variables (headers, timeout, per-signal endpoints) work too. Buffered data is
-exported on exit, after `serve` or `telegram` has let its turns finish.
+Spans and log events can also be exported, to two sinks that are switched
+on independently. With neither set, OpenTelemetry is off. There is no
+collector in between: Athena does the exporting itself, each sink on its own
+background thread.
+
+- **OTLP/HTTP** (protobuf) when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, to
+  `<endpoint>/v1/traces` and `<endpoint>/v1/logs`. On the VM that is
+  OpenObserve: `http://<tailnet-ip>:5080/api/default` with
+  `OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic%20<base64 of user:password>`
+  (`%20` is the space; values are URL-decoded). The other standard
+  `OTEL_EXPORTER_OTLP_*` variables (timeout, per-signal endpoints) work too.
+- **JSON Lines files** when `ATHENA_TELEMETRY_DIR` is set:
+  `traces-<role>-YYYYMMDD.jsonl` and `logs-<role>-YYYYMMDD.jsonl`, where the
+  role is the process (`serve`, `telegram` or `cli`) so each file has exactly
+  one writer. One object per line, a new file each UTC day,
+  files older than `ATHENA_TELEMETRY_RETENTION_DAYS` deleted. The schema is
+  Athena's own and flat (`trace_id`, `span_id`, `parent_span_id`, `name`,
+  `start_unix_nano`, `duration_ms`, `status`, `attributes`, `resource`, ...);
+  `src/telemetry/jsonl.rs` documents every field. `scripts/analytics.sh`
+  queries them with DuckDB.
+
+Buffered data is exported on exit, after `serve` or `telegram` has let its
+turns finish. There is no retry queue in front of OpenObserve: batches sent
+while it is down or restarting are lost there, but the JSONL files still
+have them. Nor is there the collector's old regex masking of secrets in
+attribute values; Athena does not put keys or tokens on spans or in log
+fields, and nothing now checks that for it.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (off) | collector base URL, e.g. `http://127.0.0.1:4318` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (no OTLP) | OTLP/HTTP base URL, e.g. `http://100.x.y.z:5080/api/default` |
+| `OTEL_EXPORTER_OTLP_HEADERS` | unset | request headers, `key=value,...`, e.g. OpenObserve's basic auth |
+| `ATHENA_TELEMETRY_DIR` | unset (no files) | directory for the daily JSONL files, e.g. `/var/lib/athena/prod/telemetry` |
+| `ATHENA_TELEMETRY_RETENTION_DAYS` | `30` | days of files kept, today included |
 | `OTEL_SERVICE_NAME` | `athena` | resource `service.name` |
 | `ATHENA_VERSION` | `<crate version>-dev` | resource `service.version` |
-| `ATHENA_ENV` | unset | resource `deployment.environment.name` |
-| `ATHENA_RECORD_CONTENT` | off | `1` puts prompt and reply text on spans |
+| `ATHENA_ENV` | unset | resource `deployment.environment.name`; `prod` strips content |
+| `ATHENA_RECORD_CONTENT` | off | `1` puts prompt and reply text on spans (not in prod) |
 | `RUST_LOG` | `warn,athena=info` | stderr filter only; export always takes `info` and up |
 
 What a turn exports:
@@ -623,8 +650,14 @@ enumerate. Treat it as internal data, not as anonymous.
 
 Content capture is off by default. Log events never include prompt or reply
 text. With `ATHENA_RECORD_CONTENT=1`, Rig records the prompt on the turn span
-and model input, output, tool arguments and tool results on its own spans. Keep it off in
-production; turn it on in staging only while no real users talk to it.
+and model input, output, tool arguments and tool results on its own spans.
+Turn it on in staging only while no real users talk to it. With
+`ATHENA_ENV=prod` it is ignored, and as a backstop Athena removes
+`gen_ai.input.messages`, `gen_ai.output.messages`,
+`gen_ai.system_instructions`, `gen_ai.tool.call.arguments`,
+`gen_ai.tool.call.result`, `gen_ai.prompt` and `gen_ai.completion` from every
+span and span event before either sink sees it, and does not export a log
+event that has one of them as a field (`src/telemetry/content.rs`).
 
 ## Known limits
 
