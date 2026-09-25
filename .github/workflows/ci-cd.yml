@@ -27,6 +27,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   ORAS_VERSION: 1.3.4
+  # Same pin as scripts/setup-host.sh (linux amd64 tarball).
+  ORAS_SHA256: f27adb935022d94df8dc77719c322dda592c78a0d57a6f7dcdd8d900b248c454
   ARTIFACT_TYPE: application/vnd.athena.release.v1
 
 jobs:
@@ -147,9 +149,15 @@ jobs:
       - name: Names
         id: names
         run: echo "repo=ghcr.io/${GITHUB_REPOSITORY,,}" >>"$GITHUB_OUTPUT"
-      - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
-        with:
-          version: ${{ env.ORAS_VERSION }}
+      - name: Install oras (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/oras.tgz" \
+            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          echo "$ORAS_SHA256  $RUNNER_TEMP/oras.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/oras.tgz" -C "$RUNNER_TEMP" oras
+          sudo install -m 0755 "$RUNNER_TEMP/oras" /usr/local/bin/oras
+          oras version
       - name: Push the release artifact
         id: push
         env:
@@ -323,9 +331,15 @@ jobs:
             exit 1
           fi
           echo "main run for $GITHUB_SHA passed staging ($runs successful run(s))"
-      - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
-        with:
-          version: ${{ env.ORAS_VERSION }}
+      - name: Install oras (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/oras.tgz" \
+            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          echo "$ORAS_SHA256  $RUNNER_TEMP/oras.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/oras.tgz" -C "$RUNNER_TEMP" oras
+          sudo install -m 0755 "$RUNNER_TEMP/oras" /usr/local/bin/oras
+          oras version
       - name: Resolve the artifact staging tested
         id: resolve
         env:
@@ -356,9 +370,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
-        with:
-          version: ${{ env.ORAS_VERSION }}
+      - name: Install oras (pinned, checksum verified)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/oras.tgz" \
+            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          echo "$ORAS_SHA256  $RUNNER_TEMP/oras.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/oras.tgz" -C "$RUNNER_TEMP" oras
+          sudo install -m 0755 "$RUNNER_TEMP/oras" /usr/local/bin/oras
+          oras version
       - name: Name the release (same bytes, new tag)
         env:
           GH_TOKEN: ${{ github.token }}
