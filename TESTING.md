@@ -208,8 +208,9 @@ assuming the code is wrong. The model may have refused or rephrased.
    and starts where the previous run ended. A second user gets the same
    404 for the first user's session as for a missing one, on every
    endpoint, and lists nothing. A client that hangs up mid-stream still
-   gets an ok run and a whole transcript. Ctrl-C while a stream is running
-   lets it end with `done`, saves its run, and exits 0.
+   gets an ok run and a whole transcript. SIGTERM, as `docker stop` sends,
+   while a stream is running lets it end with `done`, saves its run, and
+   exits 0.
 
 8. The Telegram bot: `scripts/fake_telegram.py`, a fake Bot API server,
    and the real `athena telegram` binary against it through
@@ -217,7 +218,7 @@ assuming the code is wrong. The model may have refused or rephrased.
    menu is registered; `/new` creates and selects a session for that
    Telegram user; `/sessions` marks it; `/switch` moves and stores the
    selection, refuses a missing session and creates nothing; another user
-   cannot switch into it. Ctrl-C exits with status 0, and after a restart
+   cannot switch into it. SIGTERM exits with status 0, and after a restart
    `/sessions` still marks the selection and old updates are not handled
    again. Then real turns: a new Telegram user's prompt creates the user
    and their `default` session, stores one ok run, shows typing, and the

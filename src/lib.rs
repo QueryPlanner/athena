@@ -7,5 +7,6 @@ pub mod dotenv;
 pub mod http;
 pub mod runner;
 pub mod service;
+pub mod shutdown;
 pub mod store;
 pub mod telegram;

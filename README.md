@@ -47,6 +47,12 @@ set in your shell win over the file, so `ATHENA_DB=/tmp/x.db athena ...`
 still works. `.env` is git-ignored; `.env.example` lists every setting. A
 malformed `.env` stops `athena` before it touches the database.
 
+`athena serve` and `athena telegram` stop the same way on SIGINT (Ctrl-C)
+and SIGTERM (`kill`, `docker stop`, systemd): they take no new work, let the
+turns in flight finish and reply, then exit 0. In a container, run `athena`
+directly (exec-form `CMD ["athena", "serve"]`, or `docker run --init`): a
+shell wrapper as PID 1 does not pass SIGTERM on.
+
 A session name is created on first use and resumes the conversation after
 that, tool history included. `sessions new NAME` creates one explicitly and
 prints `NAME<TAB>ID`; it fails if you already have one by that name.
@@ -361,8 +367,6 @@ fatal: losing a cost row must never cost you a reply.
 - Axum answers some malformed requests itself, not in this API's JSON
   error shape: unknown paths (empty `404`), wrong methods (`405`), and
   bodies over 2 MB (`413`).
-- Only SIGINT (Ctrl-C) shuts `serve` down gracefully. SIGTERM, as sent by
-  most process managers, stops it at once.
 - Context grows forever, and every turn re-sends the whole history.
 - Transports so far: the CLI, HTTP and Telegram. They call
   `service::Service`.
@@ -374,9 +378,13 @@ fatal: losing a cost row must never cost you a reply.
   next poll starts, not when it is answered, so a crash or `kill -9` loses
   messages that were queued, and a reply whose send fails is lost even
   though its transcript is saved.
-- Only SIGINT (Ctrl-C) stops the bot gracefully. SIGTERM, which systemd and
-  Docker send, kills it mid-turn; set `KillSignal=SIGINT` or `STOPSIGNAL
-  SIGINT`. A second Ctrl-C does not force an exit while a turn is running.
+- Stopping takes as long as the slowest turn in flight, and for the bot up
+  to one more long poll (10 s). A second signal quits `serve` at once; the
+  bot ignores it, and ignores a signal that arrives before it starts
+  polling. Docker waits 10 s and systemd 90 s before
+  SIGKILL, which cannot be caught and loses those turns: raise the grace
+  period (`docker stop -t`, `stop_grace_period`, `TimeoutStopSec`) to cover
+  a slow tool-using turn.
 - Edited messages, photos and other non-text messages are not prompts.
   Edits are ignored; the rest get "I only read text messages."
 - The selected session is Telegram state. The CLI still uses `default`

@@ -322,18 +322,19 @@ expect "a client that hung up mid-stream still got an ok run" \
     "$(q "SELECT status FROM runs WHERE run_id='$(last_run "$WEB")'")" "ok"
 expect "and its whole turn was saved" "$(runs_tile_transcript "$WEB")" "1"
 
-# Ctrl-C while a stream is running: it finishes, then the server exits.
+# SIGTERM (docker stop, systemd) while a stream is running: it finishes,
+# then the server exits.
 runs_before=$(q "SELECT COUNT(*) FROM runs WHERE session_id='$WEB'")
 stream_to "$WORK/drain.txt" alice "$WEB" "Write ten numbered sentences about mountains." >/dev/null &
 CURL_PID=$!
 for _ in $(seq 1 300); do grep -q '^event: delta' "$WORK/drain.txt" 2>/dev/null && break; sleep 0.1; done
-kill -INT "$SERVE_PID"
+kill -TERM "$SERVE_PID"
 wait "$CURL_PID" || true
-expect "a stream in flight at Ctrl-C still ends with done" \
+expect "a stream in flight at SIGTERM still ends with done" \
     "$(grep '^event: ' "$WORK/drain.txt" | tail -n 1)" "event: done"
 serve_status=0
 wait "$SERVE_PID" || serve_status=$?
-expect "athena serve exits cleanly after Ctrl-C" "$serve_status" "0"
+expect "athena serve exits cleanly after SIGTERM" "$serve_status" "0"
 grep -q 'shutting down' "$SERVE_LOG" || fail "athena serve said it was shutting down"
 pass "athena serve said it was shutting down"
 expect "the turn in flight was saved" \
@@ -359,8 +360,9 @@ start_bot() {
     BOT_PID=$!
     BACKGROUND="$BACKGROUND $BOT_PID"
 }
-stop_bot() { # description
-    kill -INT "$BOT_PID"
+stop_bot() { # signal (INT is Ctrl-C, TERM is docker stop), description
+    kill "-$1" "$BOT_PID"
+    shift
     if wait "$BOT_PID"; then pass "$1"; else sed 's/^/      /' "$WORK/bot.log"; fail "$1"; fi
 }
 tg_count() { curl -sf "$TG/control/count?method=$1&chat=${2:-0}"; } # method, [chat]
@@ -410,7 +412,7 @@ case "$reply" in "You have no session named \`side\`"*) pass "another user canno
     *) fail "another user cannot switch to it (got '$reply')";; esac
 expect "the other user has no sessions" "$(tg_sessions 9003)" ""
 
-stop_bot "Ctrl-C stops the bot cleanly"
+stop_bot TERM "SIGTERM stops the bot cleanly"
 polls=$(tg_count getUpdates)
 start_bot
 tg_wait getUpdates 0 $((polls + 1)) "the restarted bot started polling"
@@ -457,7 +459,7 @@ expect "the code word never reached the other telegram user's sessions" \
           WHERE u.external_id = '9001' AND m.json LIKE '%OTTER%'")" "0"
 expect "/usage answers from the database" "$(tg_say 9002 /usage | cut -d: -f1)" "default"
 
-stop_bot "the restarted bot stops cleanly"
+stop_bot INT "Ctrl-C stops the restarted bot cleanly"
 expect "no session lacks an owner" \
     "$(q "SELECT COUNT(*) FROM sessions s LEFT JOIN users u ON u.id = s.user_id WHERE u.id IS NULL")" "0"
 if grep -q "$TG_SECRET" "$WORK/bot.log"; then fail "the bot token never reaches the log"; fi

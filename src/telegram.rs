@@ -27,6 +27,7 @@
 use crate::agent;
 use crate::runner::Run;
 use crate::service::{self, Service, Session, User};
+use crate::shutdown;
 use crate::store::{self, Store};
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
@@ -34,7 +35,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
-use teloxide::dispatching::{DefaultKey, Dispatcher, UpdateFilterExt};
+use teloxide::dispatching::{DefaultKey, Dispatcher, ShutdownToken, UpdateFilterExt};
 use teloxide::prelude::{Requester, Update};
 use teloxide::types::{BotCommand, ChatAction, ChatId, Message};
 use teloxide::update_listeners::Polling;
@@ -735,13 +736,9 @@ where
 pub type TelegramDispatcher = Dispatcher<Bot, Infallible, DefaultKey>;
 
 /// The teloxide dispatcher for `app`. Messages go to [`Telegram::handle`];
-/// other updates are logged. With `ctrlc`, Ctrl-C (SIGINT) shuts it down
-/// gracefully; tests stop it with its `shutdown_token()` instead.
-pub fn dispatcher<R: Run + 'static>(
-    bot: Bot,
-    app: Arc<Telegram<R>>,
-    ctrlc: bool,
-) -> TelegramDispatcher {
+/// other updates are logged. Stop it with its `shutdown_token()`: `main`
+/// does that on SIGINT or SIGTERM, tests do it directly.
+pub fn dispatcher<R: Run + 'static>(bot: Bot, app: Arc<Telegram<R>>) -> TelegramDispatcher {
     let log = app.log.clone();
     let handler = Update::filter_message().endpoint(on_message::<R>);
     let builder = Dispatcher::builder(bot, handler)
@@ -750,11 +747,25 @@ pub fn dispatcher<R: Run + 'static>(
             let log = log.clone();
             async move { log(&format!("ignoring update {}: not a message", update.id.0)) }
         });
-    if ctrlc {
-        builder.enable_ctrlc_handler().build()
-    } else {
-        builder.build()
-    }
+    builder.build()
+}
+
+/// Shut the dispatcher down on the first stop signal from `stop` that
+/// arrives while it is polling; `serve` then waits for the turns in flight.
+/// This is what teloxide's own Ctrl-C handler does, for SIGTERM too. A
+/// signal before polling has started is ignored.
+pub fn stop_on<F: Future<Output = ()> + Send + 'static>(
+    token: ShutdownToken,
+    stop: impl Fn() -> F + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            stop().await;
+            if token.shutdown().is_ok() {
+                break;
+            }
+        }
+    })
 }
 
 async fn on_message<R: Run + 'static>(
@@ -814,6 +825,7 @@ pub async fn serve<R: Run + 'static>(
 /// `athena telegram`, wired to the environment: the token, the database,
 /// OpenRouter. Every setting is checked before the database is opened.
 pub async fn main(model: &str) -> Result<()> {
+    let stop = shutdown::listen()?;
     let config = Config::from_env()?;
     let client = agent::client()?;
     let store = Store::open(&store::path())?;
@@ -826,8 +838,9 @@ pub async fn main(model: &str) -> Result<()> {
         Arc::new(log_to_stderr),
     ));
     let bot = config.bot();
-    let mut dispatcher = dispatcher(bot.clone(), app.clone(), true);
-    log_to_stderr("polling for messages; Ctrl-C stops");
+    let mut dispatcher = dispatcher(bot.clone(), app.clone());
+    stop_on(dispatcher.shutdown_token(), stop);
+    log_to_stderr("polling for messages; Ctrl-C or SIGTERM stops");
     serve(&mut dispatcher, bot, &app).await
 }
 

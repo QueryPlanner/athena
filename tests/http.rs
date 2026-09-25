@@ -855,6 +855,17 @@ fn blocking_request(addr: &str, request: &str) -> String {
 
 #[test]
 fn the_binary_serves_until_ctrl_c_and_then_exits_cleanly() {
+    serves_until("INT");
+}
+
+#[test]
+fn the_binary_serves_until_sigterm_and_then_exits_cleanly() {
+    serves_until("TERM");
+}
+
+/// Start `athena serve`, use it, send it `signal`, and check it shut down
+/// gracefully rather than being killed.
+fn serves_until(signal: &str) {
     let tmp = TempDb::new();
     let dir = WorkDir::new();
     // A key that is never used: nothing here reaches the model.
@@ -886,7 +897,7 @@ fn the_binary_serves_until_ctrl_c_and_then_exits_cleanly() {
         ),
     );
     let interrupted = std::process::Command::new("kill")
-        .args(["-INT", &child.id().to_string()])
+        .args([&format!("-{signal}"), &child.id().to_string()])
         .status()
         .unwrap();
     // The timeout only turns a hang into a failure.
@@ -894,7 +905,7 @@ fn the_binary_serves_until_ctrl_c_and_then_exits_cleanly() {
     std::thread::spawn(move || done.send(child.wait()));
     let status = exited
         .recv_timeout(std::time::Duration::from_secs(60))
-        .expect("athena serve did not exit after Ctrl-C")
+        .expect("athena serve did not exit after the signal")
         .unwrap();
     let mut rest = String::new();
     stderr.read_to_string(&mut rest).unwrap();

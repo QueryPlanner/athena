@@ -100,8 +100,8 @@ pub async fn serve(
 
 /// `athena serve [--addr HOST:PORT]`.
 ///
-/// `interrupt` returns a future that resolves on the next Ctrl-C; see
-/// [`serve_until_interrupted`].
+/// `interrupt` returns a future that resolves on the next stop signal
+/// (SIGINT or SIGTERM); see [`serve_until_interrupted`].
 pub async fn run<F: Future<Output = ()> + Send + 'static>(
     args: &[String],
     service: Arc<Service>,
@@ -129,12 +129,12 @@ pub async fn serve_until_interrupted<F: Future<Output = ()> + Send + 'static>(
     let first = interrupt();
     let shutdown = async move {
         first.await;
-        eprintln!("shutting down after the turns in flight; Ctrl-C again to quit now");
+        eprintln!("shutting down after the turns in flight; signal again (Ctrl-C) to quit now");
         // Nobody listens once `run` has returned.
         let _ = stopping.send(());
     };
     let forced = async {
-        // Only a Ctrl-C after the first one counts. An error means `serve`
+        // Only a signal after the first one counts. An error means `serve`
         // ended without a shutdown, and then it has already won the select.
         let _ = stopped.await;
         interrupt().await;
