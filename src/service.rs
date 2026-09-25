@@ -23,6 +23,7 @@
 
 use crate::runner::{self, Run, RunStart, RunStream};
 use crate::store::{AppendError, SqliteMemory, Store, now_millis};
+use crate::{agent, telemetry};
 use futures_util::StreamExt;
 use rig_agent::agent::{MultiTurnStreamItem, PromptResponse, StreamingError, StreamingResult};
 use rig_agent::completion::{CompletionError, PromptError};
@@ -30,6 +31,7 @@ use rig_agent::prelude::Message;
 use rig_agent::streaming::StreamedAssistantContent;
 use std::sync::Arc;
 use tokio::sync::{OwnedMutexGuard, mpsc, watch};
+use tracing::Instrument;
 
 type SessionLock = OwnedMutexGuard<()>;
 
@@ -69,6 +71,20 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl Error {
+    /// A short, stable name for the kind of failure, for telemetry.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::AlreadyExists(_) => "already_exists",
+            Self::Invalid(_) => "invalid",
+            Self::Conflict(_) => "conflict",
+            Self::Model(_) => "model",
+            Self::Storage(_) => "storage",
+        }
+    }
+}
 
 impl From<anyhow::Error> for Error {
     fn from(e: anyhow::Error) -> Self {
@@ -199,7 +215,9 @@ impl Service {
         text: &str,
     ) -> Result<Turn, Error> {
         let (session, lock) = self.claim(user, session_id, text).await?;
+        let span = turn_span(user, &session);
         self.complete(&session, lock, agent.run(text, &session.id))
+            .instrument(span)
             .await
     }
 
@@ -218,11 +236,15 @@ impl Service {
         text: &str,
     ) -> Result<Turn, Error> {
         let (session, lock) = self.claim(user, session_id, text).await?;
+        let span = turn_span(user, &session);
         let (service, text) = (self.clone(), text.to_string());
-        self.spawn(async move {
-            let run = agent.run(&text, &session.id);
-            service.complete(&session, lock, run).await
-        })
+        self.spawn(
+            async move {
+                let run = agent.run(&text, &session.id);
+                service.complete(&session, lock, run).await
+            }
+            .instrument(span),
+        )
         .await
         .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
     }
@@ -248,16 +270,22 @@ impl Service {
         text: &str,
     ) -> Result<TurnStream, Error> {
         let (session, lock) = self.claim(user, session_id, text).await?;
+        let span = turn_span(user, &session);
         let (events, receiver) = mpsc::unbounded_channel();
         let (service, text) = (self.clone(), text.to_string());
         // The handle is not needed: the task reports through `events`, and a
         // panic in it closes the channel without a `Done`.
-        drop(self.spawn(async move {
-            let run = relay(agent.stream(&text, &session.id), &events);
-            let outcome = service.complete(&session, lock, run).await;
-            // The receiver may be gone; the turn is saved either way.
-            let _ = events.send(TurnEvent::Done(outcome));
-        }));
+        drop(
+            self.spawn(
+                async move {
+                    let run = relay(agent.stream(&text, &session.id), &events);
+                    let outcome = service.complete(&session, lock, run).await;
+                    // The receiver may be gone; the turn is saved either way.
+                    let _ = events.send(TurnEvent::Done(outcome));
+                }
+                .instrument(span),
+            ),
+        );
         Ok(TurnStream { events: receiver })
     }
 
@@ -327,12 +355,48 @@ impl Service {
             first_seq,
         };
         let (reply, run) = settle(start, outcome, receipt.appended);
+        record_on_span(&tracing::Span::current(), &reply, &run);
 
         let row = run.clone();
         if let Err(e) = self.store.call(move |s| s.save_run(&row)).await {
             (self.warn)(&format!("run telemetry not saved: {e}"));
         }
         reply.map(|reply| Turn { reply, run })
+    }
+}
+
+/// The span one turn runs in: Athena's `invoke_agent`, which Rig adopts
+/// instead of opening its own, so its `chat` and `execute_tool` spans nest
+/// under it. Created in the caller's context, so an HTTP request's span is
+/// its parent even when the turn then runs in its own task.
+fn turn_span(user: &User, session: &Session) -> tracing::Span {
+    tracing::info_span!(
+        "invoke_agent",
+        otel.name = format!("invoke_agent {}", agent::NAME),
+        otel.status_code = tracing::field::Empty,
+        gen_ai.operation.name = "invoke_agent",
+        gen_ai.agent.name = agent::NAME,
+        gen_ai.conversation.id = session.id.as_str(),
+        // Rig records the prompt here when content telemetry is on.
+        gen_ai.prompt = tracing::field::Empty,
+        gen_ai.usage.input_tokens = tracing::field::Empty,
+        gen_ai.usage.output_tokens = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+        athena.run_id = tracing::field::Empty,
+        athena.transport = user.transport(),
+        enduser.pseudo.id = telemetry::pseudonym(user),
+    )
+}
+
+/// Put what the turn came to on its span. Rig records usage only on spans
+/// it opened itself, so the run's totals are copied here.
+fn record_on_span(span: &tracing::Span, reply: &Result<String, Error>, run: &RunRecord) {
+    span.record("athena.run_id", run.run_id.as_str());
+    span.record("gen_ai.usage.input_tokens", run.input_tokens);
+    span.record("gen_ai.usage.output_tokens", run.output_tokens);
+    if let Err(e) = reply {
+        span.record("otel.status_code", "ERROR");
+        span.record("error.type", e.kind());
     }
 }
 
@@ -532,6 +596,29 @@ mod tests {
                 .collect()
             })
             .await
+    }
+
+    #[test]
+    fn every_error_has_a_distinct_kind_for_telemetry() {
+        let kinds = [
+            Error::NotFound.kind(),
+            Error::AlreadyExists("n".into()).kind(),
+            Error::Invalid("i".into()).kind(),
+            Error::Conflict("c".into()).kind(),
+            Error::Model(anyhow::anyhow!("m")).kind(),
+            Error::Storage(anyhow::anyhow!("s")).kind(),
+        ];
+        assert_eq!(
+            kinds,
+            [
+                "not_found",
+                "already_exists",
+                "invalid",
+                "conflict",
+                "model",
+                "storage"
+            ]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

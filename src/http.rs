@@ -13,6 +13,7 @@ use crate::service::{
     self, RunRecord, Service, Session, SessionSummary, SessionUsage, Turn, TurnEvent, TurnStream,
     User,
 };
+use crate::telemetry;
 use anyhow::{Context, bail};
 use axum::Router;
 use axum::body::Bytes;
@@ -30,6 +31,8 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// The header that says who is asking. See the module docs.
 pub const USER_HEADER: &str = "x-athena-user";
@@ -79,6 +82,7 @@ pub fn router(service: Arc<Service>, agent: Arc<Agent>, hosts: Hosts) -> Router 
         .route("/sessions/{id}/messages", get(messages).post(send))
         .route("/sessions/{id}/messages/stream", post(send_stream))
         .route("/usage", get(usage))
+        .layer(axum::middleware::from_fn(traced))
         .with_state(App {
             service,
             agent,
@@ -139,7 +143,9 @@ pub async fn serve_until_interrupted<F: Future<Output = ()> + Send + 'static>(
     let first = interrupt();
     let shutdown = async move {
         first.await;
-        eprintln!("shutting down after the turns in flight; signal again (Ctrl-C) to quit now");
+        tracing::info!(
+            "shutting down after the turns in flight; signal again (Ctrl-C) to quit now"
+        );
         // Nobody listens once `run` has returned.
         let _ = stopping.send(());
     };
@@ -379,7 +385,39 @@ impl IntoResponse for ApiError {
 }
 
 fn log(message: &str) {
-    eprintln!("athena serve: {message}");
+    tracing::error!("{message}");
+}
+
+// ---- tracing ----
+
+/// Run each request in a server span, parented to the caller's W3C
+/// `traceparent` if it sent one, and name the trace in the response's
+/// `x-trace-id` and `traceparent` headers so a client can find it. Without
+/// OpenTelemetry there is no trace, and no such headers.
+async fn traced(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let method = request.method().clone();
+    // The route, not the path: session ids would make every name unique.
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map_or("unmatched", |path| path.as_str())
+        .to_string();
+    let span = tracing::info_span!(
+        "http.request",
+        otel.name = format!("{method} {route}"),
+        otel.kind = "server",
+        http.request.method = method.as_str(),
+        http.route = route,
+        http.response.status_code = tracing::field::Empty,
+    );
+    // Only fails when OpenTelemetry is off, when there is no trace to join.
+    let _ = span.set_parent(telemetry::remote_context(request.headers()));
+    let mut response = next.run(request).instrument(span.clone()).await;
+    span.record("http.response.status_code", response.status().as_u16());
+    response
+        .headers_mut()
+        .extend(telemetry::trace_headers(&span));
+    response
 }
 
 // ---- handlers ----

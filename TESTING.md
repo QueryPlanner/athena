@@ -72,6 +72,12 @@ a "no API key" test would find one and call the provider.
   `MockStreamEvent::final_response`: without it Rig treats the turn as
   truncated and fails it.
 
+`tests/telemetry.rs` installs the tracing layers for one thread with
+exporters that keep what they are sent, runs real turns through the router
+and the service, and checks the spans, their nesting and the log records.
+It also runs `athena serve` against a fake OTLP collector on loopback and
+checks that SIGTERM flushes traces and logs to it.
+
 `tests/http.rs` drives the HTTP API in-process through the router
 (`tower::ServiceExt::oneshot`), the server over real loopback TCP, and
 `athena serve` as the built binary, stopped with SIGINT so its coverage is

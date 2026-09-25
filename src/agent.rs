@@ -19,6 +19,8 @@ fn read_file(path: String) -> Result<String, rig::tool::ToolExecutionError> {
 
 // ---------------- definition ----------------
 
+/// Reported as `gen_ai.agent.name` on every turn's span.
+pub const NAME: &str = "athena";
 pub const PREAMBLE: &str = "You are a helpful assistant.";
 pub const DEFAULT_MODEL: &str = "openai/gpt-5.6-luna";
 
@@ -57,6 +59,9 @@ pub fn build(
 /// production preamble and tools rather than a copy of them.
 pub fn configure(builder: rig::agent::AgentBuilder) -> rig::agent::Agent {
     builder
+        .name(NAME)
+        // Prompt and reply text on spans, only with ATHENA_RECORD_CONTENT=1.
+        .record_content_telemetry(crate::telemetry::record_content())
         .preamble(PREAMBLE)
         .tool(Add)
         .tool(ReadFile)
