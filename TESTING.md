@@ -6,7 +6,7 @@ anything that touches the agent loop, storage or a transport.
 | Layer | Command | Network | What it proves |
 |---|---|---|---|
 | Unit | `cargo test --lib` | none | Each function's rules, including the error paths |
-| Integration | `cargo test --tests` | none | The real Rig agent loop and real tools against a scripted model and a real SQLite file. The CLI in-process and as the built binary. Upgrades from every earlier schema. |
+| Integration | `cargo test --tests` | none | The real Rig agent loop and real tools against a scripted model and a real SQLite file. The CLI in-process and as the built binary. The Telegram bot against a fake Bot API. Upgrades from every earlier schema. |
 | End-to-end | `scripts/e2e.sh` | OpenRouter | The real provider, several processes, one database |
 
 ## Before opening a PR
@@ -78,6 +78,15 @@ written. A client that disconnects is simulated by dropping the response
 body or the request future, which is what hyper does when a socket closes.
 Turns are parked inside a wrapping memory (`ParkedAppend`), never timed.
 
+`tests/telegram.rs` drives the Telegram transport through
+`tests/telegram/fake_api.rs`, a fake Bot API server on a local port. Point
+a `teloxide::Bot` at it with `set_api_url`, or the binary with
+`TELEGRAM_API_URL`. `api.push(text_from(user, text))` queues an update;
+`api.wait_for(...)` and `api.messages_to(chat, n)` wait on a condition over
+the recorded calls; `api.fail_next(method, error)` makes the next call to a
+method fail. The decision logic in `src/telegram.rs` is unit-tested through
+the `Chat` trait with a recording chat, so most cases need no server.
+
 Concurrency tests must be deterministic. Park a turn inside a wrapping
 `ConversationMemory` (see `Gated` in `src/service.rs`) and wait on a
 condition, never on a sleep. A timeout is acceptable only as a guard that
@@ -137,7 +146,8 @@ To change the schema:
 
 The CLI is the test interface. Everything a transport does must be reachable
 from it, so an agent can drive and check the real system without a browser
-or a chat app.
+or a chat app. One exception: the session a Telegram user has selected is
+not shown by the CLI yet. Read it from the `selected_sessions` table.
 
 ### Running it
 
@@ -201,6 +211,22 @@ assuming the code is wrong. The model may have refused or rephrased.
    gets an ok run and a whole transcript. Ctrl-C while a stream is running
    lets it end with `done`, saves its run, and exits 0.
 
+8. The Telegram bot: `scripts/fake_telegram.py`, a fake Bot API server,
+   and the real `athena telegram` binary against it through
+   `TELEGRAM_API_URL`. Checks that need no model run first: the command
+   menu is registered; `/new` creates and selects a session for that
+   Telegram user; `/sessions` marks it; `/switch` moves and stores the
+   selection, refuses a missing session and creates nothing; another user
+   cannot switch into it. Ctrl-C exits with status 0, and after a restart
+   `/sessions` still marks the selection and old updates are not handled
+   again. Then real turns: a new Telegram user's prompt creates the user
+   and their `default` session, stores one ok run, shows typing, and the
+   model's reply comes back through the fake API. Prompts go to the
+   selected session; `/switch` back resumes a conversation (a code word,
+   retried once), and it never reaches the other user's sessions. The bot
+   token never appears in the bot's log. Without a valid key the model-free
+   checks still pass and the first turn check fails.
+
 ### Extending it
 
 Every feature PR adds a numbered section for what it introduces, such as the
@@ -217,3 +243,35 @@ commands. Follow these rules:
 - A new invariant belongs in both places: a hermetic integration test
   proves the code, and an e2e check proves it holds against the real
   provider.
+- Start background processes with `&`, append their pid to `BG_PIDS`, and
+  wait on a condition (a file, a count from the fake server), never a fixed
+  sleep. The exit trap stops everything in `BG_PIDS`, on failure too.
+
+## Telegram, live (manual)
+
+A bot cannot message itself, so no script can talk to the real Telegram.
+Once you have a token from @BotFather, a person runs this checklist. Use a
+throwaway database.
+
+1. `export TELEGRAM_BOT_TOKEN=...` and `OPENROUTER_API_KEY=...`, then
+   `ATHENA_DB=/tmp/tg.db cargo run -- telegram`. It prints
+   `telegram: polling for messages`.
+2. Open the bot in Telegram. Type `/` and check the menu lists `new`,
+   `sessions`, `switch`, `usage` and `help`.
+3. Send `/start`: it says you are in session `default`.
+4. Send `Remember the code word LYNX-2211.` "typing..." shows, then a reply.
+5. Send `/new side`, then `Say hi.` Then `/sessions`: `* side` is marked and
+   both sessions show 2 messages.
+6. Send `/switch default`, then `What code word did I give you?`: the reply
+   has LYNX-2211.
+7. Send two messages quickly: the second is answered "Still working on your
+   last message".
+8. Ask for something long (`Write 6000 words about rivers.`): it arrives in
+   several messages, none cut mid-word unless a word is longer than a
+   message.
+9. Press Ctrl-C, start the bot again, send `/sessions`: `default` is still
+   marked. `/usage` lists both sessions.
+10. Add the bot to a group and send a message there: the bot says nothing,
+    and its stderr logs that it ignored the chat.
+11. `sqlite3 /tmp/tg.db "SELECT transport, external_id FROM users"` shows
+    `telegram` and your Telegram user id.

@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use athena::service::Service;
-use athena::{agent, cli, dotenv, http, store};
+use athena::{agent, cli, dotenv, http, store, telegram};
 use std::sync::Arc;
 
 fn main() -> Result<()> {
@@ -18,6 +18,9 @@ fn main() -> Result<()> {
 async fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let model = agent::model();
+    if telegram::requested(&args)? {
+        return telegram::main(&model).await;
+    }
     let service = Service::new(store::Store::open(&store::path())?, &model, cli::warn);
     if args.first().is_some_and(|a| a == "serve") {
         // Up front: a server without a key would fail every turn.

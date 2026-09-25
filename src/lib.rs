@@ -8,3 +8,4 @@ pub mod http;
 pub mod runner;
 pub mod service;
 pub mod store;
+pub mod telegram;
