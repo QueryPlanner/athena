@@ -18,6 +18,8 @@ export default function DefaultSearchDialog(props: SharedProps) {
   const { locale } = useI18n(); // (optional) for i18n
   const { search, setSearch, query } = useDocsSearch({
     client: staticClient({
+      // Next's basePath does not apply to fetch(), so prefix the index path.
+      from: `${process.env.NEXT_PUBLIC_BASE_PATH ?? ''}/api/search`,
       locale,
     }),
   });

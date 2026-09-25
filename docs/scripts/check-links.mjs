@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const OUT = fileURLToPath(new URL('../out/', import.meta.url));
+// Links in a build with a basePath start with it; the files in out/ do not.
+const BASE_PATH = process.env.DOCS_BASE_PATH ?? '';
 
 function htmlFiles(dir) {
   return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
@@ -36,7 +38,12 @@ for (const file of htmlFiles(OUT)) {
   for (const [, href] of html.matchAll(/href="(\/[^"]*)"/g)) {
     if (href.startsWith('//') || href.startsWith('/_next/')) continue;
     const [withQuery, rawAnchor] = href.split('#');
-    const pathname = withQuery.split('?')[0];
+    const withBase = withQuery.split('?')[0];
+    if (BASE_PATH && !withBase.startsWith(`${BASE_PATH}/`) && withBase !== BASE_PATH) {
+      broken.push(`${file.slice(OUT.length)} -> ${href} (missing base path ${BASE_PATH})`);
+      continue;
+    }
+    const pathname = withBase.slice(BASE_PATH.length) || '/';
     const anchor = rawAnchor && decodeURIComponent(rawAnchor);
     const target = pageFor(decodeURIComponent(pathname));
     if (!target) broken.push(`${file.slice(OUT.length)} -> ${href} (no page)`);

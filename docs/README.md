@@ -17,4 +17,13 @@ The content follows the repository's README.md and TESTING.md. When a
 behaviour changes, update both.
 
 CI (`.github/workflows/docs.yml`) runs the typecheck, the build and the link
-check on every pull request that touches `docs/`.
+check on every pull request that touches `docs/`. A push to `main` also
+deploys `out/` to GitHub Pages at https://queryplanner.github.io/athena/.
+
+CI builds with `DOCS_BASE_PATH=/athena`, because Pages serves the site under
+the repository name. Local builds leave it unset and serve from `/`. To try
+the Pages build locally:
+
+    DOCS_BASE_PATH=/athena npm run build && DOCS_BASE_PATH=/athena npm run check-links
+
+`DOCS_SITE_URL` sets the absolute base for Open Graph image URLs.

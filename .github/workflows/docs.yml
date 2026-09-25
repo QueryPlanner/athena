@@ -6,9 +6,15 @@ on:
   push:
     branches: [main]
     paths: ['docs/**', '.github/workflows/docs.yml']
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+# One Pages deployment at a time; never cancel one that is running.
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -16,6 +22,10 @@ jobs:
     defaults:
       run:
         working-directory: docs
+    env:
+      # Pull requests build the same site that main deploys, base path included.
+      DOCS_BASE_PATH: /athena
+      DOCS_SITE_URL: https://queryplanner.github.io/athena
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -30,3 +40,22 @@ jobs:
         run: npm run build
       - name: Check links
         run: npm run check-links
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/out
+
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
