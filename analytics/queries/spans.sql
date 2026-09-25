@@ -15,7 +15,7 @@ flat AS (
     SELECT resource_attrs, unnest(ss.spans) AS s FROM scoped
 )
 SELECT
-    list_extract(list_filter(resource_attrs, a -> a.key = 'deployment.environment.name'), 1).value.stringValue AS env,
+    list_extract(list_filter(resource_attrs, lambda a: a.key = 'deployment.environment.name'), 1).value.stringValue AS env,
     s.traceId AS trace_id,
     s.spanId AS span_id,
     s.name AS span_name,
@@ -23,5 +23,5 @@ SELECT
     (CAST(s.endTimeUnixNano AS HUGEINT) - CAST(s.startTimeUnixNano AS HUGEINT)) / 1e6 AS duration_ms,
     coalesce(s.status.code, 0) = 2 AS is_error,
     s.status.message AS status_message,
-    list_extract(list_filter(s.attributes, a -> a.key = 'gen_ai.tool.name'), 1).value.stringValue AS tool_name
+    list_extract(list_filter(s.attributes, lambda a: a.key = 'gen_ai.tool.name'), 1).value.stringValue AS tool_name
 FROM flat;
