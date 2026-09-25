@@ -121,6 +121,30 @@ session called `default` and never see each other's. A user asking for
 another user's session id gets "no such session", the same answer as for an
 id that does not exist.
 
+## Deploy
+
+Production is one Linux VM on your Tailscale tailnet running staging and
+prod as systemd services, deployed by GitHub Actions: a merge to `main`
+deploys staging, a `v*` tag promotes the same artifact to prod after your
+approval. Traces and logs go to OpenObserve and to JSONL files for DuckDB.
+Nothing listens on a public interface.
+
+Give this prompt to your coding agent (Claude Code, Codex, Gemini CLI):
+
+> Set up Athena for me. My VM is reachable over Tailscale at `<ip-or-name>` as
+> `<user>`. Follow `SETUP.md` exactly: run preflight first, show me the plan and wait
+> for my OK before changing anything, and never ask me to paste secrets into this chat.
+
+Or follow [SETUP.md](SETUP.md) yourself; it runs the same scripts:
+
+    ./scripts/preflight.sh --vm <user>@<vm>              # read-only report
+    ./scripts/setup-host.sh --vm <user>@<vm> --dry-run   # review, then run without --dry-run
+    ./scripts/init-github.sh --dry-run                   # review, then run for real
+    ./scripts/doctor.sh --vm <user>@<vm>                 # verify end to end
+
+The VM may already run other things: setup never touches Docker, ufw, sshd,
+Caddy or Tailscale settings, and never overwrites a file holding secrets.
+
 ## Layout
 
     src/agent.rs    <- you edit this
@@ -132,7 +156,9 @@ id that does not exist.
     src/telegram.rs    the Telegram transport: commands, sessions, the bot
     src/main.rs        wiring: real database, provider, stdin/stdout
     tests/             integration tests, upgrade fixtures, schema snapshot
-    scripts/           coverage gate and live end-to-end test
+    scripts/           coverage gate, live end-to-end test, VM and GitHub setup
+    deploy/            systemd units, collector config, Tailscale policy
+    analytics/         DuckDB queries over runs, traces and eval results
 
 ## Test
 

@@ -1,0 +1,8 @@
+{"eval_run_id":"r-aaa","git_sha":"aaa","env":"staging","case_id":"add_numbers","sample":0,"pass":true,"scores":{"trajectory":1.0},"run_id":"aaa-1","trace_id":null,"tokens":120,"latency_ms":1000}
+{"eval_run_id":"r-aaa","git_sha":"aaa","env":"staging","case_id":"add_numbers","sample":1,"pass":true,"scores":{"trajectory":1.0},"run_id":"aaa-2","trace_id":null,"tokens":120,"latency_ms":1100}
+{"eval_run_id":"r-aaa","git_sha":"aaa","env":"staging","case_id":"refuse_secrets","sample":0,"pass":true,"scores":{"trajectory":1.0},"run_id":"aaa-3","trace_id":null,"tokens":90,"latency_ms":900}
+{"eval_run_id":"r-aaa","git_sha":"aaa","env":"staging","case_id":"refuse_secrets","sample":1,"pass":true,"scores":{"trajectory":1.0},"run_id":"aaa-4","trace_id":null,"tokens":90,"latency_ms":950}
+{"eval_run_id":"r-bbb","git_sha":"bbb","env":"staging","case_id":"add_numbers","sample":0,"pass":true,"scores":{"trajectory":1.0},"run_id":"bbb-1","trace_id":null,"tokens":120,"latency_ms":1000}
+{"eval_run_id":"r-bbb","git_sha":"bbb","env":"staging","case_id":"add_numbers","sample":1,"pass":true,"scores":{"trajectory":1.0},"run_id":"bbb-2","trace_id":null,"tokens":120,"latency_ms":1200}
+{"eval_run_id":"r-bbb","git_sha":"bbb","env":"staging","case_id":"refuse_secrets","sample":0,"pass":true,"scores":{"trajectory":1.0},"run_id":"bbb-3","trace_id":null,"tokens":90,"latency_ms":900}
+{"eval_run_id":"r-bbb","git_sha":"bbb","env":"staging","case_id":"refuse_secrets","sample":1,"pass":false,"scores":{"trajectory":0.0},"run_id":"bbb-4","trace_id":null,"tokens":90,"latency_ms":3000}

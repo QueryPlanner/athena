@@ -91,6 +91,8 @@ The sandbox image is a separate Docker image:
 - `athena` (system user) runs the services.
 - `deploy` (system user with a shell) is used only through forced-command SSH keys.
 - sudoers: `deploy ALL=(root) NOPASSWD: /opt/athena/bin/deploy-gate *`
+  plus `Defaults!/opt/athena/bin/deploy-gate env_keep += "SSH_ORIGINAL_COMMAND"`, so
+  the forced command's request survives `sudo` (file `/etc/sudoers.d/athena-deploy`).
 
 **Ports** (all bound to the VM's tailnet IP unless noted)
 
@@ -196,7 +198,9 @@ On a failed health check it puts the previous `current` back, restarts, and exit
   `bench-staging`, then `smoke-staging` + `eval-staging` (advisory).
 - **push tag `v*`:** `require-stage-success` (the tagged sha's main run must be
   green), then `deploy-prod` (environment `prod`, required reviewer; `oras tag` the
-  digest with the version, `promote prod`), then `smoke-prod`.
+  digest with the version, `promote prod`), then `smoke prod`. The prod smoke runs
+  as a step of `deploy-prod`: a separate job on the `prod` environment would ask
+  the reviewer to approve a second time.
 
 **Rules**
 - Actions are pinned to commit SHAs.

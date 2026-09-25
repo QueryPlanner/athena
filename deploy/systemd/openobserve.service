@@ -1,0 +1,40 @@
+# OpenObserve: traces, logs and metrics UI, on the VM's tailnet IP :5080.
+# Binary: /usr/local/bin/openobserve (pinned by scripts/setup-host.sh).
+# Settings: /etc/openobserve/openobserve.env (root, 0600), from
+# deploy/openobserve/openobserve.env.template.
+[Unit]
+Description=OpenObserve
+Documentation=https://openobserve.ai/docs/
+Wants=network-online.target
+After=network-online.target tailscaled.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=openobserve
+Group=openobserve
+EnvironmentFile=/etc/openobserve/openobserve.env
+WorkingDirectory=/var/lib/openobserve
+ExecStart=/usr/local/bin/openobserve
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+# Its footprint at Athena's volume is unmeasured; the env file caps its
+# caches well below this limit.
+MemoryMax=512M
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/openobserve
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
