@@ -22,9 +22,6 @@ set -euo pipefail
 ORAS_VERSION=1.3.4
 ORAS_SHA256=f27adb935022d94df8dc77719c322dda592c78a0d57a6f7dcdd8d900b248c454
 ORAS_URL="https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
-OTELCOL_VERSION=0.161.0
-OTELCOL_SHA256=9ea10aff606104408b253925ab66e8bd2a09217359e675a3c28b34e2b56aee5b
-OTELCOL_URL="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTELCOL_VERSION}/otelcol-contrib_${OTELCOL_VERSION}_linux_amd64.deb"
 OPENOBSERVE_VERSION=v1.0.4
 OPENOBSERVE_SHA256=5c1b18bc072658c045ff32ca7dd0d2e3f22fac1209755d7a0ef5fd6448896e61
 OPENOBSERVE_URL="https://downloads.openobserve.ai/releases/openobserve/${OPENOBSERVE_VERSION}/openobserve-${OPENOBSERVE_VERSION}-linux-amd64.tar.gz"
@@ -70,7 +67,7 @@ Usage: setup-host.sh [options]
   --host-alias NAME          extra Host name accepted by Athena (default athena-vm)
   --o2-email EMAIL           OpenObserve root user (default admin@athena.internal)
   --repo REF                 release repository (default ghcr.io/queryplanner/athena)
-  --skip-observability       do not install otelcol-contrib or OpenObserve
+  --skip-observability       do not install OpenObserve (Athena still writes JSONL)
   --uninstall                stop and remove Athena's units, binaries and rules;
                              keeps /etc/athena and the databases
   --purge                    with --uninstall: also delete /etc/athena,
@@ -293,10 +290,10 @@ check_ports() {
     step "ports"
     command -v ss >/dev/null 2>&1 || { warn "ss not found; port check skipped"; return 0; }
     local port line conflict=0
-    for port in "$PORT_PROD" "$PORT_STAGING" "$PORT_O2" 4317 4318; do
+    for port in "$PORT_PROD" "$PORT_STAGING" "$PORT_O2"; do
         line=$(ss -Hltnp "sport = :$port" 2>/dev/null || true)
         [ -n "$line" ] || continue
-        if grep -Eq '"(athena|openobserve|otelcol-contrib)"' <<<"$line"; then
+        if grep -Eq '"(athena|openobserve)"' <<<"$line"; then
             same "port $port (already ours)"
         elif ! grep -q 'users:' <<<"$line"; then
             warn "port $port is in use; run as root to see by whom"
@@ -329,14 +326,6 @@ ensure_users() {
                 --shell /usr/sbin/nologin openobserve
             changed "user openobserve"
         fi
-        # Same command as the otelcol-contrib package's preinst, which skips
-        # it when the user exists. Created early so the collector's env file
-        # can be group-owned before the package is installed.
-        if id otelcol-contrib >/dev/null 2>&1; then same "user otelcol-contrib"; else
-            run useradd --system --user-group --no-create-home --shell /sbin/nologin otelcol-contrib
-            stamp_set user-otelcol-contrib created
-            changed "user otelcol-contrib (runs the collector)"
-        fi
     fi
 }
 
@@ -353,6 +342,8 @@ ensure_dirs() {
         ensure_dir "/opt/athena/$env" 0755 root:root
         ensure_dir "/var/lib/athena/$env" 0750 "$athena"
         ensure_dir "/var/lib/athena/$env/backups" 0750 "$athena"
+        # ATHENA_TELEMETRY_DIR: Athena's own JSONL spans and logs.
+        ensure_dir "/var/lib/athena/$env/telemetry" 0750 "$athena"
     done
 }
 
@@ -383,58 +374,33 @@ install_duckdb() {
     changed "installed duckdb $DUCKDB_VERSION"
 }
 
-# Runs after install_openobserve: the collector's env file is derived from
-# OpenObserve's. Our config, drop-in and env file go in place BEFORE dpkg,
-# because the package's postinst restarts the collector at once; without them
-# it would start on the vendor config, which listens on 0.0.0.0 (OTLP, pprof,
-# zpages, Jaeger, Zipkin). --force-confold keeps our config.yaml (a conffile)
-# without a prompt, which >/dev/null would otherwise hide on an upgrade.
-install_otelcol() {
-    step "otelcol-contrib $OTELCOL_VERSION"
-    local have restart=0 otel
-    otel=$(owner_or_root otelcol-contrib)
-    ensure_dir /var/lib/athena/otel 0750 "$otel"
-    install_file "$REPO_ROOT/deploy/otel/config.yaml" /etc/otelcol-contrib/config.yaml 0644 root:root && restart=1
-    install_file "$REPO_ROOT/deploy/otel/otelcol-contrib.override.conf" \
-        /etc/systemd/system/otelcol-contrib.service.d/athena.conf 0644 root:root && restart=1
-
-    local o2env=/etc/openobserve/openobserve.env colenv=/etc/otelcol-contrib/openobserve.env
-    if [ -f "$colenv" ]; then
-        fix_mode "$colenv" 0640 "root:${otel##*:}"
-        same "$colenv"
-    elif [ "$DRY_RUN" = 1 ]; then
-        changed "would create $colenv (0640 root:otelcol-contrib) with the OpenObserve basic-auth header"
-    else
-        local email pass
-        email=$(sed -n 's/^ZO_ROOT_USER_EMAIL=//p' "$o2env")
-        pass=$(sed -n 's/^ZO_ROOT_USER_PASSWORD=//p' "$o2env")
-        {
-            echo "# Written by setup-host.sh from $o2env. Used by deploy/otel/config.yaml."
-            echo "OPENOBSERVE_OTLP_ENDPOINT=http://$TAILNET_IP:$PORT_O2/api/default"
-            printf 'OPENOBSERVE_AUTH=Basic %s\n' "$(printf '%s:%s' "$email" "$pass" | base64 -w0)"
-        } >"$WORK/col.env"
-        install -D -m 0640 -o root -g "${otel##*:}" "$WORK/col.env" "$colenv"
-        changed "created $colenv"
-        restart=1
+# Earlier versions of this script ran an OpenTelemetry Collector between
+# Athena and OpenObserve. Athena now exports to both itself, so a collector
+# this script set up is stopped, and purged if this script installed it.
+# Its old JSONL files in /var/lib/athena/otel are left for a human.
+retire_otelcol() {
+    local dropin=/etc/systemd/system/otelcol-contrib.service.d/athena.conf
+    [ -e "$dropin" ] || [ -n "$(stamp_get otelcol-contrib)" ] || return 0
+    step "retire otelcol-contrib (replaced by Athena's own exporters)"
+    run systemctl disable --now otelcol-contrib.service >/dev/null 2>&1 || true
+    changed "stopped and disabled otelcol-contrib"
+    if [ -e "$dropin" ]; then
+        run rm -f "$dropin" /etc/otelcol-contrib/openobserve.env
+        changed "removed the otelcol-contrib drop-in and its OpenObserve env file"
     fi
-
-    have=$(dpkg-query -W -f='${Version}' otelcol-contrib 2>/dev/null || true)
-    if [ "$have" = "$OTELCOL_VERSION" ]; then
-        same "otelcol-contrib $OTELCOL_VERSION"
-    elif [ "$DRY_RUN" = 1 ]; then
-        changed "would install otelcol-contrib $OTELCOL_VERSION (.deb; currently '${have:-absent}')"
-    else
-        fetch "$OTELCOL_URL" "$OTELCOL_SHA256" "$WORK/otelcol.deb"
-        [ -n "$have" ] || stamp_set otelcol-contrib "$OTELCOL_VERSION"
-        dpkg --force-confdef --force-confold -i "$WORK/otelcol.deb" >/dev/null
-        changed "installed otelcol-contrib $OTELCOL_VERSION"
-        restart=1
+    if [ -n "$(stamp_get otelcol-contrib)" ]; then
+        run dpkg --purge otelcol-contrib >/dev/null || warn "dpkg --purge otelcol-contrib failed; remove it by hand"
+        run rm -f "$STAMPS/otelcol-contrib"
+        changed "purged otelcol-contrib (this script installed it)"
     fi
-    OTEL_RESTART=$restart
+    [ -d /var/lib/athena/otel ] &&
+        todo "the collector's old JSONL files are still in /var/lib/athena/otel; delete them when no longer needed"
+    return 0
 }
 
 # OpenObserve root credentials: generated once into a root-only file, never
-# printed, never overwritten. The collector gets a derived basic-auth header.
+# printed, never overwritten. Athena's env files get a derived basic-auth
+# header (see otlp_block).
 install_openobserve() {
     step "OpenObserve $OPENOBSERVE_VERSION"
     local restart=0
@@ -485,10 +451,74 @@ install_units() {
     done
 }
 
+# The OTLP lines of an env file: OpenObserve's ingest endpoint and a basic
+# auth header derived from its root credentials, or a note that there is no
+# OTLP export. On a dry run the header is a placeholder, so the password is
+# never printed.
+otlp_block() {
+    if [ "$SKIP_OBSERVABILITY" = 1 ]; then
+        echo "# No OpenObserve (setup-host.sh --skip-observability), so no OTLP export."
+        return 0
+    fi
+    local o2env=/etc/openobserve/openobserve.env auth
+    if [ "$DRY_RUN" = 1 ]; then
+        auth="<base64 of the OpenObserve root user:password, from $o2env>"
+    else
+        local email pass
+        email=$(sed -n 's/^ZO_ROOT_USER_EMAIL=//p' "$o2env")
+        pass=$(sed -n 's/^ZO_ROOT_USER_PASSWORD=//p' "$o2env")
+        if [ -z "$email" ] || [ -z "$pass" ]; then die "$o2env has no root user or password"; fi
+        auth=$(printf '%s:%s' "$email" "$pass" | base64 -w0)
+    fi
+    echo "# OpenObserve's OTLP/HTTP ingest (org \"default\"). The header is basic auth"
+    echo "# for its root user, written by setup-host.sh from $o2env;"
+    echo "# if that password changes, update it here too."
+    echo "OTEL_EXPORTER_OTLP_ENDPOINT=http://$TAILNET_IP:$PORT_O2/api/default"
+    echo "OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic%20$auth"
+}
+
+# An env file written for the collector points Athena at 127.0.0.1:4318,
+# where nothing listens any more. Replace just that line (and rewrite the
+# comments that described the collector) with the telemetry settings; nothing
+# else in the file changes, and nothing is printed from it.
+LEGACY_OTLP_LINE=OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+migrate_env_file() {
+    local file=$1 env=$2
+    if ! [ -r "$file" ] || ! grep -qx "$LEGACY_OTLP_LINE" "$file"; then return 0; fi
+    if [ "$DRY_RUN" = 1 ]; then
+        changed "would replace the collector endpoint in $file with ATHENA_TELEMETRY_DIR and OpenObserve's OTLP settings"
+        return 0
+    fi
+    local block group
+    block=$(otlp_block)
+    group=$(stat -c %G "$file")
+    {
+        # Only if the file does not set them already.
+        grep -q '^ATHENA_TELEMETRY_DIR=' "$file" ||
+            echo "ATHENA_TELEMETRY_DIR=/var/lib/athena/$env/telemetry"
+        grep -q '^ATHENA_TELEMETRY_RETENTION_DAYS=' "$file" ||
+            echo "ATHENA_TELEMETRY_RETENTION_DAYS=30"
+        printf '%s\n' "$block"
+    } >"$WORK/otlp.block"
+    # The block replaces the first legacy line; any repeat is dropped.
+    awk -v block="$WORK/otlp.block" -v legacy="$LEGACY_OTLP_LINE" '
+        $0 == legacy && !done { while ((getline line < block) > 0) print line; close(block); done = 1; next }
+        $0 == legacy { next }
+        $0 == "# Telemetry to the local collector. Remove the line to turn telemetry off." { next }
+        $0 == "# 1 records prompts and responses on spans. Keep off in prod; the collector" {
+            print "# 1 records prompts and responses on spans. Ignored for prod."; next }
+        $0 == "# strips them for prod anyway." { next }
+        { print }' "$file" >"$WORK/migrated.env"
+    # Same owner and mode: install copies the content, not the metadata.
+    install -m 0640 -o root -g "$group" "$WORK/migrated.env" "$file"
+    changed "replaced the collector endpoint in $file with ATHENA_TELEMETRY_DIR and OpenObserve's OTLP settings"
+    todo "restart $env to use its new telemetry settings (or let the next deploy do it): sudo systemctl restart athena@$env.target. A release from before the collector was removed exports to OpenObserve with them but writes no JSONL files until the next deploy"
+}
+
 # /etc/athena/<env>.env: created once, then only its mode is enforced.
 ensure_env_files() {
     step "environment files"
-    local env port tg file hosts
+    local env port tg file hosts otlp
     local group
     group=$(owner_or_root athena); group=${group##*:}
     for env in staging prod; do
@@ -507,10 +537,14 @@ ensure_env_files() {
             if [ -r "$file" ] && ! grep -q "^ATHENA_ADDR=$TAILNET_IP:$port\$" "$file"; then
                 warn "$file: ATHENA_ADDR is not $TAILNET_IP:$port; check it with sudoedit"
             fi
+            migrate_env_file "$file" "$env"
             continue
         fi
+        # A plain assignment, so a failure in otlp_block stops the script.
+        otlp=$(otlp_block)
         render "$REPO_ROOT/deploy/athena.env.template" ENV "$env" TAILNET_IP "$TAILNET_IP" \
-            PORT "$port" ALLOWED_HOSTS "$hosts" TELEGRAM_BLOCK "$tg" >"$WORK/$env.env"
+            PORT "$port" ALLOWED_HOSTS "$hosts" TELEGRAM_BLOCK "$tg" \
+            OTLP_BLOCK "$otlp" >"$WORK/$env.env"
         if [ "$DRY_RUN" = 1 ]; then
             changed "would create $file (0640 root:athena):"
             sed 's/^/      /' "$WORK/$env.env" >&2
@@ -622,11 +656,6 @@ enable_services() {
         run systemctl restart openobserve.service
         changed "(re)started openobserve"
     fi
-    if [ "${OTEL_RESTART:-0}" = 1 ] || ! systemctl is-active --quiet otelcol-contrib 2>/dev/null; then
-        run systemctl enable --quiet otelcol-contrib.service
-        run systemctl restart otelcol-contrib.service
-        changed "(re)started otelcol-contrib"
-    fi
 }
 
 report_tailscale() {
@@ -671,19 +700,13 @@ uninstall() {
             run rm -rf /usr/local/bin/openobserve /var/lib/openobserve /etc/openobserve
             changed "removed OpenObserve binary, data and settings"
         fi
-        if [ -e /etc/systemd/system/otelcol-contrib.service.d/athena.conf ]; then
-            run rm -f /etc/systemd/system/otelcol-contrib.service.d/athena.conf /etc/otelcol-contrib/openobserve.env
-            changed "removed the otelcol-contrib drop-in"
-        fi
-        if [ -n "$(stamp_get otelcol-contrib)" ]; then
-            run dpkg --purge otelcol-contrib >/dev/null
-            changed "purged otelcol-contrib (this script installed it)"
-        fi
+        retire_otelcol
         for bin in oras duckdb; do
             if [ -n "$(stamp_get "$bin")" ]; then run rm -f "/usr/local/bin/$bin"; changed "removed /usr/local/bin/$bin"; fi
         done
         local users=(deploy athena openobserve)
-        # Only when this script created it; the package never removes it.
+        # Only when an earlier version of this script created it for the
+        # collector; the package never removes it.
         [ -n "$(stamp_get user-otelcol-contrib)" ] && users+=(otelcol-contrib)
         for u in "${users[@]}"; do
             if id "$u" >/dev/null 2>&1; then run userdel -r "$u" >/dev/null 2>&1 || run userdel "$u"; changed "removed user $u"; fi
@@ -720,12 +743,9 @@ main() {
     ensure_dirs
     install_oras
     install_duckdb
-    OTEL_RESTART=0
     O2_RESTART=0
-    if [ "$SKIP_OBSERVABILITY" = 0 ]; then
-        install_openobserve
-        install_otelcol
-    fi
+    retire_otelcol
+    [ "$SKIP_OBSERVABILITY" = 1 ] || install_openobserve
     install_units
     ensure_env_files
     install_sudoers

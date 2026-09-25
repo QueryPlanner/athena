@@ -7,13 +7,14 @@
 #
 # Queries are templates. Placeholders filled here:
 #   {{ATHENA_DB}}     SQLite database, opened READ_ONLY (default /var/lib/athena/<env>/agent.db)
-#   {{OTEL_DIR}}      collector JSONL directory (default /var/lib/athena/otel)
+#   {{TELEMETRY_DIR}} directory of Athena's traces-*.jsonl files (default
+#                     /var/lib/athena/*/telemetry: both environments)
 #   {{EVAL_RESULTS}}  eval results JSONL glob (default results/*.jsonl)
 #   {{PRICES}}        analytics/prices.csv
 # A query marked "-- needs: spans.sql" gets analytics/queries/spans.sql first.
 #
 # With --vm the rendered SQL is copied to the VM and run there with
-# `sudo duckdb` (the data is readable only by the athena and otelcol users),
+# `sudo duckdb` (the data is readable only by the athena user),
 # so ssh asks for your sudo password on a terminal. Nothing is written.
 set -euo pipefail
 
@@ -22,15 +23,15 @@ QUERIES=$REPO_ROOT/analytics/queries
 ENV_NAME=prod
 VM=""
 DB=""
-OTEL_DIR=/var/lib/athena/otel
+TELEMETRY_DIR="/var/lib/athena/*/telemetry"
 EVAL_RESULTS="results/*.jsonl"
 MODE=box
 QUERY=""
 
 usage() {
-    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
     echo
-    echo "Options: --list  --env staging|prod  --vm USER@HOST  --db PATH  --otel-dir DIR"
+    echo "Options: --list  --env staging|prod  --vm USER@HOST  --db PATH  --telemetry-dir DIR"
     echo "         --eval-results GLOB  --json"
 }
 
@@ -43,7 +44,7 @@ while [ $# -gt 0 ]; do
         --env) ENV_NAME="${2:?}"; shift ;;
         --vm) VM="${2:?}"; shift ;;
         --db) DB="${2:?}"; shift ;;
-        --otel-dir) OTEL_DIR="${2:?}"; shift ;;
+        --telemetry-dir) TELEMETRY_DIR="${2:?}"; shift ;;
         --eval-results) EVAL_RESULTS="${2:?}"; shift ;;
         --json) MODE=json ;;
         -h|--help) usage; exit 0 ;;
@@ -70,12 +71,12 @@ cp "$REPO_ROOT/analytics/prices.csv" "$prices"
 [ -z "$VM" ] || prices=/tmp/athena-analytics/prices.csv
 
 # Values are paths; refuse quotes so they cannot break out of SQL strings.
-for v in "$DB" "$OTEL_DIR" "$EVAL_RESULTS"; do
+for v in "$DB" "$TELEMETRY_DIR" "$EVAL_RESULTS"; do
     [[ "$v" != *"'"* ]] || { echo "analytics: paths may not contain quotes: $v" >&2; exit 2; }
 done
 
 render() {
-    sed -e "s#{{ATHENA_DB}}#$DB#g" -e "s#{{OTEL_DIR}}#$OTEL_DIR#g" \
+    sed -e "s#{{ATHENA_DB}}#$DB#g" -e "s#{{TELEMETRY_DIR}}#$TELEMETRY_DIR#g" \
         -e "s#{{EVAL_RESULTS}}#$EVAL_RESULTS#g" -e "s#{{PRICES}}#$prices#g" "$1"
 }
 {

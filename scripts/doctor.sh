@@ -113,20 +113,27 @@ fi
 read -r -d '' REMOTE <<'EOF' || true
 s() { if sudo -n true 2>/dev/null; then sudo -n "$@"; else return 99; fi; }
 echo "disk_free_mb=$(df -Pm /var/lib/athena 2>/dev/null | awk 'NR==2 {print $4}')"
-for u in athena-serve@staging athena-serve@prod athena-telegram@prod otelcol-contrib openobserve; do
+for u in athena-serve@staging athena-serve@prod athena-telegram@prod openobserve; do
     echo "unit_$u=$(systemctl is-active "$u" 2>/dev/null || true)"
 done
 echo "telegram_staging_enabled=$(systemctl is-enabled athena-telegram@staging 2>/dev/null || true)"
 for e in staging prod; do
     echo "env_$e=$(stat -c '%a %U:%G' /etc/athena/$e.env 2>/dev/null || echo missing)"
-    for k in OPENROUTER_API_KEY TELEGRAM_BOT_TOKEN OPEN_SANDBOX_URL OPEN_SANDBOX_API_KEY; do
+    for k in OPENROUTER_API_KEY TELEGRAM_BOT_TOKEN OPEN_SANDBOX_URL OPEN_SANDBOX_API_KEY \
+        ATHENA_TELEMETRY_DIR OTEL_EXPORTER_OTLP_ENDPOINT OTEL_EXPORTER_OTLP_HEADERS; do
         v=$(s grep -c "^$k=..*" /etc/athena/$e.env 2>/dev/null); rc=$?
         [ "$rc" = 99 ] && v=nosudo
         echo "secret_${e}_$k=${v:-0}"
     done
+    # Still pointed at the retired collector?
+    v=$(s grep -c "^OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318$" /etc/athena/$e.env 2>/dev/null)
+    echo "legacy_otlp_$e=${v:-0}"
+    v=$(s sh -c "ls /var/lib/athena/$e/telemetry/traces-*.jsonl 2>/dev/null | wc -l"); rc=$?
+    [ "$rc" = 99 ] && v=nosudo
+    echo "telemetry_$e=${v:-0}"
 done
 echo "gate=$( [ -x /opt/athena/bin/deploy-gate ] && echo yes || echo no)"
-echo "listen_public=$(ss -Hltn 2>/dev/null | awk '{print $4}' | grep -E '^(0\.0\.0\.0|\*|\[::\]):(18080|18081|5080|4317|4318)$' | paste -sd, -)"
+echo "listen_public=$(ss -Hltn 2>/dev/null | awk '{print $4}' | grep -E '^(0\.0\.0\.0|\*|\[::\]):(18080|18081|5080)$' | paste -sd, -)"
 EOF
 
 if [ -z "$VM" ]; then
@@ -140,7 +147,7 @@ else
     elif [ "$disk" -ge 1024 ]; then check disk pass "${disk} MB free under /var/lib/athena"
     else check disk fail "${disk} MB free; deploy-gate refuses deploys under 1 GB"; fi
 
-    for u in athena-serve@staging athena-serve@prod athena-telegram@prod otelcol-contrib openobserve; do
+    for u in athena-serve@staging athena-serve@prod athena-telegram@prod openobserve; do
         state=$(get "unit_$u")
         if [ "$state" = active ]; then check "unit $u" pass active
         else check "unit $u" fail "${state:-unknown}"; fi
@@ -169,6 +176,25 @@ else
         if [ "$k" != nosudo ] && [ "$(get "secret_${e}_OPEN_SANDBOX_URL")" != 0 ]; then
             if [ "$(get "secret_${e}_OPEN_SANDBOX_API_KEY")" != 0 ]; then check "$e sandbox auth" pass "API key set"
             else check "$e sandbox auth" warn "OPEN_SANDBOX_URL set without OPEN_SANDBOX_API_KEY (sandbox server is open to the tailnet)"; fi
+        fi
+        if [ "$k" != nosudo ]; then
+            files=$(get "telemetry_$e")
+            if [ "$(get "secret_${e}_ATHENA_TELEMETRY_DIR")" = 0 ]; then
+                check "$e telemetry files" warn "ATHENA_TELEMETRY_DIR is not set: no JSONL for scripts/analytics.sh"
+            elif [ "${files:-0}" = 0 ]; then
+                check "$e telemetry files" warn "no traces-*.jsonl in /var/lib/athena/$e/telemetry yet (written once a request is served)"
+            else
+                check "$e telemetry files" pass "$files daily trace file(s)"
+            fi
+            if [ "$(get "legacy_otlp_$e")" != 0 ]; then
+                check "$e OTLP" fail "OTEL_EXPORTER_OTLP_ENDPOINT still points at the retired collector (127.0.0.1:4318): re-run setup-host.sh"
+            elif [ "$(get "secret_${e}_OTEL_EXPORTER_OTLP_ENDPOINT")" = 0 ]; then
+                check "$e OTLP" skip "OTEL_EXPORTER_OTLP_ENDPOINT is not set: no export to OpenObserve"
+            elif [ "$(get "secret_${e}_OTEL_EXPORTER_OTLP_HEADERS")" = 0 ]; then
+                check "$e OTLP" warn "OTEL_EXPORTER_OTLP_HEADERS is not set: OpenObserve will refuse the export"
+            else
+                check "$e OTLP" pass "OpenObserve endpoint and auth header set (values not read)"
+            fi
         fi
     done
 

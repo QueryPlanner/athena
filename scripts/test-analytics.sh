@@ -2,17 +2,22 @@
 # Run every canned analytics query against fixtures and check the numbers.
 # Needs duckdb and sqlite3. CI runs this; so can you.
 #   - the database is tests/fixtures/v3_users_sessions.sql (real runs rows)
-#   - spans and eval results are analytics/testdata/*.jsonl
+#   - spans are analytics/testdata/traces-*.jsonl, laid out as on the VM
+#     (/var/lib/athena/<env>/telemetry/) so the default glob is exercised
+#   - eval results are analytics/testdata/results.jsonl
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 sqlite3 "$WORK/agent.db" <"$REPO_ROOT/tests/fixtures/v3_users_sessions.sql"
+mkdir -p "$WORK/lib/prod/telemetry" "$WORK/lib/staging/telemetry"
+cp "$REPO_ROOT/analytics/testdata/traces-20260921.jsonl" "$WORK/lib/prod/telemetry/"
+cp "$REPO_ROOT/analytics/testdata/traces-20260922.jsonl" "$WORK/lib/staging/telemetry/"
 
 q() { # query name -> JSON rows
     "$REPO_ROOT/scripts/analytics.sh" --json --db "$WORK/agent.db" \
-        --otel-dir "$REPO_ROOT/analytics/testdata" \
+        --telemetry-dir "$WORK/lib/*/telemetry" \
         --eval-results "$REPO_ROOT/analytics/testdata/results.jsonl" "$1"
 }
 fail() { echo "FAIL  $1" >&2; exit 1; }

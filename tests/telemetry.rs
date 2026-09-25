@@ -1,13 +1,13 @@
 //! What Athena reports to OpenTelemetry, captured in memory around real
 //! turns: the production agent in front of Rig's scripted model, the real
 //! service and HTTP router, and `athena serve` exporting to a fake
-//! collector. No network beyond loopback.
+//! OTLP backend and JSONL files. No network beyond loopback.
 
 mod common;
 
 use athena::http::{self, Hosts, USER_HEADER};
 use athena::service::Service;
-use athena::telemetry::{self, Exporters, Settings, TRACE_ID_HEADER, Telemetry};
+use athena::telemetry::{self, Exporters, Settings, Sinks, TRACE_ID_HEADER, Telemetry};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -83,18 +83,26 @@ struct Captured {
 
 impl Captured {
     fn new(exporting: bool) -> Self {
+        Self::in_env(exporting, "staging")
+    }
+
+    fn in_env(exporting: bool, environment: &str) -> Self {
         let (spans, logs, stderr) = (Spans::default(), Logs::default(), Stderr::default());
         let settings = Settings::from_vars(|name| match name {
             "ATHENA_VERSION" => Some("test-version".into()),
-            "ATHENA_ENV" => Some("staging".into()),
+            "ATHENA_ENV" => Some(environment.into()),
             _ => None,
-        });
-        let exporters = exporting.then(|| Exporters {
-            spans: spans.clone(),
-            logs: logs.clone(),
-        });
+        })
+        .unwrap();
+        let mut sinks = Sinks::new(&settings);
+        if exporting {
+            sinks = sinks.with(Exporters {
+                spans: spans.clone(),
+                logs: logs.clone(),
+            });
+        }
         let writer = stderr.clone();
-        let (layers, telemetry) = telemetry::layers(&settings, exporters, move || writer.clone());
+        let (layers, telemetry) = telemetry::layers(&settings, sinks, move || writer.clone());
         let subscriber = tracing_subscriber::registry().with(layers);
         Self {
             spans,
@@ -367,7 +375,47 @@ async fn a_failed_turn_marks_its_span_as_an_error_and_logs_without_the_prompt() 
 
 #[tokio::test]
 async fn with_content_capture_rig_records_the_prompt_on_athenas_span() {
-    let mut captured = Captured::new(true);
+    let spans = content_captured_turn("staging").await;
+    let turn = one(&spans, "invoke_agent athena");
+    assert_eq!(text(turn, "gen_ai.prompt"), "hi there");
+}
+
+#[tokio::test]
+async fn prod_exports_no_content_even_with_content_capture_on() {
+    let staging = content_captured_turn("staging").await;
+    let captured_keys = content_keys(&staging);
+    assert!(
+        captured_keys.contains(&"gen_ai.prompt".to_string()),
+        "{captured_keys:?}"
+    );
+
+    let prod = content_captured_turn("prod").await;
+    assert_eq!(content_keys(&prod), Vec::<String>::new());
+    nowhere(&prod, "hi there");
+    // What is not content survives.
+    let turn = one(&prod, "invoke_agent athena");
+    assert_eq!(text(turn, "athena.transport"), "cli");
+}
+
+/// Every content attribute on any span or span event.
+fn content_keys(spans: &[SpanData]) -> Vec<String> {
+    let mut keys: Vec<String> = spans
+        .iter()
+        .flat_map(|s| {
+            let events = s.events.iter().flat_map(|e| e.attributes.iter());
+            s.attributes.iter().chain(events)
+        })
+        .map(|kv| kv.key.to_string())
+        .filter(|k| telemetry::content::CONTENT_KEYS.contains(&k.as_str()))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// One turn with rig's content capture on, exported as `environment`.
+async fn content_captured_turn(environment: &str) -> Vec<SpanData> {
+    let mut captured = Captured::in_env(true, environment);
     let tmp = TempDb::new();
     let service = Arc::new(tmp.service().0);
     let user = cli_user(&service).await;
@@ -382,10 +430,7 @@ async fn with_content_capture_rig_records_the_prompt_on_athenas_span() {
         .send(&agent, &user, &session, "hi there")
         .await
         .unwrap();
-    let spans = captured.finish();
-
-    let turn = one(&spans, "invoke_agent athena");
-    assert_eq!(text(turn, "gen_ai.prompt"), "hi there");
+    captured.finish()
 }
 
 #[tokio::test]
@@ -422,8 +467,9 @@ async fn without_an_exporter_nothing_is_traced_and_stderr_stays_readable() {
 
 // ---- the real binary ----
 
-/// A fake OTLP/HTTP collector on loopback: the paths it was sent, in order.
-fn collector() -> (String, Arc<Mutex<Vec<String>>>) {
+/// A fake OTLP/HTTP backend on loopback: each request line it was sent, in
+/// order, followed by its `Authorization` header.
+fn backend() -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -435,6 +481,7 @@ fn collector() -> (String, Arc<Mutex<Vec<String>>>) {
             let mut request_line = String::new();
             reader.read_line(&mut request_line).unwrap();
             let mut length = 0;
+            let mut authorization = String::new();
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
@@ -446,10 +493,18 @@ fn collector() -> (String, Arc<Mutex<Vec<String>>>) {
                 {
                     length = value.trim().parse().unwrap();
                 }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("authorization")
+                {
+                    authorization = value.trim().to_string();
+                }
             }
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
-            record.lock().unwrap().push(request_line.trim().to_string());
+            record
+                .lock()
+                .unwrap()
+                .push(format!("{} | {authorization}", request_line.trim()));
             let reply = "HTTP/1.1 200 OK\r\ncontent-type: application/x-protobuf\r\n\
                          content-length: 0\r\nconnection: close\r\n\r\n";
             stream.write_all(reply.as_bytes()).unwrap();
@@ -459,16 +514,26 @@ fn collector() -> (String, Arc<Mutex<Vec<String>>>) {
 }
 
 #[test]
-fn athena_serve_exports_to_the_collector_and_flushes_on_sigterm() {
-    let (collector, seen) = collector();
+fn athena_serve_exports_to_openobserve_and_files_and_flushes_on_sigterm() {
+    let (backend, seen) = backend();
     let tmp = TempDb::new();
     let dir = WorkDir::new();
+    let telemetry_dir = dir.path().join("telemetry");
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_athena"))
         .args(["serve", "--addr", "127.0.0.1:0"])
         .current_dir(dir.path())
         .env("ATHENA_DB", tmp.path())
         .env("OPENROUTER_API_KEY", "unused-key")
-        .env("OTEL_EXPORTER_OTLP_ENDPOINT", format!("http://{collector}"))
+        // OpenObserve's shape: an org path, basic auth with the space escaped.
+        .env(
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            format!("http://{backend}/api/default"),
+        )
+        .env(
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "Authorization=Basic%20dXNlcjpwYXNz",
+        )
+        .env("ATHENA_TELEMETRY_DIR", &telemetry_dir)
         .env("ATHENA_ENV", "staging")
         .env_remove("ATHENA_ADDR")
         .env_remove("RUST_LOG")
@@ -519,13 +584,30 @@ fn athena_serve_exports_to_the_collector_and_flushes_on_sigterm() {
         "{health}"
     );
     let seen = seen.lock().unwrap().clone();
-    assert!(
-        seen.contains(&"POST /v1/traces HTTP/1.1".to_string()),
-        "{seen:?}"
-    );
-    assert!(
-        seen.contains(&"POST /v1/logs HTTP/1.1".to_string()),
-        "{seen:?}"
-    );
+    for path in ["traces", "logs"] {
+        let request = format!("POST /api/default/v1/{path} HTTP/1.1 | Basic dXNlcjpwYXNz");
+        assert!(seen.contains(&request), "{seen:?}");
+    }
     assert!(!rest.contains("warning: exporting"), "{rest}");
+
+    // The same spans and logs, as JSON lines for DuckDB.
+    let mut files: Vec<String> = std::fs::read_dir(&telemetry_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    files.sort();
+    assert_eq!(files.len(), 2, "{files:?}");
+    assert!(files[0].starts_with("logs-") && files[1].starts_with("traces-"));
+    let spans = std::fs::read_to_string(telemetry_dir.join(&files[1])).unwrap();
+    let probes: Vec<Value> = spans
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|span| span["name"] == "GET /health")
+        .collect();
+    assert_eq!(probes.len(), 1, "{spans}");
+    assert_eq!(
+        probes[0]["resource"]["deployment.environment.name"],
+        "staging"
+    );
+    assert_eq!(probes[0]["attributes"]["http.route"], "/health");
 }

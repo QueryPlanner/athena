@@ -1,20 +1,30 @@
 //! Traces and logs: `tracing` everywhere, OpenTelemetry when configured.
 //!
 //! Every process logs through `tracing` to stderr in the human-readable
-//! format. When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, spans and log events
-//! are also exported over OTLP/HTTP (protobuf) to that endpoint; unset, no
-//! OpenTelemetry code runs at all.
+//! format. Spans and log events are also exported to up to two sinks, each
+//! switched on by its own variable; with neither set, no OpenTelemetry code
+//! runs at all:
+//!
+//! - `OTEL_EXPORTER_OTLP_ENDPOINT`: OTLP/HTTP (protobuf) straight to a
+//!   backend, OpenObserve on the VM, with `OTEL_EXPORTER_OTLP_HEADERS`
+//!   carrying its credentials;
+//! - `ATHENA_TELEMETRY_DIR`: daily JSON Lines files for DuckDB
+//!   (see [`jsonl`]).
 //!
 //! [`layers`] builds the subscriber's layers from [`Settings`] and injected
-//! exporters, so tests capture spans in memory. [`init`] wires it to the
+//! [`Sinks`], so tests capture spans in memory. [`init`] wires it to the
 //! environment and installs it globally, which a process can do only once.
 //!
 //! What is exported is listed in README "Observability". Prompt and reply
 //! text never goes into a log event; on spans only with
-//! `ATHENA_RECORD_CONTENT=1` (see [`record_content`]).
+//! `ATHENA_RECORD_CONTENT=1` (see [`record_content`]), and never for prod:
+//! there [`content::StripContent`] removes it before any sink sees it.
+
+pub mod content;
+pub mod jsonl;
 
 use crate::service::User;
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::{TraceContextExt, TracerProvider as _};
@@ -22,12 +32,16 @@ use opentelemetry::{Context, KeyValue};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_http::HeaderExtractor;
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::logs::{LogExporter, SdkLoggerProvider};
+use opentelemetry_sdk::logs::{LogExporter, LoggerProviderBuilder, SdkLoggerProvider};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
-use opentelemetry_sdk::trace::{SdkTracerProvider, SpanExporter};
+use opentelemetry_sdk::trace::{SdkTracerProvider, SpanExporter, TracerProviderBuilder};
 use sha2::{Digest, Sha256};
 use std::io::Write;
+use std::num::NonZeroU32;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+use tracing_subscriber::filter::{FilterExt as _, filter_fn};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -37,8 +51,8 @@ use tracing_subscriber::{EnvFilter, Layer, Registry};
 /// everyone else's from `warn`. Spans are never printed.
 pub const DEFAULT_LOG_FILTER: &str = "warn,athena=info";
 
-/// What is exported over OTLP. The HTTP stack is silenced so that exporting
-/// a batch never produces events that are exported in the next one.
+/// What is exported. The HTTP stack is silenced so that exporting a batch
+/// never produces events that are exported in the next one.
 const EXPORT_FILTER: &str = "info,h2=off,hyper=off,hyper_util=off,reqwest=off,tower=off,\
                              opentelemetry=off,opentelemetry_sdk=off,opentelemetry_otlp=off,\
                              opentelemetry_http=off";
@@ -46,11 +60,18 @@ const EXPORT_FILTER: &str = "info,h2=off,hyper=off,hyper_util=off,reqwest=off,to
 /// The instrumentation scope Athena's spans and logs are reported under.
 const SCOPE: &str = "athena";
 
+/// How long JSONL files are kept without `ATHENA_TELEMETRY_RETENTION_DAYS`.
+pub const DEFAULT_RETENTION_DAYS: NonZeroU32 = NonZeroU32::new(30).expect("30 is not 0");
+
 /// Everything telemetry is configured by. See [`Settings::from_env`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
-    /// `OTEL_EXPORTER_OTLP_ENDPOINT`. `None` means OpenTelemetry is off.
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT`. `None` means no OTLP export.
     pub endpoint: Option<String>,
+    /// `ATHENA_TELEMETRY_DIR`. `None` means no JSONL files.
+    pub telemetry_dir: Option<PathBuf>,
+    /// `ATHENA_TELEMETRY_RETENTION_DAYS`, default [`DEFAULT_RETENTION_DAYS`].
+    pub retention_days: NonZeroU32,
     /// `OTEL_SERVICE_NAME`, default `athena`.
     pub service_name: String,
     /// `ATHENA_VERSION`, else `<crate version>-dev`.
@@ -62,20 +83,37 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self> {
         Self::from_vars(|name| std::env::var(name).ok())
     }
 
     /// Settings from a variable lookup. Empty values count as unset.
-    pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Self {
+    pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let set = |name: &str| var(name).filter(|value| !value.trim().is_empty());
-        Self {
+        let retention_days = match set("ATHENA_TELEMETRY_RETENTION_DAYS") {
+            None => DEFAULT_RETENTION_DAYS,
+            Some(days) => days.trim().parse().map_err(|_| {
+                anyhow!(
+                    "ATHENA_TELEMETRY_RETENTION_DAYS must be a whole number of days, \
+                     1 or more, got '{days}'"
+                )
+            })?,
+        };
+        Ok(Self {
             endpoint: set("OTEL_EXPORTER_OTLP_ENDPOINT"),
+            telemetry_dir: set("ATHENA_TELEMETRY_DIR").map(PathBuf::from),
+            retention_days,
             service_name: set("OTEL_SERVICE_NAME").unwrap_or_else(|| "athena".into()),
             version: version_or_dev(set("ATHENA_VERSION")),
             environment: set("ATHENA_ENV"),
             log_filter: set("RUST_LOG").unwrap_or_else(|| DEFAULT_LOG_FILTER.into()),
-        }
+        })
+    }
+
+    /// Whether content is removed from telemetry whatever else is set: in
+    /// prod, so a mistaken `ATHENA_RECORD_CONTENT=1` exports nothing typed.
+    pub fn strips_content(&self) -> bool {
+        self.environment.as_deref() == Some("prod")
     }
 
     /// The OpenTelemetry resource every span and log record carries.
@@ -101,16 +139,20 @@ fn version_or_dev(configured: Option<String>) -> String {
 }
 
 /// Whether `ATHENA_RECORD_CONTENT=1` asks for prompt and response content
-/// on spans. Off by default: that content is whatever users typed.
+/// on spans. Off by default: that content is whatever users typed. Always
+/// off for prod (`ATHENA_ENV=prod`).
 pub fn record_content() -> bool {
-    record_content_from(std::env::var("ATHENA_RECORD_CONTENT").ok().as_deref())
+    record_content_from(
+        std::env::var("ATHENA_RECORD_CONTENT").ok().as_deref(),
+        std::env::var("ATHENA_ENV").ok().as_deref(),
+    )
 }
 
-fn record_content_from(setting: Option<&str>) -> bool {
-    matches!(setting, Some("1" | "true"))
+fn record_content_from(setting: Option<&str>, environment: Option<&str>) -> bool {
+    environment != Some("prod") && matches!(setting, Some("1" | "true"))
 }
 
-/// The span and log exporters OpenTelemetry sends through.
+/// A span exporter and a log exporter that go together.
 pub struct Exporters<S, L> {
     pub spans: S,
     pub logs: L,
@@ -118,8 +160,11 @@ pub struct Exporters<S, L> {
 
 /// OTLP/HTTP protobuf exporters. They read the endpoint, headers and
 /// timeout from the standard `OTEL_EXPORTER_OTLP_*` variables and append
-/// `/v1/traces` and `/v1/logs` to the endpoint. Nothing connects until the
-/// first export.
+/// `/v1/traces` and `/v1/logs` to the endpoint, so for OpenObserve it is
+/// `http://<host>:5080/api/<org>`. `OTEL_EXPORTER_OTLP_HEADERS` is
+/// `key=value` pairs separated by commas, with `%XX` escapes decoded, e.g.
+/// `Authorization=Basic%20<base64 of user:password>`. Nothing connects
+/// until the first export.
 pub fn otlp_exporters()
 -> Result<Exporters<opentelemetry_otlp::SpanExporter, opentelemetry_otlp::LogExporter>> {
     use opentelemetry_otlp::{Protocol, WithExportConfig};
@@ -135,6 +180,66 @@ pub fn otlp_exporters()
             .build()
             .context("building the OTLP log exporter")?,
     })
+}
+
+/// Where spans and logs are exported to, each sink behind its own batch
+/// processor (and thread). None means OpenTelemetry is off.
+pub struct Sinks {
+    strip_content: bool,
+    count: usize,
+    tracer: TracerProviderBuilder,
+    logger: LoggerProviderBuilder,
+}
+
+impl Sinks {
+    /// No sinks yet, with `settings`' content policy.
+    pub fn new(settings: &Settings) -> Self {
+        Self {
+            strip_content: settings.strips_content(),
+            count: 0,
+            tracer: SdkTracerProvider::builder(),
+            logger: SdkLoggerProvider::builder(),
+        }
+    }
+
+    /// The sinks `settings` switch on: OTLP, JSONL files, both or neither.
+    pub fn from_settings(settings: &Settings) -> Result<Self> {
+        let mut sinks = Self::new(settings);
+        if settings.endpoint.is_some() {
+            sinks = sinks.with(otlp_exporters()?);
+        }
+        if let Some(dir) = &settings.telemetry_dir {
+            let clock = Arc::new(jsonl::SystemClock);
+            let files = jsonl::exporters(dir, settings.retention_days, clock)
+                .with_context(|| format!("creating ATHENA_TELEMETRY_DIR {}", dir.display()))?;
+            sinks = sinks.with(files);
+        }
+        Ok(sinks)
+    }
+
+    /// Add a sink. Its spans pass through [`content::StripContent`] first.
+    pub fn with<S, L>(self, exporters: Exporters<S, L>) -> Self
+    where
+        S: SpanExporter + 'static,
+        L: LogExporter + 'static,
+    {
+        let spans = content::StripContent::new(exporters.spans, self.strip_content);
+        Self {
+            count: self.count + 1,
+            tracer: self.tracer.with_batch_exporter(spans),
+            logger: self.logger.with_batch_exporter(exporters.logs),
+            ..self
+        }
+    }
+
+    /// How many sinks there are.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
 }
 
 type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync>;
@@ -172,46 +277,39 @@ impl Telemetry {
 }
 
 /// The subscriber's layers: a human-readable log on `stderr`, filtered by
-/// `settings.log_filter`, and with `exporters`, the OpenTelemetry span and
+/// `settings.log_filter`, and with any `sinks`, the OpenTelemetry span and
 /// log layers over them.
-pub fn layers<S, L, W>(
-    settings: &Settings,
-    exporters: Option<Exporters<S, L>>,
-    stderr: W,
-) -> (Vec<BoxedLayer>, Telemetry)
+pub fn layers<W>(settings: &Settings, sinks: Sinks, stderr: W) -> (Vec<BoxedLayer>, Telemetry)
 where
-    S: SpanExporter + 'static,
-    L: LogExporter + 'static,
     W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
 {
+    // For prod, an event with a content field goes nowhere: not to stderr
+    // (the journal), and not to a sink, since a log record cannot be edited
+    // once made.
+    let strip = settings.strips_content();
+    let keep = move || filter_fn(move |metadata| !(strip && content::carries_content(metadata)));
     let log = tracing_subscriber::fmt::layer()
         .with_writer(stderr)
         .with_ansi(false)
         .with_target(false)
-        .with_filter(EnvFilter::new(&settings.log_filter))
+        .with_filter(EnvFilter::new(&settings.log_filter).and(keep()))
         .boxed();
-    let Some(exporters) = exporters else {
+    if sinks.is_empty() {
         let off = Telemetry {
             tracer: None,
             logger: None,
         };
         return (vec![log], off);
-    };
+    }
 
-    let tracer = SdkTracerProvider::builder()
-        .with_resource(settings.resource())
-        .with_batch_exporter(exporters.spans)
-        .build();
-    let logger = SdkLoggerProvider::builder()
-        .with_resource(settings.resource())
-        .with_batch_exporter(exporters.logs)
-        .build();
+    let tracer = sinks.tracer.with_resource(settings.resource()).build();
+    let logger = sinks.logger.with_resource(settings.resource()).build();
     let spans = tracing_opentelemetry::layer()
         .with_tracer(tracer.tracer(SCOPE))
         .with_filter(EnvFilter::new(EXPORT_FILTER))
         .boxed();
     let events = OpenTelemetryTracingBridge::new(&logger)
-        .with_filter(EnvFilter::new(EXPORT_FILTER))
+        .with_filter(EnvFilter::new(EXPORT_FILTER).and(keep()))
         .boxed();
     let on = Telemetry {
         tracer: Some(tracer),
@@ -223,9 +321,9 @@ where
 /// Configure telemetry from the environment and install it for the whole
 /// process. Call once, before anything logs.
 pub fn init() -> Result<Telemetry> {
-    let settings = Settings::from_env();
-    let exporters = settings.endpoint.as_ref().map(|_| otlp_exporters());
-    let (layers, telemetry) = layers(&settings, exporters.transpose()?, std::io::stderr);
+    let settings = Settings::from_env()?;
+    let sinks = Sinks::from_settings(&settings)?;
+    let (layers, telemetry) = layers(&settings, sinks, std::io::stderr);
     tracing_subscriber::registry()
         .with(layers)
         .try_init()
@@ -296,35 +394,93 @@ mod tests {
         }
     }
 
+    fn settings(pairs: &[(&str, &str)]) -> Settings {
+        Settings::from_vars(vars(pairs)).unwrap()
+    }
+
+    fn in_memory() -> Exporters<InMemorySpanExporter, InMemoryLogExporter> {
+        Exporters {
+            spans: InMemorySpanExporter::default(),
+            logs: InMemoryLogExporter::default(),
+        }
+    }
+
+    /// A fresh directory under the system temp dir, removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("athena-telemetry-{}", uuid::Uuid::new_v4()));
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
-    fn without_an_endpoint_telemetry_is_off_and_has_defaults() {
-        let settings = Settings::from_vars(vars(&[("OTEL_EXPORTER_OTLP_ENDPOINT", " ")]));
+    fn without_an_endpoint_or_a_directory_telemetry_is_off_and_has_defaults() {
+        let settings = settings(&[
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", " "),
+            ("ATHENA_TELEMETRY_DIR", ""),
+        ]);
         assert_eq!(
             settings,
             Settings {
                 endpoint: None,
+                telemetry_dir: None,
+                retention_days: DEFAULT_RETENTION_DAYS,
                 service_name: "athena".into(),
                 version: format!("{}-dev", env!("CARGO_PKG_VERSION")),
                 environment: None,
                 log_filter: DEFAULT_LOG_FILTER.into(),
             }
         );
+        assert!(Sinks::from_settings(&settings).unwrap().is_empty());
     }
 
     #[test]
     fn every_setting_comes_from_its_variable() {
-        let settings = Settings::from_vars(vars(&[
-            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4318"),
+        let settings = settings(&[
+            (
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "http://127.0.0.1:5080/api/default",
+            ),
+            ("ATHENA_TELEMETRY_DIR", "/var/lib/athena/staging/telemetry"),
+            ("ATHENA_TELEMETRY_RETENTION_DAYS", " 7 "),
             ("OTEL_SERVICE_NAME", "athena-staging"),
             ("ATHENA_VERSION", "v1.2.3+abc"),
             ("ATHENA_ENV", "staging"),
             ("RUST_LOG", "debug"),
-        ]));
-        assert_eq!(settings.endpoint.as_deref(), Some("http://127.0.0.1:4318"));
+        ]);
+        assert_eq!(
+            settings.endpoint.as_deref(),
+            Some("http://127.0.0.1:5080/api/default")
+        );
+        assert_eq!(
+            settings.telemetry_dir,
+            Some(PathBuf::from("/var/lib/athena/staging/telemetry"))
+        );
+        assert_eq!(settings.retention_days.get(), 7);
         assert_eq!(settings.service_name, "athena-staging");
         assert_eq!(settings.version, "v1.2.3+abc");
         assert_eq!(settings.environment.as_deref(), Some("staging"));
         assert_eq!(settings.log_filter, "debug");
+    }
+
+    #[test]
+    fn a_retention_that_is_not_a_positive_number_is_refused() {
+        for bad in ["0", "-1", "thirty", "1.5"] {
+            let error = Settings::from_vars(vars(&[("ATHENA_TELEMETRY_RETENTION_DAYS", bad)]))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("ATHENA_TELEMETRY_RETENTION_DAYS"), "{error}");
+            assert!(error.contains(&format!("'{bad}'")), "{error}");
+        }
     }
 
     #[test]
@@ -334,11 +490,8 @@ mod tests {
                 .get(&opentelemetry::Key::from_static_str(key))
                 .map(|v| v.to_string())
         };
-        let staging = Settings::from_vars(vars(&[
-            ("ATHENA_VERSION", "abc123"),
-            ("ATHENA_ENV", "staging"),
-        ]))
-        .resource();
+        let staging =
+            settings(&[("ATHENA_VERSION", "abc123"), ("ATHENA_ENV", "staging")]).resource();
         assert_eq!(
             attribute(&staging, "service.name").as_deref(),
             Some("athena")
@@ -352,34 +505,141 @@ mod tests {
             Some("staging")
         );
 
-        let dev = Settings::from_vars(vars(&[])).resource();
+        let dev = settings(&[]).resource();
         assert_eq!(attribute(&dev, "deployment.environment.name"), None);
     }
 
     #[test]
-    fn content_is_recorded_only_when_asked_for() {
-        assert!(!record_content_from(None));
-        assert!(!record_content_from(Some("0")));
-        assert!(!record_content_from(Some("yes")));
-        assert!(record_content_from(Some("1")));
-        assert!(record_content_from(Some("true")));
+    fn only_prod_strips_content() {
+        assert!(settings(&[("ATHENA_ENV", "prod")]).strips_content());
+        assert!(!settings(&[("ATHENA_ENV", "staging")]).strips_content());
+        assert!(!settings(&[]).strips_content());
+    }
+
+    #[test]
+    fn content_is_recorded_only_when_asked_for_and_never_for_prod() {
+        assert!(!record_content_from(None, None));
+        assert!(!record_content_from(Some("0"), None));
+        assert!(!record_content_from(Some("yes"), None));
+        assert!(record_content_from(Some("1"), None));
+        assert!(record_content_from(Some("true"), Some("staging")));
+        assert!(!record_content_from(Some("1"), Some("prod")));
         // The env-reading wrapper; tests never set ATHENA_RECORD_CONTENT.
         assert!(!record_content());
     }
 
     #[test]
-    fn the_otlp_exporters_build_without_a_collector() {
+    fn the_otlp_exporters_build_without_a_backend() {
         assert!(otlp_exporters().is_ok());
     }
 
     #[test]
+    fn each_configured_sink_is_added_and_the_directory_is_created() {
+        let dir = TempDir::new();
+        let path = dir.0.join("telemetry");
+        let path = path.to_str().unwrap();
+        let endpoint = (
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "http://127.0.0.1:1/api/default",
+        );
+        let files = ("ATHENA_TELEMETRY_DIR", path);
+
+        assert_eq!(
+            Sinks::from_settings(&settings(&[endpoint])).unwrap().len(),
+            1
+        );
+        assert!(!dir.0.exists());
+        assert_eq!(Sinks::from_settings(&settings(&[files])).unwrap().len(), 1);
+        assert!(dir.0.join("telemetry").is_dir());
+        let both = Sinks::from_settings(&settings(&[endpoint, files])).unwrap();
+        assert_eq!(both.len(), 2);
+        assert!(!both.is_empty());
+    }
+
+    #[test]
+    fn a_telemetry_directory_that_cannot_be_created_is_an_error() {
+        let dir = TempDir::new();
+        std::fs::write(&dir.0, "a file, not a directory").unwrap();
+        let below = dir.0.join("telemetry");
+        let error = Sinks::from_settings(&settings(&[(
+            "ATHENA_TELEMETRY_DIR",
+            below.to_str().unwrap(),
+        )]))
+        .err()
+        .expect("a directory under a file")
+        .to_string();
+        assert!(error.contains("creating ATHENA_TELEMETRY_DIR"), "{error}");
+        let _ = std::fs::remove_file(&dir.0);
+    }
+
+    /// What stderr would have shown.
+    #[derive(Clone, Default)]
+    struct Stderr(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for Stderr {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Emit one event with a content field and one without, and return the
+    /// bodies of the log records exported and what stderr showed.
+    fn logged(environment: &str) -> (Vec<String>, String) {
+        let settings = settings(&[("ATHENA_ENV", environment)]);
+        let exporters = in_memory();
+        let logs = exporters.logs.clone();
+        let stderr = Stderr::default();
+        let writer = stderr.clone();
+        let (layers, telemetry) = layers(
+            &settings,
+            Sinks::new(&settings).with(exporters),
+            move || writer.clone(),
+        );
+        let subscriber = tracing_subscriber::registry().with(layers);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(gen_ai.prompt = "what the user typed", "with content");
+            tracing::warn!(gen_ai.usage.input_tokens = 12, "without content");
+        });
+        telemetry.logger.as_ref().unwrap().force_flush().unwrap();
+        let bodies = logs
+            .get_emitted_logs()
+            .unwrap()
+            .iter()
+            .map(|log| format!("{:?}", log.record.body()))
+            .collect();
+        telemetry.shutdown_to(&mut Vec::new());
+        // The fmt layer never flushes; the helper's flush must still work.
+        stderr.clone().flush().unwrap();
+        let shown = String::from_utf8(stderr.0.lock().unwrap().clone()).unwrap();
+        (bodies, shown)
+    }
+
+    #[test]
+    fn prod_neither_exports_nor_prints_a_log_event_with_a_content_field() {
+        let (exported, shown) = logged("prod");
+        assert_eq!(exported.len(), 1, "{exported:?}");
+        assert!(exported[0].contains("without content"), "{exported:?}");
+        assert!(shown.contains("without content"), "{shown}");
+        assert!(!shown.contains("with content"), "{shown}");
+        assert!(!shown.contains("what the user typed"), "{shown}");
+
+        let (exported, shown) = logged("staging");
+        assert_eq!(exported.len(), 2, "{exported:?}");
+        assert!(shown.contains("what the user typed"), "{shown}");
+    }
+
+    #[test]
     fn a_failed_final_export_is_reported_not_raised() {
-        let settings = Settings::from_vars(vars(&[]));
-        let exporters = Exporters {
-            spans: InMemorySpanExporter::default(),
-            logs: InMemoryLogExporter::default(),
-        };
-        let (_, telemetry) = layers(&settings, Some(exporters), std::io::sink);
+        let settings = settings(&[]);
+        let (_, telemetry) = layers(
+            &settings,
+            Sinks::new(&settings).with(in_memory()),
+            std::io::sink,
+        );
         assert!(telemetry.exporting());
         // Shut down behind its back: the second shutdown fails.
         telemetry.tracer.as_ref().unwrap().shutdown().unwrap();
@@ -396,9 +656,8 @@ mod tests {
 
     #[test]
     fn switched_off_telemetry_shuts_down_silently() {
-        let settings = Settings::from_vars(vars(&[]));
-        let none: Option<Exporters<InMemorySpanExporter, InMemoryLogExporter>> = None;
-        let (layers, telemetry) = layers(&settings, none, std::io::sink);
+        let settings = settings(&[]);
+        let (layers, telemetry) = layers(&settings, Sinks::new(&settings), std::io::sink);
         assert_eq!(layers.len(), 1);
         assert!(!telemetry.exporting());
         let mut out = Vec::new();

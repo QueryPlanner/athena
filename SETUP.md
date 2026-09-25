@@ -112,7 +112,24 @@ It runs with sudo over `ssh -t`, so the human types their sudo password.
 Works when: it ends with `Done:` and a "Still for a human to do" list. It
 creates `/etc/athena/{staging,prod}.env` and the OpenObserve root password
 (`/etc/openobserve/openobserve.env`, root only) the first time, and never
-overwrites them later.
+overwrites them later. Each env file already holds the telemetry settings:
+`ATHENA_TELEMETRY_DIR` (Athena's own JSONL files, for DuckDB) and the
+OpenObserve endpoint with a basic-auth header derived from that password.
+The header is written only into the env files (root:athena, 0640) and is
+never printed; the dry run shows a placeholder.
+
+On a VM set up before the collector was removed, a re-run stops and disables
+`otelcol-contrib` (and purges it if this script installed it), and replaces
+the old `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318` line in each env
+file with the new settings. It lists the restart that picks them up. Until
+the next deploy, a release from before that change still exports to
+OpenObserve (it reads the same OTEL variables) but writes no JSONL files.
+
+Both env files carry the OpenObserve **root** credentials in that header, so
+anything that can read `staging.env` can also read or delete prod telemetry
+in OpenObserve. An ingest-only OpenObserve user per environment would be
+tighter; setup-host.sh does not create one (not verified that OpenObserve's
+open-source edition supports it).
 
 On failure: it stops before changing anything else and says why (port
 conflict, no tailnet IP, not root, checksum mismatch). Fix and re-run.
@@ -131,7 +148,10 @@ sandbox host is ready. Staging has no Telegram bot, on purpose.
 
 The OpenObserve login is `admin@athena.internal`; the human reads the password
 on the VM with `sudo grep ZO_ROOT_USER_PASSWORD /etc/openobserve/openobserve.env`.
-The UI is `http://<tailnet-ip>:5080`, reachable from the tailnet only.
+The UI is `http://<tailnet-ip>:5080`, reachable from the tailnet only. If
+the password is changed in the UI, update `OTEL_EXPORTER_OTLP_HEADERS` in both
+env files too (`Authorization=Basic%20<base64 of email:password>`), or
+OpenObserve refuses Athena's exports; the JSONL files are unaffected.
 
 ## 7. Apply on GitHub
 
@@ -206,5 +226,5 @@ prod.
 | Status | `ssh "$VM" sudo cat /var/lib/athena/prod/state.json` |
 | Logs | `ssh "$VM" journalctl -u athena-serve@prod -f` |
 | Traces and logs UI | `http://<tailnet-ip>:5080` (OpenObserve) |
-| Analytics | `./scripts/analytics.sh --list`, then `./scripts/analytics.sh --vm "$VM" --env prod cost_by_model_day` |
+| Analytics | `./scripts/analytics.sh --list`, then `./scripts/analytics.sh --vm "$VM" --env prod cost_by_model_day` (spans from `/var/lib/athena/*/telemetry/traces-*.jsonl`) |
 | Remove Athena | `./scripts/setup-host.sh --vm "$VM" --uninstall` (keeps data); add `--purge` to delete databases and secrets too |

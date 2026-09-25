@@ -36,7 +36,7 @@ with a production-ready agent. That means:
 │   athena-serve@prod      <tailnet-ip>:18080   (listens on the tailnet IP only)        │
 │   athena-telegram@prod                                                                 │
 │   athena-serve@staging   <tailnet-ip>:18081                                           │
-│   otelcol-contrib (.deb)  → JSONL files → DuckDB   (+ OpenObserve in M3)                │
+│   athena → JSONL files → DuckDB, and → OTLP → OpenObserve  ("setup B": no collector)  │
 │ /opt/athena/releases/<digest>/      (cache of the last 3; GHCR holds all releases)     │
 │ /opt/athena/bin/deploy-gate         (forced SSH command; the only thing CI can run)    │
 └────────────────────────────────────────────────────────────────────────────────────────┘
@@ -188,7 +188,7 @@ and duration are variables, so a fork can tune the cost.
 | RAM | none extra | dockerd + containerd, roughly 100–150 MB |
 | Logs | journald, native | docker logs driver |
 | Rollback | flip a symlink (local cache), or pull any older digest from GHCR | redeploy the previous digest |
-| Obs stack | otelcol-contrib and OpenObserve both ship official `.deb`/single-binary releases with systemd units | compose |
+| Obs stack | OpenObserve ships an official single-binary release; Athena exports to it and writes its own JSONL, so there is no collector ("setup B") | compose |
 | Downside | no identical local "container" environment | heavier; dockerd plus images on a 4 GB VM |
 
 Docker stays on the **sandbox laptop only**, because OpenSandbox needs it to create
@@ -319,7 +319,7 @@ so it is easy to find, back up, or remove.
 | `/etc/athena/{staging,prod}.env` | secrets, 0600 root | – |
 | `/var/lib/athena/{staging,prod}/agent.db` | SQLite (WAL) | – |
 | `/var/lib/athena/{staging,prod}/backups/` | pre-deploy DB backups | the last 10 per env. `deploy-gate` refuses to deploy when free disk is under 1 GB. |
-| `/var/lib/athena/otel/` | collector JSONL, rotated at 50 MB | 30 days |
+| `/var/lib/athena/{staging,prod}/telemetry/` | Athena's own `traces-`/`logs-YYYYMMDD.jsonl`, one file per signal per UTC day | `ATHENA_TELEMETRY_RETENTION_DAYS`, default 30 |
 
 `setup-host.sh --uninstall` stops the units and removes the three roots. It removes
 the DB only with `--purge`.
@@ -350,7 +350,8 @@ Tailscale, and about 1.9 GB of free RAM.
   - the three roots above;
   - the units and `deploy-gate`;
   - the two `authorized_keys` entries with `restrict,command=…`;
-  - otelcol-contrib (`.deb`), with `MemoryMax=256M`.
+  - OpenObserve (single binary), with `MemoryMax=512M`. No collector (section 7,
+    "setup B").
 - Hetzner's cloud firewall and Docker-published ports are outside Athena's scope.
   `preflight.sh` still **warns** when it sees services published on `0.0.0.0`.
 
@@ -490,6 +491,18 @@ truncation stays in the tool code. Tracing uses rig's spans, not hooks.
 
 ## 7. Observability (OTel standard practice)
 
+> **Setup B (owner decision, 2026-09-25).** The OpenTelemetry Collector is
+> gone. Athena exports OTLP/HTTP **directly** to OpenObserve
+> (`OTEL_EXPORTER_OTLP_ENDPOINT=http://<tailnet-ip>:5080/api/default`,
+> `OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic%20<base64>`), and writes its
+> spans and logs itself as daily JSONL files under `ATHENA_TELEMETRY_DIR`
+> (`/var/lib/athena/<env>/telemetry`) for DuckDB. The two sinks are
+> independent: OpenObserve stays optional and may be removed later (no
+> endpoint, no OTLP export), and the files work without it. The collector's
+> prod content stripping moved into Athena (`src/telemetry/content.rs`); its
+> regex secret redaction was not carried over. Where the text below still
+> says "collector", read it as history.
+
 **rig already emits GenAI-semconv `tracing` spans:** `invoke_agent`, `chat`, and
 `execute_tool`, carrying `gen_ai.*` attributes. The sources are
 `rig-core/src/telemetry/mod.rs:441` and `rig-agent/src/agent/runner.rs:504,791`.
@@ -518,9 +531,10 @@ Athena adds:
 - W3C `traceparent` in and out on HTTP.
 - **Content capture.** Off in prod. Staging turns it on only while the staging bot has
   no real users.
-  - The collector strips `gen_ai.input/output.messages` and tool arguments/results
-    as a backstop.
-  - The `redaction` processor also covers the **logs** pipeline.
+  - Setup B: for `ATHENA_ENV=prod`, Athena itself strips `gen_ai.input/output.messages`,
+    `gen_ai.system_instructions`, tool arguments/results, `gen_ai.prompt` and
+    `gen_ai.completion` from every span and span event before any exporter,
+    ignores `ATHENA_RECORD_CONTENT`, and drops log events carrying those fields.
   - Log statements never include prompt text.
 - `RUNS_STORE_RAW=0` in prod.
 
@@ -529,7 +543,7 @@ from its official `.deb` or release binary, with `MemoryMax=`. There is no Docke
 
 | Phase | Components | Why |
 |---|---|---|
-| M2 | otelcol-contrib (Apache-2.0, `MemoryMax=256M`) → rotating JSONL files → DuckDB | Traces and logs are captured and queryable with almost no RAM. |
+| M2 | ~~otelcol-contrib → rotating JSONL files → DuckDB~~ Setup B: Athena writes rotating JSONL files itself → DuckDB | Traces and logs are captured and queryable with no extra process. |
 | M3 | **OpenObserve** (AGPL-3.0, Rust, single binary): traces, logs and metrics, with a UI and dashboards, and native OTLP ingest. It replaces Tempo + Prometheus + Grafana. | Live monitoring from **one** process instead of three, **on the VM**, with `MemoryMax=512M` to start. The collector exports OTLP to it and keeps writing JSONL for DuckDB. Its footprint at Athena's volume is unmeasured; PR 19 measures it with `systemd-cgtop` before relying on it. If it doesn't fit, the fallback is running it on another tailnet host (the collector's `file_storage` queue buffers while that host sleeps). It listens only on the tailnet IP, and the admin password is set at setup. |
 
 **Why M3 had moved off the VM, and why it can come back.**
@@ -557,9 +571,10 @@ queries. Alerts can be added later on top of the same data.
 
 ## 8. Analytics (DuckDB)
 
-- **Trace and log data.** The collector JSONL is read directly with DuckDB's `otlp`
-  community extension (MIT). It caps input at 100 MB per file, so files rotate at
-  50 MB.
+- **Trace and log data.** Setup B: Athena's own JSONL files
+  (`/var/lib/athena/*/telemetry/traces-*.jsonl`), in a flat schema documented in
+  `src/telemetry/jsonl.rs`, read with plain `read_json` and declared columns. No
+  `otlp` extension is needed; files rotate daily.
 - **Athena's own data.** `ATTACH '/var/lib/athena/prod/agent.db' (TYPE sqlite, READ_ONLY)`.
   No ETL is needed.
 - **Eval results.** Read directly with `read_json_auto('results/*.jsonl')`.
@@ -791,7 +806,7 @@ These are the checkpoints.
 | 12 | Browser tools | 11 |
 | 13 | `ToolPolicy` hook | 9 |
 | 14 | Telemetry: tracing + OTLP + `invoke_agent` span + traceparent | – |
-| 15 | otelcol-contrib unit + config: collector → JSONL, with redaction/strip processors | 14 |
+| 15 | ~~otelcol-contrib unit + config~~ replaced by setup B: Athena's JSONL exporter and prod content filter | 14 |
 | 16 | `athena eval` v1: dataset, deterministic graders, `ReplayModel`, PR gate | – |
 | 17 | Live eval target + staging eval report via `deploy-gate eval` | 8, 16 |
 | 18 | DuckDB analytics scripts + canned queries | 15, 16 |

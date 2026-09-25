@@ -43,9 +43,12 @@ Rules for `serve` and `telegram`:
 | `OPEN_SANDBOX_API_KEY` | agent | optional; sent as the `OPEN-SANDBOX-API-KEY` header when set |
 | `ATHENA_SANDBOX_IMAGE` | agent | default `ghcr.io/queryplanner/athena-sandbox:latest` |
 | `ATHENA_SANDBOX_TIMEOUT_SECS` | agent | default `1800`, minimum 60 |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | all | e.g. `http://127.0.0.1:4318`. **Unset means telemetry is off**, with plain stderr logs. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | all | OTLP/HTTP base URL; on the VM OpenObserve, `http://<tailnet-ip>:5080/api/default` (`/v1/traces` and `/v1/logs` are appended). **Unset means no OTLP export.** |
+| `OTEL_EXPORTER_OTLP_HEADERS` | all | `Authorization=Basic%20<base64 of OpenObserve root email:password>`, written by `setup-host.sh` into the env file only |
+| `ATHENA_TELEMETRY_DIR` | all | e.g. `/var/lib/athena/<env>/telemetry`: daily `traces-YYYYMMDD.jsonl` and `logs-YYYYMMDD.jsonl`. **Unset means no files.** With neither this nor the endpoint, telemetry is off and logs go to stderr only. |
+| `ATHENA_TELEMETRY_RETENTION_DAYS` | all | default `30`; files of older days are deleted |
 | `OTEL_SERVICE_NAME` | all | default `athena` |
-| `ATHENA_RECORD_CONTENT` | all | `1` records prompt and response content on spans. Default off. |
+| `ATHENA_RECORD_CONTENT` | all | `1` records prompt and response content on spans. Default off. Ignored when `ATHENA_ENV=prod`. |
 
 ## HTTP
 
@@ -88,7 +91,7 @@ The sandbox image is a separate Docker image:
 | `/var/lib/athena/<env>/agent.db` | athena | the database |
 | `/var/lib/athena/<env>/backups/` | athena | last 10 per env |
 | `/var/lib/athena/gate/<env>.state.json` | root, 0644 (dir root 0755) | written by deploy-gate, outside the athena-writable `<env>/` dir because `promote` trusts it: `{"digest":..., "version":..., "deployed_at":...}` |
-| `/var/lib/athena/otel/{traces,logs}.jsonl` | otelcol | collector file export, rotated |
+| `/var/lib/athena/<env>/telemetry/{traces,logs}-YYYYMMDD.jsonl` | athena, dir 0750, files 0640 | Athena's own export (`ATHENA_TELEMETRY_DIR`), one file per signal per UTC day, pruned after `ATHENA_TELEMETRY_RETENTION_DAYS` |
 | `/var/lib/openobserve/` | openobserve | OpenObserve data |
 
 **Users**
@@ -105,8 +108,7 @@ The sandbox image is a separate Docker image:
 |---|---|
 | prod serve | 18080 |
 | staging serve | 18081 |
-| OpenObserve UI/API | 5080 |
-| otelcol OTLP | 127.0.0.1:4318 (HTTP) and 127.0.0.1:4317 (gRPC) |
+| OpenObserve UI/API and OTLP/HTTP ingest | 5080 (one address: `ZO_HTTP_ADDR` takes a single IP) |
 
 ## systemd
 
@@ -122,8 +124,6 @@ The sandbox image is a separate Docker image:
   **enabled for prod only**.
 - `athena@.target`: `Wants=` both units, so `systemctl start athena@staging.target`
   works. For staging, only serve is enabled.
-- `otelcol-contrib.service` comes from the `.deb`, with config at
-  `/etc/otelcol-contrib/config.yaml` (from `deploy/otel/config.yaml`).
 - `openobserve.service` comes from `deploy/systemd/openobserve.service` (binary in
   `/usr/local/bin/openobserve`).
 
@@ -222,11 +222,28 @@ On a failed health check it puts the previous `current` back, restarts, and exit
 
 ## Telemetry
 
-- OTLP over HTTP to `OTEL_EXPORTER_OTLP_ENDPOINT`.
+Setup B: no collector. Athena exports itself, to two independent sinks.
+
+- OTLP over HTTP (protobuf) to `OTEL_EXPORTER_OTLP_ENDPOINT`, with
+  `OTEL_EXPORTER_OTLP_HEADERS`; on the VM that is OpenObserve.
+- JSONL files under `ATHENA_TELEMETRY_DIR`. One object per line, flat
+  schema (documented in `src/telemetry/jsonl.rs`). Spans: `trace_id`,
+  `span_id`, `parent_span_id`, `name`, `kind`, `start_unix_nano`,
+  `end_unix_nano`, `duration_ms`, `status` (`unset|ok|error`),
+  `status_message`, `attributes` (object), `events`, `scope`, `resource`
+  (object with `service.name`, `service.version`,
+  `deployment.environment.name`). Logs: `time_unix_nano`, `severity`,
+  `severity_number`, `target`, `body`, `trace_id`, `span_id`, `attributes`,
+  `scope`, `resource`. `analytics/queries/spans.sql` reads this schema.
+- For `ATHENA_ENV=prod`, `gen_ai.input.messages`, `gen_ai.output.messages`,
+  `gen_ai.system_instructions`, `gen_ai.tool.call.arguments`,
+  `gen_ai.tool.call.result`, `gen_ai.prompt` and `gen_ai.completion` are
+  removed from spans and span events before either sink, and log events
+  carrying them are not exported.
 - Each turn gets an Athena `invoke_agent` span carrying `gen_ai.conversation.id`,
   `athena.run_id`, `athena.transport`, and `enduser.pseudo.id` (a hash).
 - rig's own spans nest under it.
 - Logs go through `tracing`: plain text to stderr always (so the CLI REPL
-  stays readable), plus OTLP when on.
+  stays readable), plus each sink that is on.
 - HTTP accepts W3C `traceparent` and, when OTel is on, answers with
   `x-trace-id` and `traceparent` response headers.
