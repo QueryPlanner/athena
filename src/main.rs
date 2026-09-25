@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use athena::service::Service;
-use athena::{agent, cli, dotenv, http, shutdown, store, telegram};
+use athena::{agent, bench, cli, dotenv, eval, http, shutdown, store, telegram};
 use std::sync::Arc;
 
 fn main() -> Result<()> {
@@ -20,6 +20,15 @@ async fn run() -> Result<()> {
     let model = agent::model();
     if telegram::requested(&args)? {
         return telegram::main(&model).await;
+    }
+    // Before opening the database: neither touches `ATHENA_DB`.
+    let mut stdout = std::io::stdout();
+    match args.split_first() {
+        Some((cmd, rest)) if cmd == "eval" => {
+            return eval::main(rest, &model, agent::provider_model, &mut stdout).await;
+        }
+        Some((cmd, rest)) if cmd == "bench" => return bench::main(rest, &mut stdout).await,
+        _ => {}
     }
     let service = Service::new(store::Store::open(&store::path())?, &model, cli::warn);
     if args.first().is_some_and(|a| a == "serve") {

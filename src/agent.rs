@@ -41,6 +41,12 @@ pub fn client() -> Result<Client> {
     Ok(Client::from_env()?)
 }
 
+/// A bare model on the same provider, without the agent around it: what
+/// `athena eval record` records and `athena eval run --judge` asks.
+pub fn provider_model(model: &str) -> Result<rig::core::providers::openrouter::CompletionModel> {
+    Ok(client()?.completion_model(model))
+}
+
 /// The production agent. `memory` is where Rig loads and saves each
 /// conversation: `service.memory()`.
 pub fn build(

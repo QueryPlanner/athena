@@ -1,0 +1,15 @@
+{
+  "eval_case_id": "add_tool",
+  "kind": "trajectory",
+  "tags": ["core", "tools"],
+  "turns": ["Use the add tool to add 21 and 21, then tell me the result."],
+  "expect": {
+    "trajectory": {
+      "mode": "exact",
+      "tools": [{"tool": "add", "args_match": "\"a\":21(\\.0)?,\"b\":21(\\.0)?"}]
+    },
+    "output": {"regex": "\\b42\\b"},
+    "rubric": "States that 21 + 21 is 42."
+  },
+  "thresholds": {"max_model_calls": 3}
+}
