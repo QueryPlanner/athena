@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod cli;
+pub mod http;
 pub mod runner;
 pub mod service;
 pub mod store;
