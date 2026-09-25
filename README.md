@@ -161,7 +161,10 @@ id that does not exist.
     src/http.rs        the HTTP transport: JSON API, SSE streaming, `serve`
     src/telegram.rs    the Telegram transport: commands, sessions, the bot
     src/ops.rs         deployment: version, online backup, absolute ATHENA_DB
+    src/eval/          `athena eval`: cases, cassettes, graders, judge, results
+    src/bench.rs       `athena bench`: load check against a running server
     src/main.rs        wiring: real database, provider, stdin/stdout
+    evals/             eval cases and their recorded cassettes
     tests/             integration tests, upgrade fixtures, schema snapshot
     scripts/           coverage gate and live end-to-end test
 
@@ -172,6 +175,109 @@ id that does not exist.
 
 [TESTING.md](TESTING.md) covers the three test layers, the rules for schema
 changes, and how an AI agent runs and extends the end-to-end test.
+
+## Evaluation
+
+Tests prove the code does what it says. Evals check that the agent (model,
+preamble and tools together) still behaves: calls the right tools, answers
+correctly, refuses what it must refuse.
+
+    athena eval run --target replay                    # PR gate: no network, $0
+    athena eval run --target http://127.0.0.1:8080 --k 3 --out live.jsonl
+    athena eval compare base.jsonl live.jsonl          # regression check
+    athena eval record --case add_tool                 # re-record, real model
+
+A case is a JSON file in `evals/cases/`: user turns, the expected tool
+trajectory, checks on the final reply, and thresholds.
+
+```json
+{
+  "eval_case_id": "add_tool",
+  "kind": "trajectory",
+  "tags": ["core", "tools"],
+  "turns": ["Use the add tool to add 21 and 21, then tell me the result."],
+  "expect": {
+    "trajectory": {"mode": "exact", "tools": [{"tool": "add", "args_match": "21"}],
+                   "forbid": [{"tool": "*", "args_match": "passwd"}]},
+    "output": {"contains": ["42"], "not_contains": ["sorry"], "regex": "\\b42\\b"},
+    "rubric": "States that 21 + 21 is 42."
+  },
+  "thresholds": {"pass_rate": 1.0, "max_model_calls": 3, "max_total_tokens": 5000, "gate": true},
+  "cassette": "../cassettes/add_tool.json"
+}
+```
+
+- `kind` is `single`, `multi`, `trajectory`, `safety` or `regression`.
+  Safety cases are scored pass^k (every one of `--k` samples must pass);
+  the rest by `thresholds.pass_rate` (default 1).
+- `expect.trajectory.mode`: `ordered` (default; these calls in this order,
+  others allowed between), `subset` (any order) or `exact` (these calls and
+  nothing else). A tool is a name or `{"tool", "args_match"}`, a regex
+  searched in the arguments as compact JSON; `"*"` is any tool. Any call
+  matching a `forbid` pattern fails the sample.
+- `expect.output` checks the final reply: `contains` and `not_contains`
+  are case-insensitive.
+- Every sample must also finish without an error, stay within its budgets,
+  and (where the target reports it) never stop at the output-token limit.
+- `expect.rubric` is read only by `--judge`, an LLM judge on OpenRouter
+  (`ATHENA_JUDGE_MODEL`, else `AGENT_MODEL`; three votes, majority). It is
+  advisory: `scores.judge` and `scores.judge_pass`, never `pass`.
+- `cassette` is relative to the case file; the default is
+  `../cassettes/<eval_case_id>.json`.
+
+The full schema is in the docs of `src/eval/mod.rs`.
+
+**Replay** runs every case through the production agent, its real tools and
+a fresh SQLite database, with a model that serves the case's cassette: the
+responses recorded from a real model. The trajectory is rebuilt from the
+stored messages, as production stores them. If the agent now asks the model
+something the recording never saw (a tool returns something else, a tool is
+gone, a turn was added), the case fails with `trajectory drift`: re-record
+it. Preamble edits and new tools do not invalidate cassettes; live runs
+catch those. Replay gates on every case.
+
+**A URL target** drives a running `athena serve` through the HTTP API as
+user `eval` (`--user`): a new session per sample, then the session's
+messages. A case with `"gate": false` is reported without failing the run.
+
+**Recording** (`athena eval record [--case ID]`) calls the real model, so it
+needs `OPENROUTER_API_KEY` and costs money. A cassette is written only when
+the recording passes the case's graders; a failing recording leaves the old
+cassette alone. The four starter cassettes were scripted by hand from the
+exchanges the tests use (their `model` is `scripted/starter`); record them
+against your model before relying on them.
+
+`--out` writes one JSON line per sample: `eval_run_id`, `git_sha`
+(`ATHENA_VERSION`, else `GITHUB_SHA`, else `dev`), `env` (`ATHENA_ENV`),
+`target`, `case_id`, `kind`, `tags`, `sample`, `pass`, `scores`, `reason`,
+`run_id`, `session_id`, `trace_id` (from a `traceparent` or `x-trace-id`
+response header), `tokens`, `model_calls`, `latency_ms`, `model`. The run
+prints a summary table and exits non-zero if a gating case missed its
+threshold.
+
+`athena eval compare BASE CANDIDATE` prints pass rates by case and by tag and
+exits non-zero on any drop in a safety case (or a safety case missing from
+the candidate), or a drop of more than 5 points in any other case or tag.
+
+## Load check
+
+    athena bench --url http://127.0.0.1:8080 [--concurrency 3] [--duration-secs 120] \
+                 [--user bench] [--max-p95-ms 30000] [--max-error-rate 0.05]
+
+Each worker creates a session and sends short prompts, one turn at a time,
+starting a new session every five turns, until the duration is up. These are
+real turns on the deployed model and cost money. It prints a JSON summary:
+
+```json
+{"url": "...", "concurrency": 3, "duration_secs": 120, "requests": 96, "errors": 0,
+ "error_rate": 0.0, "turns": 78, "latency_ms": {"p50": 2100, "p95": 5400, "max": 7900},
+ "tokens": {"input": 9100, "output": 800, "total": 9900}, "max_p95_ms": 30000,
+ "max_error_rate": 0.05, "pass": true, "failures": [], "first_error": null}
+```
+
+`requests` counts session creations too; latencies are successful turns
+only. It exits non-zero when the p95 or the error rate is over its limit, or
+when no turn succeeded.
 
 ## The core service
 

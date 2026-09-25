@@ -1,0 +1,33 @@
+{
+  "eval_case_id": "plain_answer",
+  "model": "scripted/starter",
+  "interactions": [
+    {
+      "input": [
+        "user: Reply with exactly one word: pong"
+      ],
+      "response": {
+        "choice": [
+          {
+            "type": "text",
+            "text": "pong"
+          }
+        ],
+        "usage": {
+          "input_tokens": 96,
+          "output_tokens": 2,
+          "total_tokens": 98,
+          "cached_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "tool_use_prompt_tokens": 0,
+          "reasoning_tokens": 0
+        },
+        "message_id": null,
+        "response_id": null,
+        "finish_reason": "stop",
+        "provider": "scripted",
+        "model": null
+      }
+    }
+  ]
+}

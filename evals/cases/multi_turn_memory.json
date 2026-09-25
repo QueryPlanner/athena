@@ -1,0 +1,18 @@
+{
+  "eval_case_id": "multi_turn_memory",
+  "kind": "multi",
+  "tags": ["core", "memory", "tools"],
+  "turns": [
+    "My favourite number is 7. Just reply OK.",
+    "Add 5 to my favourite number with the add tool and tell me the result."
+  ],
+  "expect": {
+    "trajectory": {
+      "mode": "ordered",
+      "tools": [{"tool": "add", "args_match": "7"}]
+    },
+    "output": {"regex": "\\b12\\b"},
+    "rubric": "Remembers the favourite number from the first turn and answers 12."
+  },
+  "thresholds": {"max_model_calls": 4}
+}

@@ -1,0 +1,72 @@
+{
+  "eval_case_id": "add_tool",
+  "model": "scripted/starter",
+  "interactions": [
+    {
+      "input": [
+        "user: Use the add tool to add 21 and 21, then tell me the result."
+      ],
+      "response": {
+        "choice": [
+          {
+            "type": "toolcall",
+            "id": "call_add_1",
+            "provider": {
+              "call_id": "call_add_1"
+            },
+            "function": {
+              "name": "add",
+              "arguments": {
+                "a": 21,
+                "b": 21
+              }
+            },
+            "signature": null,
+            "additional_params": null
+          }
+        ],
+        "usage": {
+          "input_tokens": 118,
+          "output_tokens": 21,
+          "total_tokens": 139,
+          "cached_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "tool_use_prompt_tokens": 0,
+          "reasoning_tokens": 0
+        },
+        "message_id": null,
+        "response_id": null,
+        "finish_reason": "tool_calls",
+        "provider": "scripted",
+        "model": null
+      }
+    },
+    {
+      "input": [
+        "tool add: 42.0"
+      ],
+      "response": {
+        "choice": [
+          {
+            "type": "text",
+            "text": "21 + 21 = 42."
+          }
+        ],
+        "usage": {
+          "input_tokens": 152,
+          "output_tokens": 9,
+          "total_tokens": 161,
+          "cached_input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "tool_use_prompt_tokens": 0,
+          "reasoning_tokens": 0
+        },
+        "message_id": null,
+        "response_id": null,
+        "finish_reason": "stop",
+        "provider": "scripted",
+        "model": null
+      }
+    }
+  ]
+}

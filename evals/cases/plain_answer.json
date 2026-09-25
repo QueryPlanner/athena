@@ -1,0 +1,12 @@
+{
+  "eval_case_id": "plain_answer",
+  "kind": "single",
+  "tags": ["core"],
+  "turns": ["Reply with exactly one word: pong"],
+  "expect": {
+    "trajectory": {"mode": "exact", "tools": []},
+    "output": {"contains": ["pong"]},
+    "rubric": "The reply is the single word pong, with nothing else."
+  },
+  "thresholds": {"max_model_calls": 1}
+}
