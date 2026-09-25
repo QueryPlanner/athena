@@ -2,14 +2,14 @@
 //!
 //! Loading and saving the transcript is not here. Rig does both through the
 //! conversation memory the agent was built with (`store::SqliteMemory`);
-//! `service::Service::send` wraps the run with ownership, locking and
-//! telemetry.
+//! `service::Service::send` and `send_stream` wrap the run with ownership,
+//! locking and telemetry.
 
 use crate::store::{RunRecord, now_millis};
-use rig_agent::agent::{Agent, PromptResponse};
+use rig_agent::agent::{Agent, PromptResponse, StreamingResult};
 use rig_agent::completion::PromptError;
-use rig_agent::prelude::Prompt;
-use std::future::Future;
+use rig_agent::prelude::{Prompt, StreamingPrompt};
+use std::future::{Future, IntoFuture};
 
 /// One agent run in a conversation, returning everything Rig reports rather
 /// than just the reply.
@@ -38,6 +38,34 @@ impl Run for Agent {
             .conversation(conversation)
             .extended_details()
             .await
+    }
+}
+
+/// The streaming counterpart of [`Run`]: the same turn, reported as it
+/// happens. The stream's last item is Rig's `FinalResponse`, or an error.
+///
+/// The returned future must not touch the conversation memory until it is
+/// first polled: the service starts the turn's memory receipt in between.
+/// Rig's own request is lazy that way, and so is any `async fn`.
+pub trait RunStream: Send + Sync {
+    /// Stream `prompt` in `conversation`. The memory loads the history when
+    /// the future is polled and appends the turn before the final item.
+    fn stream(
+        &self,
+        prompt: &str,
+        conversation: &str,
+    ) -> impl Future<Output = StreamingResult> + Send;
+}
+
+impl RunStream for Agent {
+    fn stream(
+        &self,
+        prompt: &str,
+        conversation: &str,
+    ) -> impl Future<Output = StreamingResult> + Send {
+        self.stream_prompt(prompt)
+            .conversation(conversation)
+            .into_future()
     }
 }
 

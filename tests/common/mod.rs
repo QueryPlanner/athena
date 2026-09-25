@@ -6,7 +6,7 @@ use athena::service::{Service, Session, User};
 use athena::store::Store;
 use rig_agent::agent::{Agent, AgentBuilder};
 use rig_core::completion::Usage;
-use rig_core::test_utils::{MockCompletionModel, MockTurn};
+use rig_core::test_utils::{MockCompletionModel, MockStreamEvent, MockTurn};
 use rusqlite::Connection;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -53,6 +53,35 @@ impl Drop for TempDb {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", self.path()));
         }
+    }
+}
+
+/// An empty directory to run the binary in, removed on drop.
+///
+/// The binary loads `.env` from its working directory, so it must never run
+/// in the repository, where a developer's real `.env` holds real keys.
+pub struct WorkDir(PathBuf);
+
+impl WorkDir {
+    pub fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("athena-cwd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        Self(dir)
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+
+    /// Write `contents` as this directory's `.env`.
+    pub fn env_file(&self, contents: &str) {
+        std::fs::write(self.0.join(".env"), contents).unwrap();
+    }
+}
+
+impl Drop for WorkDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -166,4 +195,47 @@ pub fn user_version(db: &Connection) -> i64 {
 
 pub fn count(db: &Connection, sql: &str) -> i64 {
     db.query_row(sql, [], |r| r.get(0)).unwrap()
+}
+
+/// The production agent in front of a scripted streaming model, with any
+/// conversation memory (the service's, or a wrapper around it). A mock
+/// model scripts blocking or streaming turns, not both.
+pub fn mock_stream_agent(
+    memory: impl rig_core::memory::ConversationMemory + 'static,
+    turns: impl IntoIterator<Item = Vec<MockStreamEvent>>,
+) -> (Agent, MockCompletionModel) {
+    let model = MockCompletionModel::from_stream_turns(turns);
+    let builder = AgentBuilder::new(model.clone()).memory(memory);
+    (agent::configure(builder), model)
+}
+
+/// One streamed model turn: `chunks` of text, then the provider's terminal
+/// record. Without that record Rig treats the turn as truncated.
+pub fn streamed_text(chunks: &[&str], usage: Usage) -> Vec<MockStreamEvent> {
+    let mut events: Vec<MockStreamEvent> =
+        chunks.iter().map(|c| MockStreamEvent::text(*c)).collect();
+    events.push(MockStreamEvent::final_response(usage));
+    events
+}
+
+/// `add 21 and 21`, streamed: a tool call, then "42" in two deltas.
+pub fn streamed_add_turns() -> Vec<Vec<MockStreamEvent>> {
+    vec![
+        vec![
+            MockStreamEvent::tool_call("call_1", "add", serde_json::json!({"a": 21, "b": 21})),
+            MockStreamEvent::final_response(usage(111, 21)),
+        ],
+        streamed_text(&["4", "2"], usage(145, 5)),
+    ]
+}
+
+/// [`mock_agent`] with any conversation memory, such as a wrapper that
+/// parks a turn at a chosen point.
+pub fn mock_agent_with_memory(
+    memory: impl rig_core::memory::ConversationMemory + 'static,
+    turns: impl IntoIterator<Item = MockTurn>,
+) -> (Agent, MockCompletionModel) {
+    let model = MockCompletionModel::new(turns);
+    let builder = AgentBuilder::new(model.clone()).memory(memory);
+    (agent::configure(builder), model)
 }

@@ -278,37 +278,13 @@ async fn a_closed_output_is_an_error_not_silently_dropped() {
 
 // ---- the real binary ----
 
-/// An empty directory to run the binary in, removed on drop.
-///
-/// The binary loads `.env` from its working directory, so it must never run
-/// in the repository, where a developer's real `.env` holds real keys.
-struct WorkDir(std::path::PathBuf);
-
-impl WorkDir {
-    fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("athena-cwd-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
-        Self(dir)
-    }
-
-    fn env_file(&self, contents: &str) {
-        std::fs::write(self.0.join(".env"), contents).unwrap();
-    }
-}
-
-impl Drop for WorkDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// `athena` run in `dir`, with no key, model or database inherited from the
 /// developer's shell. `env_remove` rather than `env_clear`, which would also
 /// drop the coverage profiler's variables.
 fn athena_in(dir: &WorkDir, db: Option<&TempDb>, list: &[&str]) -> std::process::Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_athena"));
     cmd.args(list)
-        .current_dir(&dir.0)
+        .current_dir(dir.path())
         .env_remove("ATHENA_DB")
         .env_remove("OPENROUTER_API_KEY")
         .env_remove("AGENT_MODEL");
