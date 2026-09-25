@@ -5,25 +5,31 @@
 # phrases things differently does not fail it. The two checks that do depend
 # on the model (it chose the tool; it repeated a code word) retry once.
 #
-# Needs OPENROUTER_API_KEY and sqlite3. Costs a few cents. Not run in CI.
+# Needs OPENROUTER_API_KEY, sqlite3, curl and python3 (section 8's fake
+# Telegram server). Costs a few cents. Not run in CI.
 # See TESTING.md for what each check proves and how to extend it.
 set -euo pipefail
 
 : "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY not set}"
 export AGENT_MODEL="${AGENT_MODEL:-openai/gpt-5.6-luna}"
 command -v sqlite3 >/dev/null || { echo "sqlite3 is required"; exit 1; }
+command -v curl >/dev/null || { echo "curl is required"; exit 1; }
+python3 -c 'import http.server' 2>/dev/null || { echo "python3 is required"; exit 1; }
 
 cd "$(dirname "$0")/.."
 cargo build --quiet --locked
 BIN="$PWD/target/debug/athena"
 
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# Background processes (section 8) are always stopped, even on failure.
+BG_PIDS=()
+stop_bg() { for pid in "${BG_PIDS[@]:-}"; do [ -n "$pid" ] && kill "$pid" 2>/dev/null || true; done; }
+trap 'stop_bg; rm -rf "$WORK"' EXIT
 export ATHENA_DB="$WORK/e2e.db"
 
 q() { sqlite3 "$ATHENA_DB" "$1"; }
 pass() { echo "PASS  $1"; }
-fail() { echo "FAIL  $1"; echo "      database kept at $ATHENA_DB"; trap - EXIT; exit 1; }
+fail() { echo "FAIL  $1"; echo "      database kept at $ATHENA_DB"; trap stop_bg EXIT; exit 1; }
 expect() { # description, actual, expected
     if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (got '$2', want '$3')"; fi
 }
@@ -185,5 +191,4 @@ expect "the new turn appended at seq 12" \
     "$(q "SELECT first_seq FROM runs WHERE session_id='testsess' AND rowid > 3")" "12"
 expect "seq numbers contiguous" "$(contiguous testsess)" "1"
 
-echo
-echo "All end-to-end checks passed."
+__SECTION8__

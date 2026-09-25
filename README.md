@@ -39,6 +39,7 @@ as is.
     cargo run -- usage                       # per-session token totals
     cargo run -- --user telegram:42 ...      # any of the above as another user
     ATHENA_DB=/tmp/x.db cargo run -- ...     # use another database file
+    TELEGRAM_BOT_TOKEN=... cargo run -- telegram   # run the Telegram bot
 
 A session name is created on first use and resumes the conversation after
 that, tool history included. `sessions new NAME` creates one explicitly and
@@ -49,12 +50,55 @@ otherwise. That flag exists so an AI agent (or you) can drive exactly what an
 HTTP client or a Telegram chat would see, from a shell. It is not an access
 control boundary: anyone who can run the binary can read the database file.
 
+## Telegram
+
+    export TELEGRAM_BOT_TOKEN=123456:ABC...   # from @BotFather
+    cargo run -- telegram                     # long polling; Ctrl-C stops
+
+`athena telegram` needs `OPENROUTER_API_KEY` and `TELEGRAM_BOT_TOKEN` and
+checks both before it opens the database. `TELEGRAM_API_URL` points it at
+another Bot API server (the tests use a fake one); it defaults to
+`https://api.telegram.org`.
+
+The bot is open to anyone who finds it; see Known limits. It answers private
+chats only. A group message is ignored and logged: in a group every member
+would read one member's conversation.
+
+Each Telegram user is the user `telegram:<their Telegram user id>`, so
+`cargo run -- --user telegram:ID sessions` shows what the bot stored for
+them. They talk in one session at a time: `default` until they pick another.
+The pick is stored (the `selected_sessions` table), so it survives a restart.
+
+| Command | What it does |
+|---|---|
+| `/new NAME` | Create session NAME and switch to it. Without NAME, picks `chat-N`. |
+| `/sessions` | List your sessions with message counts; `*` marks the current one. |
+| `/switch NAME` | Switch to an existing session (`default` always exists). |
+| `/usage` | Turns, model calls and tokens per session. |
+| `/help`, `/start` | What the bot is, the current session, the commands. |
+
+The commands are registered with Telegram's command menu at startup. Any
+other text is a prompt for the current session.
+
+While the model works the bot shows "typing...". A reply longer than
+Telegram's 4096-character limit is split, at a line break if there is one
+near the limit, else at a space, never inside a character; at most 8
+messages, then a note that the rest is in the transcript. A 429 from
+Telegram is retried after the delay it asks for.
+
+Each turn runs in its own task, so a slow model never holds up another user.
+One user gets one turn at a time: a message that arrives while their turn is
+running is answered "Still working on your last message" and dropped, not
+queued. Commands still answer at once. Errors are logged to stderr and
+answered with one short line; the bot keeps running. Ctrl-C stops polling
+and waits for turns in flight to reply.
+
 ## Users and sessions
 
-A user is identified by `(transport, external_id)`: `("cli", "local")`
-today, `("telegram", "<chat id>")` or `("http", "<account>")` once those
-transports exist. A new transport adds a transport name, never a schema
-change.
+A user is identified by `(transport, external_id)`: `("cli", "local")`,
+`("telegram", "<Telegram user id>")`, or `("http", "<account>")` once that
+transport exists. A new transport adds a transport name, never a change to
+how users are stored.
 
 A session belongs to exactly one user. Its name is unique among that user's
 sessions; its id (a uuid) is unique everywhere. Two users can both have a
@@ -69,6 +113,7 @@ id that does not exist.
     src/store.rs       the database: migrations, Rig conversation memory, runs
     src/runner.rs      the Run trait and the run record
     src/cli.rs         the CLI transport: arguments, output, REPL
+    src/telegram.rs    the Telegram transport: commands, sessions, the bot
     src/main.rs        wiring: real database, provider, stdin/stdout
     tests/             integration tests, upgrade fixtures, schema snapshot
     scripts/           coverage gate and live end-to-end test
@@ -201,7 +246,25 @@ fatal: losing a cost row must never cost you a reply.
   streaming driver appends to the same memory, so a streaming `send` can
   reuse the session lock and the receipt.
 - Context grows forever, and every turn re-sends the whole history.
-- Only a CLI transport so far. HTTP and Telegram call `service::Service`.
+- The Telegram bot is open to anyone. Whoever finds its username can talk
+  to it, and every turn they run spends the owner's OpenRouter credit. There
+  is no allowlist and no per-user budget; `/usage` and the `runs` table show
+  who spent what, by Telegram user id.
+- Telegram delivery is at most once. An update counts as received when the
+  next poll starts, not when it is answered, so a crash or `kill -9` loses
+  messages that were queued, and a reply whose send fails is lost even
+  though its transcript is saved.
+- Only SIGINT (Ctrl-C) stops the bot gracefully. SIGTERM, which systemd and
+  Docker send, kills it mid-turn; set `KillSignal=SIGINT` or `STOPSIGNAL
+  SIGINT`. A second Ctrl-C does not force an exit while a turn is running.
+- Edited messages, photos and other non-text messages are not prompts.
+  Edits are ignored; the rest get "I only read text messages."
+- The selected session is Telegram state. The CLI still uses `default`
+  unless given a session name, and `sessions` does not mark the selection
+  (`selected_sessions` is readable with `sqlite3`). `Service` does not
+  expose selection yet; `telegram.rs` reads it from `Store` directly.
+- Provider errors are logged to stderr in full and can include account
+  details from the provider's error body. Message text is never logged.
 - Turns on one session are serialized within a process. Across processes
   they are not: the second one to finish is refused with `Conflict` rather
   than interleaved.

@@ -18,6 +18,7 @@ commands:
   sessions             list your sessions: name, message count
   sessions new NAME    create an empty session; prints name and id
   usage                token totals per session
+  telegram             run the Telegram bot (TELEGRAM_BOT_TOKEN; see README)
 
 --user acts as another user, e.g. telegram:42. The default is cli:local.";
 

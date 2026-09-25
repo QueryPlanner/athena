@@ -6,3 +6,4 @@ pub mod cli;
 pub mod runner;
 pub mod service;
 pub mod store;
+pub mod telegram;
