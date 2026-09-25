@@ -40,13 +40,13 @@ async fn a_tool_turn_runs_the_real_tool_and_records_what_it_cost() {
     assert!(rows[2].contains(r#""type":"toolresult""#), "{}", rows[2]);
     assert!(rows[2].contains("42"), "{}", rows[2]);
 
-    // The model was sent the production preamble and both tools.
+    // The model was sent the production preamble and its one host tool.
     let requests = model.requests();
     assert_eq!(requests.len(), 2);
     assert!(is_preamble(&requests[0].chat_history[0]));
     let mut tools: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
     tools.sort();
-    assert_eq!(tools, ["add", "read_file"]);
+    assert_eq!(tools, ["add"]);
 
     // One run, two model calls, four messages, and the summed token counts.
     assert_eq!(runs(&db, &s.id), [run_row(0, 3, 2, "ok")]);

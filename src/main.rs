@@ -24,11 +24,11 @@ async fn run() -> Result<()> {
     let service = Service::new(store::Store::open(&store::path())?, &model, cli::warn);
     if args.first().is_some_and(|a| a == "serve") {
         // Up front: a server without a key would fail every turn.
-        let agent = agent::build(&agent::client()?, &model, service.memory());
+        let agent = agent::build(&agent::client()?, &model, service.memory())?;
         let stop = shutdown::listen()?;
         return http::run(&args[1..], Arc::new(service), Arc::new(agent), stop).await;
     }
-    let make_agent = || Ok(agent::build(&agent::client()?, &model, service.memory()));
+    let make_agent = || agent::build(&agent::client()?, &model, service.memory());
     cli::run(
         &args,
         &service,

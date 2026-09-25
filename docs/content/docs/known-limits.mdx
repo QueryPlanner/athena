@@ -11,8 +11,7 @@ description: What athena does not do yet. Read this before exposing it.
 
 - Whoever can reach the port can act as any user by setting
   `X-Athena-User`, read every session, spend the OpenRouter credit, and use
-  the agent's tools on the server, including `read_file` on any path the
-  process can read. Loopback is the default and refuses foreign `Host`
+  the agent's tools in any session's sandbox. Loopback is the default and refuses foreign `Host`
   headers, but every local process is still trusted. Put an authenticating
   proxy in front before listening anywhere else.
 - Every distinct `X-Athena-User` value creates a `users` row, even for a

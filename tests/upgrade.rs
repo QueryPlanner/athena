@@ -23,6 +23,7 @@ const V0_MAIN: &str = include_str!("fixtures/v0_main.sql");
 const V0_RUN_OBSERVABILITY: &str = include_str!("fixtures/v0_run_observability.sql");
 const V2_RUN_TELEMETRY: &str = include_str!("fixtures/v2_run_telemetry.sql");
 const V3_USERS_SESSIONS: &str = include_str!("fixtures/v3_users_sessions.sql");
+const V4_SELECTED_SESSIONS: &str = include_str!("fixtures/v4_selected_sessions.sql");
 
 /// Every row of a table, every column, in rowid order, as SQLite holds it.
 fn dump(db: &Connection, table: &str) -> Vec<Vec<Value>> {
@@ -220,6 +221,47 @@ async fn a_database_at_schema_3_gains_session_selection_without_changing_a_row()
             .collect::<Vec<_>>(),
         owned_by_cli(&["broken", "research", "testsess"])
     );
+}
+
+/// The upgrade this build adds: schema version 4, with a Telegram user's
+/// selected session. Migration 5 only adds `sandboxes`; every existing row
+/// of every table must survive it, and a turn must still work.
+#[tokio::test]
+async fn a_database_at_schema_4_gains_sandboxes_without_changing_a_row() {
+    const TABLES: [&str; 5] = ["messages", "runs", "users", "sessions", "selected_sessions"];
+    let tmp = from_fixture(V4_SELECTED_SESSIONS);
+    let before: Vec<Vec<Vec<Value>>> = {
+        let db = tmp.raw();
+        assert_eq!(user_version(&db), 4);
+        TABLES.iter().map(|t| dump(&db, t)).collect()
+    };
+    let sizes: Vec<usize> = before.iter().map(Vec::len).collect();
+    assert_eq!(sizes, [14, 3, 3, 6, 1]);
+
+    let (service, _) = tmp.service();
+    let db = tmp.raw();
+
+    assert_eq!(user_version(&db), store::SCHEMA_VERSION as i64);
+    let after: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
+    assert_eq!(after, before);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM sandboxes"), 0);
+
+    // The selection survived and still reads back; a turn in it appends.
+    let store = tmp.open();
+    let user = service.user("telegram", "111111").await.unwrap();
+    let notes = store.selected_session(&user).unwrap().unwrap();
+    assert_eq!(notes.name, "notes");
+    let (agent, _) = mock_agent(&service, [MockTurn::text("noted")]);
+    service
+        .send(&agent, &user, &notes.id, "hello")
+        .await
+        .unwrap();
+
+    let now: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
+    for ((table, old), new) in TABLES.iter().zip(&before).zip(&now) {
+        assert_eq!(&new[..old.len()], &old[..], "{table}");
+    }
+    assert_eq!(runs(&db, &notes.id), [run_row(0, 1, 1, "ok")]);
 }
 
 #[test]
