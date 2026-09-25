@@ -20,14 +20,23 @@ use std::sync::{Arc, Mutex};
 use teloxide::Bot;
 use tokio::sync::{Semaphore, mpsc};
 
+/// The secret half of the test token: 35+ characters of `[A-Za-z0-9_-]`,
+/// which is what teloxide's redaction looks for. Built at runtime and
+/// obviously fake, so the source never holds a token-shaped literal for
+/// secret scanners to flag.
+fn secret() -> String {
+    format!("not_a_real_secret_{}", "x".repeat(18))
+}
+
 /// Shaped like a real token, so teloxide's redaction applies to it.
-const TOKEN: &str = "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsawx";
-const SECRET: &str = "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsawx";
+fn token() -> String {
+    format!("123456789:{}", secret())
+}
 
 type Logged = Arc<Mutex<Vec<String>>>;
 
 fn bot(url: &str) -> Bot {
-    Bot::new(TOKEN).set_api_url(url::Url::parse(url).unwrap())
+    Bot::new(token()).set_api_url(url::Url::parse(url).unwrap())
 }
 
 fn app<R: Run + 'static>(
@@ -127,7 +136,11 @@ async fn messages_and_commands_round_trip_through_the_bot_api() {
     // The command menu was registered, and every call carried our token.
     let menu = &api.calls_to("setMyCommands")[0].body["commands"];
     assert_eq!(menu.as_array().unwrap().len(), telegram::COMMANDS.len());
-    assert!(api.calls().iter().all(|c| c.token == format!("bot{TOKEN}")));
+    assert!(
+        api.calls()
+            .iter()
+            .all(|c| c.token == format!("bot{}", token()))
+    );
     // "typing" went out before each reply to a prompt, in that chat.
     let order: Vec<String> = api
         .calls()
@@ -328,7 +341,7 @@ async fn bot_api_errors_are_logged_retried_or_survived() {
     assert!(has("getting updates failed: Retry after 0s"), "{logged:?}");
     assert!(has("sending the typing indicator failed"), "{logged:?}");
     assert!(has("ignoring update 2: not a message"), "{logged:?}");
-    assert!(logged.iter().all(|l| !l.contains(SECRET)), "{logged:?}");
+    assert!(logged.iter().all(|l| !l.contains(&secret())), "{logged:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -368,7 +381,7 @@ async fn a_refused_or_unreachable_api_fails_serve_without_leaking_the_token() {
         text.contains("registering the command menu failed"),
         "{text}"
     );
-    assert!(!text.contains(SECRET), "{text}");
+    assert!(!text.contains(&secret()), "{text}");
 }
 
 // ---------------- the real binary ----------------
@@ -379,7 +392,7 @@ fn start_binary(tmp: &TempDb, api: &FakeApi) -> Child {
     Command::new(env!("CARGO_BIN_EXE_athena"))
         .arg("telegram")
         .env("ATHENA_DB", tmp.path())
-        .env("TELEGRAM_BOT_TOKEN", TOKEN)
+        .env("TELEGRAM_BOT_TOKEN", token())
         .env("TELEGRAM_API_URL", &api.url)
         .env("OPENROUTER_API_KEY", "unused-by-these-tests")
         .env_remove("AGENT_MODEL")
@@ -424,7 +437,7 @@ async fn the_binary_serves_commands_and_remembers_the_session_across_a_restart()
 
     assert_eq!(first[2], "Switched to `work` (0 messages).");
     assert!(stderr.contains("polling for messages"), "{stderr}");
-    assert!(!stderr.contains(SECRET), "{stderr}");
+    assert!(!stderr.contains(&secret()), "{stderr}");
     assert_eq!(selected(&tmp, "77").as_deref(), Some("work"));
 
     // A new process picks up where the old one left off.
@@ -466,7 +479,7 @@ fn the_binary_checks_its_settings_before_touching_the_database() {
     };
 
     let missing = run(&["telegram"], None);
-    let extra = run(&["telegram", "now"], Some(TOKEN));
+    let extra = run(&["telegram", "now"], Some(&token()));
 
     assert!(
         missing.contains("TELEGRAM_BOT_TOKEN is not set"),
