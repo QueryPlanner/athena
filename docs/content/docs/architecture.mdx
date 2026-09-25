@@ -1,0 +1,85 @@
+---
+title: Architecture
+description: The core service, users and sessions, and the source layout.
+---
+
+## Layout
+
+```text
+src/agent.rs    <- you edit this
+src/service.rs     the core every transport calls: users, sessions, send
+src/store.rs       the database: migrations, Rig conversation memory, runs
+src/runner.rs      the Run trait and the run record
+src/cli.rs         the CLI transport: arguments, output, REPL
+src/http.rs        the HTTP transport: JSON API, SSE streaming, `serve`
+src/telegram.rs    the Telegram transport: commands, sessions, the bot
+src/main.rs        wiring: real database, provider, stdin/stdout
+src/lib.rs         the crate root: module list
+src/dotenv.rs      loads .env without overriding the shell
+src/shutdown.rs    SIGINT and SIGTERM handling for serve and telegram
+tests/             integration tests, upgrade fixtures, schema snapshot
+scripts/           coverage gate and live end-to-end test
+```
+
+## Users and sessions
+
+A user is identified by `(transport, external_id)`: `("cli", "local")`,
+`("telegram", "<Telegram user id>")` or `("http", "<X-Athena-User>")`. A new
+transport adds a transport name, never a change to how users are stored.
+
+A session belongs to exactly one user. Its name is unique among that user's
+sessions; its id (a uuid) is unique everywhere. A user asking for another
+user's session id gets "no such session", the same answer as for an id that
+does not exist.
+
+## The core service
+
+`service::Service` is the one API a transport calls. It returns values and
+never prints; problems that do not fail a call (a lost telemetry row) go to
+the `warn` callback given to `Service::new`.
+
+```rust
+let service = Service::new(Store::open(path)?, model, warn);
+let agent   = agent::build(&client, model, service.memory());
+
+let user    = service.user("telegram", chat_id).await?;         // get or create
+let session = service.open_session(&user, "default").await?;    // get or create
+let session = service.create_session(&user, "notes").await?;    // AlreadyExists if taken
+let session = service.session(&user, &id).await?;               // NotFound unless theirs
+let list    = service.sessions(&user).await?;                   // name, id, message count
+let msgs    = service.history(&user, &id).await?;               // Vec<Message>
+let totals  = service.usage(&user).await?;
+let turn    = service.send(&agent, &user, &id, "hello").await?; // Turn { reply, run }
+```
+
+Errors are `service::Error`: `NotFound`, `AlreadyExists`, `Invalid`,
+`Conflict`, `Model`, `Storage`, chosen to map straight onto HTTP statuses.
+
+### What `send` guarantees
+
+- Turns on one session run one at a time. A second message waits, then loads
+  the history the first one saved. Turns on different sessions run
+  concurrently.
+- The transcript is saved before `send` returns the reply. If it cannot be,
+  `send` fails even though the model answered; the run is still recorded.
+- If another process appended to the session during the turn, the turn is
+  refused with `Conflict` instead of interleaving two conversations.
+
+The agent is a parameter of `send`, not part of the service, so listing and
+creating sessions needs no API key and one service can serve many agents.
+
+### Detached and streamed turns
+
+Dropping `send`'s future cancels the turn. A transport whose client can go
+away uses one of these instead, with the service behind an `Arc`:
+
+```rust
+let turn = service.send_detached(agent, &user, &id, "hi").await?;  // Turn
+let mut turn = service.send_stream(agent, &user, &id, "hi").await?;
+while let Some(event) = turn.next().await { ... }  // Text, ToolCall, then Done(Result<Turn>)
+service.idle().await;                             // on shutdown
+```
+
+Once the turn holds the session it runs in its own task, with every
+guarantee above, and is saved even if nobody is listening any more. `idle`
+waits for those tasks.

@@ -1,0 +1,36 @@
+---
+title: CLI
+description: The REPL, one-shot prompts, sessions and usage from a shell.
+---
+
+```bash
+cargo run                                # REPL, session "default"
+cargo run -- research                    # REPL, session "research"
+cargo run -- research "some prompt"      # one-shot, same session
+cargo run -- sessions                    # list your sessions
+cargo run -- sessions new notes          # create an empty session
+cargo run -- usage                       # per-session token totals
+cargo run -- --user telegram:42 ...      # any of the above as another user
+cargo run -- serve                       # HTTP API
+cargo run -- telegram                    # Telegram bot
+```
+
+## Sessions
+
+A session name is created on first use and resumes the conversation after
+that, tool history included. `sessions new NAME` creates one explicitly and
+prints `NAME<TAB>ID`. It fails if you already have one by that name.
+
+## Acting as another user
+
+The CLI acts as the user `cli:local` unless `--user TRANSPORT:ID` says
+otherwise. That flag exists so an AI agent (or you) can drive exactly what
+an HTTP client or a Telegram chat would see, from a shell.
+
+<Callout type="info">
+  `--user` is not an access control boundary. Anyone who can run the binary
+  can read the database file.
+</Callout>
+
+The CLI is also the end-to-end test interface: everything a transport does
+must be reachable from it. See [Testing](/docs/testing).

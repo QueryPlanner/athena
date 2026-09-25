@@ -1,0 +1,55 @@
+---
+title: Known limits
+description: What athena does not do yet. Read this before exposing it.
+---
+
+## Security
+
+<Callout type="error">
+  **The HTTP API is unauthenticated. Do not expose it publicly.**
+</Callout>
+
+- Whoever can reach the port can act as any user by setting
+  `X-Athena-User`, read every session, spend the OpenRouter credit, and use
+  the agent's tools on the server, including `read_file` on any path the
+  process can read. Loopback is the default and refuses foreign `Host`
+  headers, but every local process is still trusted. Put an authenticating
+  proxy in front before listening anywhere else.
+- Every distinct `X-Athena-User` value creates a `users` row, even for a
+  read. There is no rate limit or cap beyond the 256-byte header limit.
+- The Telegram bot is open to anyone. There is no allowlist and no per-user
+  budget; `/usage` and the `runs` table show who spent what.
+- Provider errors are logged to stderr in full and can include account
+  details from the provider's error body. Message text is never logged.
+
+## Durability
+
+- A crash mid-turn loses that turn, and so does a second Ctrl-C while
+  `serve` drains. Persistence is one append per turn, not per model call.
+- Dropping `send`'s future after the append but before the run row leaves
+  transcript rows no run covers. `send_detached` and `send_stream` do not
+  have this problem.
+- A turn that panics records no run. A streamed client gets an `internal`
+  error event.
+- Telegram delivery is at most once. A crash or `kill -9` loses queued
+  messages, and a reply whose send fails is lost though its transcript is
+  saved.
+- Deltas already streamed cannot be taken back if the transcript then fails
+  to save.
+
+## Behaviour
+
+- Context grows forever, and every turn re-sends the whole history.
+- Turns on one session are serialized within a process. Across processes the
+  second to finish is refused with `Conflict`.
+- Axum answers some malformed requests itself, outside the JSON error
+  shape: unknown paths (`404`), wrong methods (`405`), bodies over 2 MB
+  (`413`).
+- Edited Telegram messages are ignored; photos and other non-text messages
+  get "I only read text messages."
+- The selected session is Telegram state. The CLI uses `default` unless
+  given a name, and `sessions` does not mark the selection.
+- No timing beyond whole-turn wall clock.
+
+The full list, with details, is in the
+[README](https://github.com/QueryPlanner/athena#known-limits).

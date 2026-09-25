@@ -1,0 +1,58 @@
+---
+title: Persistence
+description: How conversations are stored, and how the schema upgrades.
+---
+
+Rig loads and saves the conversation itself, through `store::SqliteMemory`,
+an implementation of Rig's `ConversationMemory` over the `messages` table.
+The conversation id is the session id.
+
+Before a turn, Rig loads the session's rows. After a successful turn it
+appends everything the turn produced (the user message, each tool call and
+result, the reply) in one call. The memory inserts those rows after the last
+one in a single transaction and never rewrites an earlier row.
+
+Each row is opaque Rig JSON. Rig's `Message` already encodes tool calls and
+results, and keeping it opaque means a Rig upgrade does not need a schema
+change.
+
+## Unsaved transcripts are errors
+
+Rig treats a failed append as a warning and returns the reply anyway. The
+memory records what each load and append did in a per-session receipt, and
+`send` reads it after the run. That is how an unsaved transcript becomes an
+error instead of a log line.
+
+## The database handle
+
+One SQLite connection per process behind a mutex (`store::Store`). SQL runs
+on tokio's blocking pool, never on an async worker, and the mutex is never
+held across an `.await`, so a model call on one session never holds up
+another. SQLite allows one writer at a time anyway, so a pool would add code
+without adding write throughput. All SQL lives in `store.rs`.
+
+## Schema versions
+
+The schema is versioned with `PRAGMA user_version`. `Store::open`:
+
+- applies any missing migrations in one transaction,
+- refuses a database written by a newer build,
+- refuses a table whose columns it does not expect,
+- refuses a database with dangling references.
+
+Existing `agent.db` files upgrade in place: every session they hold is given
+to `cli:local` under its old name, and no stored message changes. The rules
+for adding a migration are in [Testing](/docs/testing#schema-changes).
+
+<Callout type="info">
+  Foreign keys are enforced per connection. `Store` turns them on; a plain
+  `sqlite3` shell does not.
+</Callout>
+
+## Inspect a session
+
+```bash
+sqlite3 agent.db "SELECT m.seq, json_extract(m.json,'\$.role'), substr(m.json,1,200)
+                  FROM messages m JOIN sessions s ON s.id = m.session_id
+                  WHERE s.name='default' ORDER BY m.seq;"
+```

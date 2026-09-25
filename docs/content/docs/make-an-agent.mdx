@@ -1,0 +1,36 @@
+---
+title: Make an agent
+description: Tools, system prompt and model all live in src/agent.rs.
+---
+
+Edit `src/agent.rs`. That is the only file that changes.
+
+```rust
+#[rig_tool(description = "...")]        // add your tools
+fn my_tool(arg: String) -> Result<String, rig::tool::ToolExecutionError> { ... }
+
+pub const PREAMBLE: &str = "...";       // set the system prompt
+pub const DEFAULT_MODEL: &str = "...";  // set the model
+
+pub fn configure(builder: AgentBuilder) -> Agent {
+    builder ... .tool(MyTool) ...       // register them
+}
+```
+
+The template ships two tools, `add` and `read_file`, and the default model
+`openai/gpt-5.6-luna`. `AGENT_MODEL` overrides the model at runtime.
+
+## Why `configure` is the whole definition
+
+Production wraps `configure` around the OpenRouter client. The tests wrap it
+around Rig's mock model, so they run the same preamble and tools you ship.
+
+Both give the builder the conversation memory first
+(`builder.memory(service.memory())`), so `configure` never has to know where
+conversations are stored.
+
+<Callout type="warn">
+  Tools run on the machine that runs athena. The bundled `read_file` reads any
+  path the process can read, and any caller of an exposed transport can
+  trigger it. Remove or restrict tools before exposing a transport.
+</Callout>

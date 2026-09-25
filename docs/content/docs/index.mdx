@@ -1,0 +1,33 @@
+---
+title: Introduction
+description: A template for persistent, tool-using agents in Rust.
+---
+
+athena is a template for agents that remember. It is built on
+[rig-agent](https://crates.io/crates/rig-agent) 0.42 and SQLite, and talks to
+models through [OpenRouter](https://openrouter.ai).
+
+You define the agent (its tools, system prompt and model) in one file,
+`src/agent.rs`. Users, sessions, storage, the turn loop and the transports
+stay as they are.
+
+## What you get
+
+- **Persistent sessions.** Every turn, tool calls and results included, is
+  stored in SQLite. A session resumes where it left off, across processes.
+- **Three transports** over one core service: a [CLI](/docs/cli), an
+  [HTTP API](/docs/http-api) with SSE streaming, and a
+  [Telegram bot](/docs/telegram).
+- **Isolated users.** A user is `(transport, external_id)`. Two users can
+  both own a session called `default` and never see each other's.
+- **Cost telemetry.** Each turn records model calls and tokens by kind. See
+  [Usage and cost](/docs/usage-and-cost).
+- **Safe upgrades.** The schema is versioned and existing databases migrate
+  in place without changing a stored message.
+
+<Cards>
+  <Card title="Getting started" href="/docs/getting-started" description="Configure a key and run your first turn." />
+  <Card title="Make an agent" href="/docs/make-an-agent" description="Add tools and set the prompt in src/agent.rs." />
+  <Card title="Architecture" href="/docs/architecture" description="The core service every transport calls." />
+  <Card title="Known limits" href="/docs/known-limits" description="Read before exposing anything." />
+</Cards>

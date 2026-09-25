@@ -3,6 +3,9 @@
 A template for persistent, tool-using agents in Rust.
 rig-agent 0.42 + SQLite, talking to OpenRouter.
 
+The same material as a browsable site is in [`docs/`](docs/README.md)
+(`cd docs && npm install && npm run dev`).
+
 ## Make a new agent
 
 Edit `src/agent.rs`. That is the only file that changes.

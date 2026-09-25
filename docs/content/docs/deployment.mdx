@@ -1,0 +1,33 @@
+---
+title: Deployment
+description: Graceful shutdown on SIGINT and SIGTERM, and running in containers.
+---
+
+`athena serve` and `athena telegram` stop the same way on SIGINT (Ctrl-C)
+and SIGTERM (`kill`, `docker stop`, systemd): they take no new work, let the
+turns in flight finish and reply, then exit 0.
+
+## Containers
+
+Run `athena` directly: exec-form `CMD ["athena", "serve"]`, or
+`docker run --init`. A shell wrapper as PID 1 does not pass SIGTERM on.
+
+## Grace periods
+
+Stopping takes as long as the slowest turn in flight, and for the bot up to
+one more long poll (10 s). Docker waits 10 s and systemd 90 s before SIGKILL,
+which cannot be caught and loses those turns. Raise the grace period to
+cover a slow tool-using turn:
+
+- `docker stop -t`
+- `stop_grace_period` in Compose
+- `TimeoutStopSec` in systemd
+
+A second signal quits `serve` at once, and the turns in flight are lost as
+in a crash. The bot ignores a second signal, and ignores a signal that
+arrives before it starts polling.
+
+<Callout type="warn">
+  Neither transport has authentication. Keep `serve` on loopback or put an
+  authenticating proxy in front. See [Known limits](/docs/known-limits).
+</Callout>

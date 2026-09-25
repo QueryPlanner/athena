@@ -1,0 +1,43 @@
+---
+title: Getting started
+description: Configure an API key and run your first turn.
+---
+
+## Prerequisites
+
+- A Rust toolchain that supports edition 2024
+- An [OpenRouter](https://openrouter.ai) API key
+
+## Configure
+
+```bash
+cp .env.example .env
+```
+
+Fill in `OPENROUTER_API_KEY` in `.env`. The file is git-ignored; never commit
+it. See [Configuration](/docs/configuration) for every setting.
+
+## Run
+
+```bash
+cargo run                                # REPL, session "default"
+cargo run -- research "some prompt"      # one-shot, session "research"
+cargo run -- sessions                    # list your sessions
+cargo run -- usage                       # per-session token totals
+```
+
+A session name is created on first use and resumes the conversation after
+that, tool history included.
+
+## Other transports
+
+```bash
+cargo run -- serve                       # HTTP API on 127.0.0.1:8080
+cargo run -- telegram                    # Telegram bot; needs TELEGRAM_BOT_TOKEN
+```
+
+<Callout type="warn">
+  The HTTP API and the Telegram bot are unauthenticated. Read
+  [Known limits](/docs/known-limits) before running either anywhere but your
+  own machine.
+</Callout>
