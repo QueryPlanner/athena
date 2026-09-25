@@ -7,6 +7,7 @@ pub mod cli;
 pub mod dotenv;
 pub mod eval;
 pub mod flags;
+pub mod gate;
 pub mod http;
 pub mod ops;
 pub mod runner;

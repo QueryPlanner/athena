@@ -164,6 +164,8 @@ id that does not exist.
     src/eval/          `athena eval`: cases, cassettes, graders, judge, results
     src/bench.rs       `athena bench`: load check against a running server
     src/main.rs        wiring: real database, provider, stdin/stdout
+    src/gate/          deploy-gate, the only program CI runs on the VM (DEPLOY.md)
+    src/bin/           deploy-gate's wiring
     evals/             eval cases and their recorded cassettes
     tests/             integration tests, upgrade fixtures, schema snapshot
     scripts/           coverage gate and live end-to-end test

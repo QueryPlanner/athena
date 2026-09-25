@@ -97,6 +97,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "http-body-util",
+ "libc",
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-http",
