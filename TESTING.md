@@ -17,8 +17,15 @@ cargo clippy --all-targets --locked -- -D warnings
 ./scripts/coverage.sh
 ```
 
-CI runs the same three commands on every pull request. `coverage.sh` also runs
-the unit and integration tests.
+CI (`.github/workflows/ci-cd.yml`) runs the same three commands on every pull
+request. `coverage.sh` also runs the unit and integration tests. CI also runs:
+
+- `shellcheck scripts/*.sh`, `scripts/setup-host.sh --dry-run` (no root), and
+  `scripts/test-analytics.sh` (every DuckDB query against fixtures);
+- the collector config through `otelcol-contrib validate`;
+- `scripts/smoke-binary.sh target/release/athena`: the release binary serving
+  on loopback with a temp database (`/health`, `/version`, a session, the Host
+  allowlist, SIGTERM, `athena backup`), with no model calls.
 
 ## Coverage
 

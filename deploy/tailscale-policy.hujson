@@ -1,0 +1,41 @@
+// Tailscale policy snippet for Athena. Merge these sections into your
+// tailnet policy file (admin console -> Access controls); do not replace an
+// existing policy wholesale if other apps depend on it.
+//
+// Reference: https://tailscale.com/kb/1337/policy-syntax
+//
+// The VM is addressed through the "athena-vm" hosts alias, so an existing
+// user-owned node (like the owner's, 100.124.202.79) keeps its identity and
+// nothing else on it breaks. On a fresh VM tagged tag:athena-server, swap
+// "athena-vm" for "tag:athena-server" below.
+{
+	"tagOwners": {
+		// Ephemeral GitHub Actions runners during deploy jobs. The OAuth client
+		// (auth_keys scope) must carry this tag too.
+		"tag:ci": ["autogroup:admin"],
+		// The OpenSandbox host (the owner's laptop).
+		"tag:sandbox": ["autogroup:admin"],
+		// Future apps that call Athena's prod API.
+		"tag:athena-client": ["autogroup:admin"],
+		// Only for a fresh, tagged VM.
+		"tag:athena-server": ["autogroup:admin"],
+	},
+
+	"hosts": {
+		// Replace with your VM's `tailscale ip -4`.
+		"athena-vm": "100.124.202.79",
+	},
+
+	"acls": [
+		// CI reaches SSH only, where its key can only run deploy-gate.
+		{"action": "accept", "src": ["tag:ci"], "dst": ["athena-vm:22"]},
+		// The VM calls the sandbox server's API and execd proxy.
+		{"action": "accept", "src": ["athena-vm", "tag:athena-server"], "dst": ["tag:sandbox:9090"]},
+		// Client apps reach prod's HTTP API only (not staging, not OpenObserve).
+		{"action": "accept", "src": ["tag:athena-client"], "dst": ["athena-vm:18080"]},
+		// You, as an admin, reach everything (staging, OpenObserve :5080, SSH).
+		{"action": "accept", "src": ["autogroup:admin"], "dst": ["*:*"]},
+		// Nothing else is allowed: in particular tag:sandbox reaches nothing.
+		// Keep any rules your other apps already need alongside these.
+	],
+}

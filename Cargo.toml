@@ -2,6 +2,8 @@
 name = "athena"
 version = "0.1.0"
 edition = "2024"
+# `cargo run` means the agent; deploy-gate runs only on the VM.
+default-run = "athena"
 
 [dependencies]
 anyhow = "1.0.104"

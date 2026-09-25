@@ -1,0 +1,15 @@
+# Groups one environment's units, so `systemctl stop athena@staging.target`
+# stops everything for staging and `start` brings back what is enabled.
+#
+# The units attach themselves with `WantedBy=athena@%i.target`, so the target
+# wants only the units enabled for that environment: serve for staging, serve
+# and telegram for prod. A static `Wants=` on both would start a Telegram bot
+# for staging too. The units' `PartOf=` makes stop and restart propagate.
+[Unit]
+Description=Athena (%i)
+Documentation=https://github.com/QueryPlanner/athena/blob/main/SETUP.md
+Wants=network-online.target
+After=network-online.target tailscaled.service
+
+[Install]
+WantedBy=multi-user.target

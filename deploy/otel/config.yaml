@@ -1,0 +1,117 @@
+# otelcol-contrib configuration for the Athena VM.
+# Installed to /etc/otelcol-contrib/config.yaml by scripts/setup-host.sh.
+#
+# One collector serves both environments. Athena tags every span and log with
+# the resource attribute deployment.environment.name (ATHENA_ENV), and the
+# `transform/strip_prod_content` processor keys off it, so prompt and tool
+# content is dropped for prod and kept for staging. That is the "prod
+# overlay": a condition, not a second file.
+#
+# Two exporters per signal:
+# - JSONL files under /var/lib/athena/otel/ for DuckDB (scripts/analytics.sh);
+#   rotated at 50 MB because DuckDB's otlp extension caps input at 100 MB.
+# - OpenObserve over OTLP/HTTP, with basic auth from
+#   /etc/otelcol-contrib/openobserve.env (root:otelcol-contrib, 0640).
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+      http:
+        endpoint: 127.0.0.1:4318
+
+processors:
+  # First in every pipeline: refuse data before the process hits MemoryMax.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 200
+    spike_limit_mib: 50
+
+  # Backstop for secrets that reach telemetry by accident. Masks matching
+  # attribute values and string log bodies, keeps keys. Key patterns avoid "token" on purpose: gen_ai.usage.*_tokens
+  # are counts and must survive.
+  redaction:
+    allow_all_keys: true
+    blocked_key_patterns:
+      - "(?i).*(api[_.-]?key|authorization|password|passwd|secret|bot[_.-]?token|bearer).*"
+    blocked_values:
+      - "\\bsk-or-v1-[A-Za-z0-9]{16,}"        # OpenRouter keys
+      - "\\bsk-[A-Za-z0-9_-]{20,}"          # other sk- style API keys
+      - "(?i)bearer\\s+[A-Za-z0-9._~+/=-]{8,}"
+      - "[0-9]{6,12}:[A-Za-z0-9_-]{30,}"     # Telegram bot tokens
+    summary: info
+
+  # Prod never keeps prompt, response or tool payloads, even if
+  # ATHENA_RECORD_CONTENT was switched on by mistake.
+  transform/strip_prod_content:
+    error_mode: ignore
+    # One group per context: in a flat list the processor infers a single
+    # context for all statements, and span statements would never run.
+    trace_statements:
+      - context: span
+        statements:
+          - delete_key(span.attributes, "gen_ai.input.messages") where resource.attributes["deployment.environment.name"] == "prod"
+          - delete_key(span.attributes, "gen_ai.output.messages") where resource.attributes["deployment.environment.name"] == "prod"
+          - delete_key(span.attributes, "gen_ai.system_instructions") where resource.attributes["deployment.environment.name"] == "prod"
+          - delete_key(span.attributes, "gen_ai.tool.call.arguments") where resource.attributes["deployment.environment.name"] == "prod"
+          - delete_key(span.attributes, "gen_ai.tool.call.result") where resource.attributes["deployment.environment.name"] == "prod"
+      - context: spanevent
+        statements:
+          - delete_key(spanevent.attributes, "gen_ai.input.messages") where resource.attributes["deployment.environment.name"] == "prod"
+          - delete_key(spanevent.attributes, "gen_ai.output.messages") where resource.attributes["deployment.environment.name"] == "prod"
+          - delete_key(spanevent.attributes, "gen_ai.tool.call.arguments") where resource.attributes["deployment.environment.name"] == "prod"
+          - delete_key(spanevent.attributes, "gen_ai.tool.call.result") where resource.attributes["deployment.environment.name"] == "prod"
+    log_statements:
+      - context: log
+        statements:
+          - delete_key(log.attributes, "gen_ai.input.messages") where resource.attributes["deployment.environment.name"] == "prod"
+          - delete_key(log.attributes, "gen_ai.output.messages") where resource.attributes["deployment.environment.name"] == "prod"
+          - delete_key(log.attributes, "gen_ai.tool.call.arguments") where resource.attributes["deployment.environment.name"] == "prod"
+          - delete_key(log.attributes, "gen_ai.tool.call.result") where resource.attributes["deployment.environment.name"] == "prod"
+
+  batch:
+    send_batch_size: 512
+    timeout: 5s
+
+exporters:
+  file/traces:
+    path: /var/lib/athena/otel/traces.jsonl
+    format: json
+    rotation:
+      max_megabytes: 50
+      max_days: 30
+      max_backups: 60
+  file/logs:
+    path: /var/lib/athena/otel/logs.jsonl
+    format: json
+    rotation:
+      max_megabytes: 50
+      max_days: 30
+      max_backups: 60
+  otlp_http/openobserve:
+    # e.g. http://100.124.202.79:5080/api/default (no trailing slash: the
+    # exporter appends /v1/traces and /v1/logs).
+    endpoint: ${env:OPENOBSERVE_OTLP_ENDPOINT}
+    headers:
+      Authorization: ${env:OPENOBSERVE_AUTH}
+    sending_queue:
+      enabled: true
+      queue_size: 1000
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 300s
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, redaction, transform/strip_prod_content, batch]
+      exporters: [file/traces, otlp_http/openobserve]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, redaction, transform/strip_prod_content, batch]
+      exporters: [file/logs, otlp_http/openobserve]
