@@ -278,17 +278,49 @@ async fn a_closed_output_is_an_error_not_silently_dropped() {
 
 // ---- the real binary ----
 
-/// `athena` pointed at a temp database, with no key and no model override
-/// inherited from the developer's shell. `env_remove` rather than
-/// `env_clear`, which would also drop the coverage profiler's variables.
-fn athena(tmp: &TempDb, list: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_athena"))
-        .args(list)
-        .env("ATHENA_DB", tmp.path())
+/// An empty directory to run the binary in, removed on drop.
+///
+/// The binary loads `.env` from its working directory, so it must never run
+/// in the repository, where a developer's real `.env` holds real keys.
+struct WorkDir(std::path::PathBuf);
+
+impl WorkDir {
+    fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("athena-cwd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        Self(dir)
+    }
+
+    fn env_file(&self, contents: &str) {
+        std::fs::write(self.0.join(".env"), contents).unwrap();
+    }
+}
+
+impl Drop for WorkDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `athena` run in `dir`, with no key, model or database inherited from the
+/// developer's shell. `env_remove` rather than `env_clear`, which would also
+/// drop the coverage profiler's variables.
+fn athena_in(dir: &WorkDir, db: Option<&TempDb>, list: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_athena"));
+    cmd.args(list)
+        .current_dir(&dir.0)
+        .env_remove("ATHENA_DB")
         .env_remove("OPENROUTER_API_KEY")
-        .env_remove("AGENT_MODEL")
-        .output()
-        .unwrap()
+        .env_remove("AGENT_MODEL");
+    if let Some(db) = db {
+        cmd.env("ATHENA_DB", db.path());
+    }
+    cmd.output().unwrap()
+}
+
+/// `athena` pointed at a temp database, in an empty directory.
+fn athena(tmp: &TempDb, list: &[&str]) -> std::process::Output {
+    athena_in(&WorkDir::new(), Some(tmp), list)
 }
 
 fn stdout(out: std::process::Output) -> String {
@@ -361,4 +393,49 @@ fn the_binary_creates_and_lists_sessions_per_user() {
         stdout(athena(&tmp, &["--user", "telegram:43", "sessions"])),
         ""
     );
+}
+
+#[test]
+fn the_binary_reads_settings_from_a_dotenv_file_in_its_directory() {
+    let dir = WorkDir::new();
+    let tmp = TempDb::new();
+    dir.env_file(&format!("# comment\nATHENA_DB={}\n", tmp.path()));
+
+    stdout(athena_in(&dir, None, &["usage"]));
+
+    // The database named only in .env was created and migrated.
+    assert_eq!(
+        user_version(&tmp.raw()),
+        athena::store::SCHEMA_VERSION as i64
+    );
+}
+
+#[test]
+fn a_variable_set_in_the_shell_wins_over_dotenv() {
+    let dir = WorkDir::new();
+    let from_file = TempDb::new();
+    let from_shell = TempDb::new();
+    dir.env_file(&format!("ATHENA_DB={}\n", from_file.path()));
+
+    stdout(athena_in(&dir, Some(&from_shell), &["usage"]));
+
+    assert_eq!(
+        user_version(&from_shell.raw()),
+        athena::store::SCHEMA_VERSION as i64
+    );
+    assert!(!std::path::Path::new(from_file.path()).exists());
+}
+
+#[test]
+fn a_malformed_dotenv_stops_the_binary_before_it_touches_anything() {
+    let dir = WorkDir::new();
+    let tmp = TempDb::new();
+    dir.env_file("this line is not KEY=value\n");
+
+    let out = athena_in(&dir, Some(&tmp), &["usage"]);
+
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("reading .env"), "{stderr}");
+    assert!(!std::path::Path::new(tmp.path()).exists());
 }
