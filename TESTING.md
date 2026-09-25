@@ -31,7 +31,8 @@ excluding the line. The existing code shows the usual fixes:
 
 - Environment variables are read by a one-line function that passes the
   value to a pure function you can test: `agent::model_or_default`,
-  `store::path_or_default`, `runner::keep_raw`.
+  `store::path_or_default`, `runner::keep_raw`, `ops::version_or_dev`,
+  `ops::absolute_db`, `http::allowed_hosts`.
 - The provider is kept apart from the agent's definition, so tests build
   the production agent around a mock model: `agent::configure`.
 - The CLI takes its input, output and agent factory as parameters:

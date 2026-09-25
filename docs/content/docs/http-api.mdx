@@ -13,7 +13,7 @@ description: JSON endpoints and SSE streaming served by athena serve.
 
 ## Identifying the user
 
-Every request except `/health` names its user in a header:
+Every request except `/health` and `/version` names its user in a header:
 
 ```http
 X-Athena-User: alice
@@ -28,11 +28,18 @@ While listening on loopback, a request whose `Host` is not `localhost`,
 `127.0.0.1` or `[::1]` is `403`. A web page cannot reach the API by pointing
 its own domain at 127.0.0.1 (DNS rebinding).
 
+`ATHENA_ALLOWED_HOSTS` (for example `100.64.0.1:18080,athena-vm:18080`) sets
+the `Host` values the API answers wherever it listens: a `HOST` entry on any
+port, a `HOST:PORT` entry on that port only. On loopback the loopback names
+are answered too. Any other `Host` is `403`, and the warning is not printed.
+This is DNS-rebinding protection for a private address, not authentication.
+
 ## Endpoints
 
 | Method and path | Body | Success |
 |---|---|---|
 | `GET /health` | | `200 {"status":"ok"}` |
+| `GET /version` | | `200 {"version":"..."}` |
 | `POST /sessions` | `{"name":"notes"}` | `201 {"id","name","created_at"}` |
 | `GET /sessions` | | `200 {"sessions":[{"id","name","created_at","messages"}]}` |
 | `GET /sessions/{id}/messages` | | `200 {"messages":[...]}` |
@@ -77,7 +84,7 @@ Errors are `{"error":{"code","message"}}`:
 | Status | `code` | When |
 |---|---|---|
 | 400 | `invalid` | bad or missing header, body not JSON, empty name or text |
-| 403 | `forbidden_host` | foreign `Host` on loopback |
+| 403 | `forbidden_host` | foreign `Host` on loopback, or one not in `ATHENA_ALLOWED_HOSTS` |
 | 404 | `not_found` | no such session **for this user**, including another user's |
 | 409 | `already_exists` | session name taken |
 | 409 | `conflict` | another process wrote to the session mid-turn; send again |

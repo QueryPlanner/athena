@@ -41,14 +41,44 @@ as is.
     cargo run -- usage                       # per-session token totals
     cargo run -- --user telegram:42 ...      # any of the above as another user
     ATHENA_DB=/tmp/x.db cargo run -- ...     # use another database file
-    cargo run -- serve                       # HTTP API on 127.0.0.1:8080
-    cargo run -- serve --addr 127.0.0.1:9000 # or ATHENA_ADDR=...
-    cargo run -- telegram                    # Telegram bot; TELEGRAM_BOT_TOKEN in .env
+    ATHENA_DB=$PWD/agent.db cargo run -- serve   # HTTP API on 127.0.0.1:8080
+    ATHENA_DB=$PWD/agent.db cargo run -- serve --addr 127.0.0.1:9000  # or ATHENA_ADDR
+    ATHENA_DB=$PWD/agent.db cargo run -- telegram  # bot; TELEGRAM_BOT_TOKEN in .env
+    cargo run -- backup backups/today.db     # online copy of the database
+    cargo run -- --version                   # athena 0.1.0-dev, or ATHENA_VERSION
 
 `athena` reads `.env` from the directory you run it in. Variables already
 set in your shell win over the file, so `ATHENA_DB=/tmp/x.db athena ...`
 still works. `.env` is git-ignored; `.env.example` lists every setting. A
 malformed `.env` stops `athena` before it touches the database.
+
+`athena serve` and `athena telegram` refuse to start unless `ATHENA_DB` is
+an absolute path, so a service never creates a fresh database in whatever
+directory it was started from. The REPL and the other commands keep the
+default `agent.db` in the working directory.
+
+`athena backup DEST` copies the database (`ATHENA_DB`, else `agent.db`) to
+the new file `DEST`, creating its directories. It is safe while `serve` or
+`telegram` is running: SQLite's online backup copies a consistent snapshot,
+WAL included. It opens the database read-only and never migrates it, so the
+binary being replaced can back up a database before its successor migrates
+it. It waits up to 30 s for a writer's lock, refuses an existing `DEST`,
+never leaves a partial `DEST` behind, and needs no API key.
+
+`athena --version` prints `athena VERSION`: `ATHENA_VERSION` if set (deploys
+set it), else the crate version with `-dev`.
+
+| Variable | Used by | Default | Meaning |
+|---|---|---|---|
+| `OPENROUTER_API_KEY` | anything that talks to the model | none, required | OpenRouter API key |
+| `AGENT_MODEL` | all | `openai/gpt-5.6-luna` | Model id on OpenRouter |
+| `ATHENA_DB` | all | `agent.db`; `serve` and `telegram` require an absolute path | SQLite database file |
+| `ATHENA_VERSION` | `--version`, `GET /version` | `<crate version>-dev` | The deployed release |
+| `RUNS_STORE_RAW` | all | on | `0` drops raw provider responses from `runs.calls_json` |
+| `ATHENA_ADDR` | `serve` | `127.0.0.1:8080` | Listen address; `--addr` wins over it |
+| `ATHENA_ALLOWED_HOSTS` | `serve` | unset | Comma list of `HOST` or `HOST:PORT` the API answers; see HTTP API |
+| `TELEGRAM_BOT_TOKEN` | `telegram` | none, required | Bot token from @BotFather |
+| `TELEGRAM_API_URL` | `telegram` | `https://api.telegram.org` | Bot API server; the tests point it at a fake one |
 
 `athena serve` and `athena telegram` stop the same way on SIGINT (Ctrl-C)
 and SIGTERM (`kill`, `docker stop`, systemd): they take no new work, let the
@@ -68,7 +98,7 @@ control boundary: anyone who can run the binary can read the database file.
 ## Telegram
 
     export TELEGRAM_BOT_TOKEN=123456:ABC...   # from @BotFather
-    cargo run -- telegram                     # long polling; Ctrl-C stops
+    ATHENA_DB=$PWD/agent.db cargo run -- telegram  # long polling; Ctrl-C stops
 
 `athena telegram` needs `OPENROUTER_API_KEY` and `TELEGRAM_BOT_TOKEN` and
 checks both before it opens the database. `TELEGRAM_API_URL` points it at
@@ -130,6 +160,7 @@ id that does not exist.
     src/cli.rs         the CLI transport: arguments, output, REPL
     src/http.rs        the HTTP transport: JSON API, SSE streaming, `serve`
     src/telegram.rs    the Telegram transport: commands, sessions, the bot
+    src/ops.rs         deployment: version, online backup, absolute ATHENA_DB
     src/main.rs        wiring: real database, provider, stdin/stdout
     tests/             integration tests, upgrade fixtures, schema snapshot
     scripts/           coverage gate and live end-to-end test
@@ -200,7 +231,7 @@ blocking one; its `Done` carries exactly what `send` would have returned.
 unauthenticated: read Known limits before listening anywhere but loopback.
 On any other address it still starts, and prints a warning.
 
-Every request except `/health` names its user in a header:
+Every request except `/health` and `/version` names its user in a header:
 
     X-Athena-User: alice          # the user ("http", "alice")
 
@@ -211,9 +242,20 @@ a request whose `Host` is not `localhost`, `127.0.0.1` or `[::1]` is `403`,
 so a web page cannot reach the API by pointing its own domain at 127.0.0.1
 (DNS rebinding).
 
+`ATHENA_ALLOWED_HOSTS` (for example `100.64.0.1:18080,athena-vm:18080`) sets
+the `Host` values the API answers wherever it listens: a `HOST` entry on any
+port, a `HOST:PORT` entry on that port only, compared without case. On
+loopback the loopback names are answered too. Any other `Host` is `403`, and
+the UNAUTHENTICATED warning is not printed. This gives a server on a private
+network address (a tailnet IP, say) the same DNS-rebinding protection as
+loopback. It is not authentication: anyone who can reach the port and send a
+listed `Host` is still trusted. Without it, a server on any other address
+answers every `Host` and prints the warning.
+
 | Method and path | Body | Success |
 |---|---|---|
 | `GET /health` | | `200 {"status":"ok"}` |
+| `GET /version` | | `200 {"version":"..."}`, as `athena --version` prints it |
 | `POST /sessions` | `{"name":"notes"}` | `201 {"id","name","created_at"}` |
 | `GET /sessions` | | `200 {"sessions":[{"id","name","created_at","messages"}]}` |
 | `GET /sessions/{id}/messages` | | `200 {"messages":[...]}` |

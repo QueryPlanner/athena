@@ -286,6 +286,7 @@ fn athena_in(dir: &WorkDir, db: Option<&TempDb>, list: &[&str]) -> std::process:
     cmd.args(list)
         .current_dir(dir.path())
         .env_remove("ATHENA_DB")
+        .env_remove("ATHENA_VERSION")
         .env_remove("OPENROUTER_API_KEY")
         .env_remove("AGENT_MODEL");
     if let Some(db) = db {
@@ -414,4 +415,133 @@ fn a_malformed_dotenv_stops_the_binary_before_it_touches_anything() {
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(stderr.contains("reading .env"), "{stderr}");
     assert!(!std::path::Path::new(tmp.path()).exists());
+}
+
+#[test]
+fn the_binary_prints_its_version_without_touching_the_database() {
+    let tmp = TempDb::new();
+    let dir = WorkDir::new();
+
+    let dev = stdout(athena_in(&dir, Some(&tmp), &["--version"]));
+    dir.env_file("ATHENA_VERSION=v1.2.3+abc\n");
+    let released = stdout(athena_in(&dir, Some(&tmp), &["--version"]));
+
+    assert_eq!(dev, format!("athena {}-dev\n", env!("CARGO_PKG_VERSION")));
+    assert_eq!(released, "athena v1.2.3+abc\n");
+    assert!(!std::path::Path::new(tmp.path()).exists());
+}
+
+fn wal_bytes(tmp: &TempDb) -> u64 {
+    std::fs::metadata(format!("{}-wal", tmp.path()))
+        .map(|m| m.len())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn the_binary_backs_up_a_database_in_use_including_its_wal() {
+    let tmp = TempDb::new();
+    // Still open, as a running server would hold it.
+    let service = seeded(&tmp).await;
+    assert!(wal_bytes(&tmp) > 0, "the turn should still be in the WAL");
+    let dir = WorkDir::new();
+    let dest = dir.path().join("backups/staging/1.db");
+
+    let out = stdout(athena_in(
+        &dir,
+        Some(&tmp),
+        &["backup", dest.to_str().unwrap()],
+    ));
+
+    assert_eq!(
+        out,
+        format!("backed up {} to {}\n", tmp.path(), dest.display())
+    );
+    let copy = rusqlite::Connection::open(&dest).unwrap();
+    let id = cli_session(&tmp, "s");
+    assert_eq!(user_version(&copy), athena::store::SCHEMA_VERSION as i64);
+    assert_eq!(raw_rows(&copy, &id), raw_rows(&tmp.raw(), &id));
+    assert_eq!(raw_rows(&copy, &id).len(), 4);
+    assert!(!dir.path().join("backups/staging/1.db.partial").exists());
+    drop(service);
+}
+
+#[tokio::test]
+async fn the_binary_backs_up_a_stopped_database() {
+    let tmp = TempDb::new();
+    // Closed, as after `systemctl stop`: the WAL is checkpointed and gone.
+    drop(seeded(&tmp).await);
+    assert!(!std::path::Path::new(&format!("{}-wal", tmp.path())).exists());
+    let dir = WorkDir::new();
+    let dest = dir.path().join("stopped.db");
+
+    stdout(athena_in(
+        &dir,
+        Some(&tmp),
+        &["backup", dest.to_str().unwrap()],
+    ));
+
+    let id = cli_session(&tmp, "s");
+    let copy = rusqlite::Connection::open(&dest).unwrap();
+    assert_eq!(raw_rows(&copy, &id).len(), 4);
+}
+
+#[test]
+fn the_binary_backs_up_an_older_schema_without_migrating_it() {
+    let tmp = TempDb::new();
+    tmp.raw()
+        .execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY);
+             INSERT INTO sessions VALUES ('old');
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    let dir = WorkDir::new();
+    let dest = dir.path().join("old.db");
+
+    stdout(athena_in(
+        &dir,
+        Some(&tmp),
+        &["backup", dest.to_str().unwrap()],
+    ));
+
+    let tables = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'";
+    for db in [tmp.raw(), rusqlite::Connection::open(&dest).unwrap()] {
+        assert_eq!(user_version(&db), 1);
+        assert_eq!(count(&db, tables), 1);
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM sessions"), 1);
+    }
+}
+
+#[test]
+fn a_failed_backup_says_why_and_leaves_no_new_file() {
+    let dir = WorkDir::new();
+    let missing = dir.path().join("missing.db");
+    let not_a_file = dir.path().join("not-a-dir");
+    std::fs::write(&not_a_file, "a file").unwrap();
+    let taken = dir.path().join("taken.db");
+    std::fs::write(&taken, "keep").unwrap();
+    let not_a_db = TempDb::new();
+    std::fs::write(not_a_db.path(), "this is not a database, just text").unwrap();
+    let source = TempDb::new();
+    source.raw().execute_batch("CREATE TABLE t (x)").unwrap();
+
+    for (db, dest, why) in [
+        // No ATHENA_DB: the default, agent.db in the working directory.
+        (
+            None,
+            missing.clone(),
+            "opening the database agent.db read-only",
+        ),
+        (Some(&not_a_db), missing.clone(), "backing up"),
+        (Some(&source), not_a_file.join("x.db"), "creating"),
+        (Some(&source), taken.clone(), "already exists"),
+    ] {
+        let out = athena_in(&dir, db, &["backup", dest.to_str().unwrap()]);
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(!out.status.success(), "{why}");
+        assert!(stderr.contains(why), "{why}: {stderr}");
+    }
+    assert!(!missing.exists());
+    assert!(!dir.path().join("agent.db").exists());
+    assert_eq!(std::fs::read_to_string(&taken).unwrap(), "keep");
 }

@@ -539,3 +539,23 @@ fn the_binary_checks_its_settings_before_touching_the_database() {
     assert!(extra.contains("takes no arguments"), "{extra}");
     assert!(!std::path::Path::new(tmp.path()).exists());
 }
+
+#[test]
+fn the_binary_refuses_to_run_the_bot_without_an_absolute_database_path() {
+    let dir = WorkDir::new();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_athena"))
+        .arg("telegram")
+        .current_dir(dir.path())
+        .env("ATHENA_DB", "agent.db")
+        .env("TELEGRAM_BOT_TOKEN", token())
+        .env("OPENROUTER_API_KEY", "unused")
+        .env_remove("TELEGRAM_API_URL")
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(!out.status.success());
+    assert!(stderr.contains("must be an absolute path"), "{stderr}");
+    assert!(!dir.path().join("agent.db").exists());
+}
