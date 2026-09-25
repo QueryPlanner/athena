@@ -111,6 +111,19 @@ pub struct SessionUsage {
     pub cached_input_tokens: i64,
 }
 
+/// The sandbox a session's tools run in. See `sandbox::Sandboxes`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxRow {
+    pub session_id: String,
+    pub sandbox_id: String,
+    pub bash_session: Option<String>,
+    pub code_language: Option<String>,
+    pub code_context: Option<String>,
+    /// Milliseconds since the Unix epoch.
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
 /// Why an append wrote nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppendError {
@@ -297,6 +310,20 @@ const MIGRATIONS: &[&str] = &[
          session_id  TEXT NOT NULL REFERENCES sessions (id),
          selected_at INTEGER NOT NULL
      );",
+    // 5: the OpenSandbox sandbox each session's tools run in, at most one
+    // per session. `bash_session` and `code_context` are execd's ids for the
+    // persistent shell and interpreter inside that sandbox, created on first
+    // use. `expires_at` is when Athena last asked the sandbox to expire, in
+    // Athena's clock; the server's own clock decides.
+    "CREATE TABLE sandboxes (
+         session_id    TEXT NOT NULL PRIMARY KEY REFERENCES sessions (id),
+         sandbox_id    TEXT NOT NULL,
+         bash_session  TEXT,
+         code_language TEXT,
+         code_context  TEXT,
+         created_at    INTEGER NOT NULL,
+         expires_at    INTEGER NOT NULL
+     );",
 ];
 
 /// The schema version this build writes.
@@ -335,6 +362,18 @@ const EXPECTED_COLUMNS: &[(&str, &[&str])] = &[
     (
         "selected_sessions",
         &["user_id", "session_id", "selected_at"],
+    ),
+    (
+        "sandboxes",
+        &[
+            "session_id",
+            "sandbox_id",
+            "bash_session",
+            "code_language",
+            "code_context",
+            "created_at",
+            "expires_at",
+        ],
     ),
 ];
 
@@ -420,6 +459,18 @@ fn session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         id: r.get(0)?,
         name: r.get(1)?,
         created_at: r.get(2)?,
+    })
+}
+
+fn sandbox_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SandboxRow> {
+    Ok(SandboxRow {
+        session_id: r.get(0)?,
+        sandbox_id: r.get(1)?,
+        bash_session: r.get(2)?,
+        code_language: r.get(3)?,
+        code_context: r.get(4)?,
+        created_at: r.get(5)?,
+        expires_at: r.get(6)?,
     })
 }
 
@@ -663,6 +714,81 @@ impl Store {
             .optional()?)
     }
 
+    /// The id of the user who owns a session, if the session exists.
+    pub fn session_owner(&self, session_id: &str) -> Result<Option<i64>> {
+        Ok(self
+            .db()
+            .query_row(
+                "SELECT user_id FROM sessions WHERE id = ?1",
+                [session_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The sandbox recorded for a session, if any.
+    pub fn sandbox(&self, session_id: &str) -> Result<Option<SandboxRow>> {
+        Ok(self
+            .db()
+            .query_row(
+                "SELECT session_id, sandbox_id, bash_session, code_language, code_context,
+                        created_at, expires_at
+                 FROM sandboxes WHERE session_id = ?1",
+                [session_id],
+                sandbox_row,
+            )
+            .optional()?)
+    }
+
+    /// Record a session's sandbox. Returns false, and changes nothing, if
+    /// the session already has one: another process got there first.
+    pub fn insert_sandbox(&self, row: &SandboxRow) -> Result<bool> {
+        let inserted = self.db().execute(
+            "INSERT INTO sandboxes (session_id, sandbox_id, bash_session, code_language,
+                                    code_context, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (session_id) DO NOTHING",
+            rusqlite::params![
+                row.session_id,
+                row.sandbox_id,
+                row.bash_session,
+                row.code_language,
+                row.code_context,
+                row.created_at,
+                row.expires_at
+            ],
+        )?;
+        Ok(inserted == 1)
+    }
+
+    /// Update a session's sandbox row, but only while it still names
+    /// `row.sandbox_id`: a replacement recorded meanwhile is left alone.
+    pub fn update_sandbox(&self, row: &SandboxRow) -> Result<()> {
+        self.db().execute(
+            "UPDATE sandboxes SET bash_session = ?3, code_language = ?4, code_context = ?5,
+                                  expires_at = ?6
+             WHERE session_id = ?1 AND sandbox_id = ?2",
+            rusqlite::params![
+                row.session_id,
+                row.sandbox_id,
+                row.bash_session,
+                row.code_language,
+                row.code_context,
+                row.expires_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Forget a session's sandbox, if it is still `sandbox_id`.
+    pub fn remove_sandbox(&self, session_id: &str, sandbox_id: &str) -> Result<()> {
+        self.db().execute(
+            "DELETE FROM sandboxes WHERE session_id = ?1 AND sandbox_id = ?2",
+            [session_id, sandbox_id],
+        )?;
+        Ok(())
+    }
+
     /// A session's transcript, oldest first. Does not check ownership:
     /// callers look the session up through [`Store::session`] first.
     pub(crate) fn load(&self, session_id: &str) -> Result<Vec<Message>> {
@@ -824,6 +950,14 @@ pub struct SqliteMemory {
     store: Store,
 }
 
+impl SqliteMemory {
+    /// The store this memory writes to, which holds the rest of the
+    /// agent's state too (its sessions' sandboxes).
+    pub(crate) fn store(&self) -> &Store {
+        &self.store
+    }
+}
+
 impl ConversationMemory for SqliteMemory {
     fn load<'a>(
         &'a self,
@@ -933,7 +1067,14 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!(
             tables,
-            ["messages", "runs", "selected_sessions", "sessions", "users"]
+            [
+                "messages",
+                "runs",
+                "sandboxes",
+                "selected_sessions",
+                "sessions",
+                "users"
+            ]
         );
         assert!(fk);
     }
@@ -1347,6 +1488,53 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.selected_session(&user).unwrap(), None);
+    }
+
+    fn sandbox_for(session_id: &str, sandbox_id: &str) -> SandboxRow {
+        SandboxRow {
+            session_id: session_id.into(),
+            sandbox_id: sandbox_id.into(),
+            bash_session: None,
+            code_language: None,
+            code_context: None,
+            created_at: 1,
+            expires_at: 2,
+        }
+    }
+
+    #[test]
+    fn a_session_has_at_most_one_sandbox_and_stale_writers_change_nothing() {
+        let (store, user, id) = with_session();
+        assert_eq!(store.session_owner(&id).unwrap(), Some(user.id()));
+        assert_eq!(store.session_owner("missing").unwrap(), None);
+        assert_eq!(store.sandbox(&id).unwrap(), None);
+
+        let first = sandbox_for(&id, "sbx-1");
+        assert!(store.insert_sandbox(&first).unwrap());
+        // A second process creating one for the same session loses.
+        assert!(!store.insert_sandbox(&sandbox_for(&id, "sbx-2")).unwrap());
+        assert_eq!(store.sandbox(&id).unwrap(), Some(first.clone()));
+
+        let updated = SandboxRow {
+            bash_session: Some("bash-1".into()),
+            code_language: Some("python".into()),
+            code_context: Some("ctx-1".into()),
+            expires_at: 99,
+            ..first.clone()
+        };
+        store.update_sandbox(&updated).unwrap();
+        assert_eq!(store.sandbox(&id).unwrap(), Some(updated.clone()));
+
+        // Writers holding another sandbox id touch nothing.
+        store.update_sandbox(&sandbox_for(&id, "sbx-2")).unwrap();
+        store.remove_sandbox(&id, "sbx-2").unwrap();
+        assert_eq!(store.sandbox(&id).unwrap(), Some(updated));
+
+        store.remove_sandbox(&id, "sbx-1").unwrap();
+        assert_eq!(store.sandbox(&id).unwrap(), None);
+
+        // A sandbox needs a real session.
+        assert!(store.insert_sandbox(&sandbox_for("missing", "x")).is_err());
     }
 
     #[test]

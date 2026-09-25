@@ -9,7 +9,21 @@ use crate::store::{RunRecord, now_millis};
 use rig_agent::agent::{Agent, PromptResponse, StreamingResult};
 use rig_agent::completion::PromptError;
 use rig_agent::prelude::{Prompt, StreamingPrompt};
+use rig_agent::tool::ToolContext;
 use std::future::{Future, IntoFuture};
+
+/// The conversation (session id) a run belongs to. Every tool call in the
+/// run finds it in its [`ToolContext`]; the model never sees or sets it.
+/// The sandbox tools use it to pick the session's sandbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conversation(pub String);
+
+/// The tool context for one run in `conversation`.
+pub fn tool_context(conversation: &str) -> ToolContext {
+    let mut context = ToolContext::new();
+    context.insert(Conversation(conversation.to_string()));
+    context
+}
 
 /// One agent run in a conversation, returning everything Rig reports rather
 /// than just the reply.
@@ -36,6 +50,7 @@ impl Run for Agent {
     async fn run(&self, prompt: &str, conversation: &str) -> Result<PromptResponse, PromptError> {
         self.prompt(prompt)
             .conversation(conversation)
+            .tool_context(tool_context(conversation))
             .extended_details()
             .await
     }
@@ -65,6 +80,7 @@ impl RunStream for Agent {
     ) -> impl Future<Output = StreamingResult> + Send {
         self.stream_prompt(prompt)
             .conversation(conversation)
+            .tool_context(tool_context(conversation))
             .into_future()
     }
 }

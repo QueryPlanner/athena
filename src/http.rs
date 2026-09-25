@@ -48,7 +48,7 @@ pub const EXPOSED_WARNING: &str = "\
 WARNING: athena is listening on a non-loopback address.
 WARNING: The HTTP API is UNAUTHENTICATED. Anyone who can reach it can act as
 WARNING: any user, read every session, spend your model credit and use the
-WARNING: agent's tools, including read_file on this machine.
+WARNING: agent's tools, including each session's sandbox.
 WARNING: Listen on 127.0.0.1 unless something in front of it authenticates.";
 
 /// Which `Host` headers the API answers.

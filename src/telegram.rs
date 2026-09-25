@@ -831,7 +831,7 @@ pub async fn main(model: &str) -> Result<()> {
     let client = agent::client()?;
     let store = Store::open(&store::path())?;
     let service = Arc::new(Service::new(store.clone(), model, log_warning));
-    let agent = agent::build(&client, model, service.memory());
+    let agent = agent::build(&client, model, service.memory())?;
     let app = Arc::new(Telegram::new(service, store, agent, Arc::new(log_warning)));
     let bot = config.bot();
     let mut dispatcher = dispatcher(bot.clone(), app.clone());

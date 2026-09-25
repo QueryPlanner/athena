@@ -1,4 +1,4 @@
-user_version 4
+user_version 5
 
 table messages
   session_id TEXT NOT NULL PK1
@@ -28,6 +28,17 @@ table runs
   foreign key session_id REFERENCES sessions (id)
   index runs_by_session (session_id, started_at) from c
   unique index (run_id) from pk
+
+table sandboxes
+  session_id TEXT NOT NULL PK1
+  sandbox_id TEXT NOT NULL
+  bash_session TEXT
+  code_language TEXT
+  code_context TEXT
+  created_at INTEGER NOT NULL
+  expires_at INTEGER NOT NULL
+  foreign key session_id REFERENCES sessions (id)
+  unique index (session_id) from pk
 
 table selected_sessions
   user_id INTEGER NOT NULL PK1

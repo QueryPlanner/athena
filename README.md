@@ -16,11 +16,12 @@ Edit `src/agent.rs`. That is the only file that changes.
     pub const PREAMBLE: &str = "...";       // set the system prompt
     pub const DEFAULT_MODEL: &str = "...";  // set the model
 
-    pub fn configure(builder: AgentBuilder) -> Agent {
+    pub fn configure_with(builder, sandboxes) -> Agent {
         builder ... .tool(MyTool) ...       // register them
     }
 
-`configure` is the agent's whole definition. Production wraps it around the
+`configure_with` is the agent's whole definition (`configure` is the same
+without sandbox tools). Production wraps it around the
 OpenRouter client; the tests wrap it around Rig's mock model, so they run the
 same preamble and tools you ship. Both give the builder the conversation
 memory first (`builder.memory(service.memory())`), so `configure` never has
@@ -138,6 +139,64 @@ queued. Commands still answer at once. Errors are logged to stderr and
 answered with one short line; the bot keeps running. Ctrl-C stops polling
 and waits for turns in flight to reply.
 
+## Sandbox and browser tools
+
+Tools that touch a computer run in a sandbox on an
+[OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) server, never
+on the machine running athena. The template ships no host tool except `add`.
+
+| Tool | What it does |
+|---|---|
+| `shell(command, timeout_secs?)` | bash in a persistent session: `cd`, exports and venvs carry over |
+| `run_code(language, code)` | a persistent Python interpreter (execd's Jupyter-backed code API) |
+| `read_file(path)` / `write_file(path, content)` | files inside the sandbox; reads stop at 64 KiB |
+| `browser_open(url)`, `browser_snapshot()`, `browser_click(ref)`, `browser_fill(ref, text)`, `browser_read(url)`, `browser_screenshot()` | [agent-browser](https://github.com/vercel-labs/agent-browser) inside the sandbox |
+
+**One sandbox per session.** The first tool call in a session creates it;
+later calls reuse it and push its expiry `ATHENA_SANDBOX_TIMEOUT_SECS` into
+the future. A sandbox that expired or was deleted is replaced on the next
+call (its files are gone). The sandbox id, bash session and interpreter are
+kept in the `sandboxes` table, so restarts and other processes find them.
+Tools know their session from the run itself (Rig's per-request
+`ToolContext`, set in `src/runner.rs`), never from the model.
+
+**Limits.** Each tool result is cut to 16 KiB. URLs must be http or https;
+element refs must look like `@e3`. A run may make 40 tool calls, each with at
+most 128 KiB of arguments; past that the call is skipped and the model is
+told why (`src/policy.rs`). Browser output is wrapped in agent-browser's
+content boundaries, and `eval` and downloads need a confirmation no tool
+gives. Commands run without a terminal, so interactive programs hang until
+their timeout.
+
+**Configuration.** Without `OPEN_SANDBOX_URL` none of these tools exist and
+everything else works as before.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OPEN_SANDBOX_URL` | unset | e.g. `http://100.118.54.67:9090` |
+| `OPEN_SANDBOX_API_KEY` | unset | sent as `OPEN-SANDBOX-API-KEY` when set |
+| `ATHENA_SANDBOX_IMAGE` | `ghcr.io/queryplanner/athena-sandbox:latest` | image each sandbox runs |
+| `ATHENA_SANDBOX_TIMEOUT_SECS` | `1800` (min 60) | idle lifetime of a sandbox |
+
+**The image** is `deploy/sandbox-image/Dockerfile`: Debian 13 slim, Chromium,
+a pinned and checksummed agent-browser release, Python with a Jupyter server,
+git and curl. Build it on (or for) the sandbox host:
+
+    docker build -t athena-sandbox:dev deploy/sandbox-image
+    ATHENA_SANDBOX_IMAGE=athena-sandbox:dev
+
+To upgrade agent-browser, change `AGENT_BROWSER_VERSION` and both
+`AGENT_BROWSER_SHA256_*` digests together.
+
+**Accepted risk, until the sandbox host is hardened** (plan section 4):
+sandboxes run as root with internet egress, can reach other tailnet
+machines, and the OpenSandbox server accepts requests from any tailnet
+device. A prompt injection can therefore make the agent send anything it
+has seen to the internet. athena passes none of its own secrets into a
+sandbox; keep secrets out of conversations too. Sandboxes are not deleted
+when a session is (there is no session delete yet); they expire after the
+timeout.
+
 ## Users and sessions
 
 A user is identified by `(transport, external_id)`: `("cli", "local")`,
@@ -156,7 +215,10 @@ id that does not exist.
     src/agent.rs    <- you edit this
     src/service.rs     the core every transport calls: users, sessions, send
     src/store.rs       the database: migrations, Rig conversation memory, runs
-    src/runner.rs      the Run trait and the run record
+    src/runner.rs      the Run trait, the run record, each run's tool context
+    src/sandbox.rs     per-session OpenSandbox sandboxes; sandbox/ has the
+                       HTTP client, stream parser, quoting and the tools
+    src/policy.rs      the tool-call budget hook
     src/cli.rs         the CLI transport: arguments, output, REPL
     src/http.rs        the HTTP transport: JSON API, SSE streaming, `serve`
     src/telegram.rs    the Telegram transport: commands, sessions, the bot
@@ -542,10 +604,9 @@ production; turn it on in staging only while no real users talk to it.
 
 - **The HTTP API is unauthenticated. Do not expose it publicly.** Whoever
   can reach the port can act as any user by setting `X-Athena-User`, read
-  every session, spend the OpenRouter credit, and use the agent's tools on
-  the server's machine, including `read_file` on any path the process can
-  read. Loopback is the default, and a loopback server refuses foreign
-  `Host` headers, but every local process is still trusted. Authentication
+  every session, spend the OpenRouter credit, and use the agent's tools in
+  any session's sandbox. Loopback is the default, and a loopback server
+  refuses foreign `Host` headers, but every local process is still trusted. Authentication
   replaces `Caller` in `src/http.rs`; until then, put an authenticating
   proxy in front before listening anywhere else.
 - Every distinct `X-Athena-User` value creates a `users` row, even for a
