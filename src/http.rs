@@ -49,7 +49,7 @@ WARNING: agent's tools, including read_file on this machine.
 WARNING: Listen on 127.0.0.1 unless something in front of it authenticates.";
 
 /// Which `Host` headers the API answers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hosts {
     /// Only `localhost`, `127.0.0.1` and `[::1]`. A web page that points its
     /// own domain at 127.0.0.1 (DNS rebinding) sends its domain as the
@@ -57,6 +57,10 @@ pub enum Hosts {
     Loopback,
     /// Any. For a server listening beyond loopback, reached by other names.
     Any,
+    /// Only these, from `ATHENA_ALLOWED_HOSTS`: a `host` entry matches that
+    /// host on any port, a `host:port` entry only that port. With
+    /// `loopback`, the loopback names too.
+    Allowed { hosts: Vec<String>, loopback: bool },
 }
 
 #[derive(Clone)]
@@ -70,6 +74,7 @@ struct App {
 pub fn router(service: Arc<Service>, agent: Arc<Agent>, hosts: Hosts) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/version", get(version))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}/messages", get(messages).post(send))
         .route("/sessions/{id}/messages/stream", post(send_stream))
@@ -86,11 +91,11 @@ pub fn router(service: Arc<Service>, agent: Arc<Agent>, hosts: Hosts) -> Router 
 /// running, including those whose client has gone.
 pub async fn serve(
     listener: TcpListener,
+    hosts: Hosts,
     service: Arc<Service>,
     agent: Arc<Agent>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    let hosts = hosts_for(listener.local_addr()?);
     axum::serve(listener, router(service.clone(), agent, hosts))
         .with_graceful_shutdown(shutdown)
         .await?;
@@ -98,7 +103,8 @@ pub async fn serve(
     Ok(())
 }
 
-/// `athena serve [--addr HOST:PORT]`.
+/// `athena serve [--addr HOST:PORT]`, answering the hosts named by
+/// `ATHENA_ALLOWED_HOSTS` when it is set.
 ///
 /// `interrupt` returns a future that resolves on the next stop signal
 /// (SIGINT or SIGTERM); see [`serve_until_interrupted`].
@@ -109,11 +115,14 @@ pub async fn run<F: Future<Output = ()> + Send + 'static>(
     interrupt: impl Fn() -> F,
 ) -> anyhow::Result<()> {
     let addr = addr(args, std::env::var("ATHENA_ADDR").ok())?;
+    let allowed = allowed_hosts(std::env::var("ATHENA_ALLOWED_HOSTS").ok())?;
     let listener = TcpListener::bind(&addr)
         .await
         .with_context(|| format!("listening on {addr}"))?;
-    announce(listener.local_addr()?, &mut std::io::stderr());
-    serve_until_interrupted(listener, service, agent, interrupt).await
+    let local = listener.local_addr()?;
+    let hosts = hosts_for(local, allowed);
+    announce(local, &hosts, &mut std::io::stderr());
+    serve_until_interrupted(listener, hosts, service, agent, interrupt).await
 }
 
 /// [`serve`] until the first interrupt, then shut down gracefully. A second
@@ -121,6 +130,7 @@ pub async fn run<F: Future<Output = ()> + Send + 'static>(
 /// are lost, as with a crash.
 pub async fn serve_until_interrupted<F: Future<Output = ()> + Send + 'static>(
     listener: TcpListener,
+    hosts: Hosts,
     service: Arc<Service>,
     agent: Arc<Agent>,
     interrupt: impl Fn() -> F,
@@ -140,17 +150,53 @@ pub async fn serve_until_interrupted<F: Future<Output = ()> + Send + 'static>(
         interrupt().await;
     };
     tokio::select! {
-        served = serve(listener, service, agent, shutdown) => Ok(served?),
+        served = serve(listener, hosts, service, agent, shutdown) => Ok(served?),
         () = forced => bail!("interrupted twice; quit without waiting for the turns in flight"),
     }
 }
 
-/// A server listening on loopback only answers loopback host names.
-fn hosts_for(addr: SocketAddr) -> Hosts {
-    match addr.ip().is_loopback() {
-        true => Hosts::Loopback,
-        false => Hosts::Any,
+/// The hosts a server listening on `addr` answers. With an allowlist, those
+/// wherever it listens (plus the loopback names on loopback); without one, a
+/// loopback server answers loopback names and any other server any name.
+fn hosts_for(addr: SocketAddr, allowed: Option<Vec<String>>) -> Hosts {
+    let loopback = addr.ip().is_loopback();
+    match allowed {
+        Some(hosts) => Hosts::Allowed { hosts, loopback },
+        None if loopback => Hosts::Loopback,
+        None => Hosts::Any,
     }
+}
+
+/// `ATHENA_ALLOWED_HOSTS`: comma-separated `host` or `host:port` entries,
+/// compared without case. Set but naming no host is an error, not "any".
+fn allowed_hosts(configured: Option<String>) -> anyhow::Result<Option<Vec<String>>> {
+    let Some(list) = configured else {
+        return Ok(None);
+    };
+    let hosts: Vec<String> = list
+        .split(',')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect();
+    if hosts.is_empty() {
+        bail!("ATHENA_ALLOWED_HOSTS is set but names no host; unset it or list HOST[:PORT],...");
+    }
+    if let Some(bad) = hosts.iter().find(|h| !is_host_entry(h)) {
+        bail!(
+            "ATHENA_ALLOWED_HOSTS takes HOST or HOST:PORT, IPv6 in brackets, \
+             without a scheme or path; got `{bad}`"
+        );
+    }
+    Ok(Some(hosts))
+}
+
+/// `HOST` or `HOST:PORT`, with an IPv6 host in brackets.
+fn is_host_entry(entry: &str) -> bool {
+    let (name, port) = split_host(entry);
+    let bracketed = name.starts_with('[') && name.ends_with(']');
+    let plain = !name.is_empty() && !name.contains(['[', ']', ':', '/', ' ']);
+    let port_ok = port.is_none_or(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    (bracketed || plain) && port_ok
 }
 
 /// The address to listen on: `--addr`, else `ATHENA_ADDR`, else the default.
@@ -162,12 +208,19 @@ fn addr(args: &[String], configured: Option<String>) -> anyhow::Result<String> {
     }
 }
 
-/// Say where the server listens, and warn loudly if that is not loopback.
-fn announce(addr: SocketAddr, out: &mut impl Write) {
+/// Say where the server listens and which hosts it answers, and warn
+/// loudly if it answers any host beyond loopback.
+fn announce(addr: SocketAddr, hosts: &Hosts, out: &mut impl Write) {
     // Nowhere left to report a failure to write to stderr.
     let _ = writeln!(out, "listening on http://{addr}");
-    if !addr.ip().is_loopback() {
-        let _ = writeln!(out, "{EXPOSED_WARNING}");
+    match hosts {
+        Hosts::Loopback => {}
+        Hosts::Any => {
+            let _ = writeln!(out, "{EXPOSED_WARNING}");
+        }
+        Hosts::Allowed { hosts, .. } => {
+            let _ = writeln!(out, "answering only Host: {}", hosts.join(", "));
+        }
     }
 }
 
@@ -183,9 +236,7 @@ impl FromRequestParts<App> for Caller {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, ApiError> {
-        if app.hosts == Hosts::Loopback {
-            loopback_host(&parts.headers)?;
-        }
+        allowed_host(&app.hosts, &parts.headers)?;
         let id = user_id(&parts.headers)?;
         Ok(Caller(app.service.user("http", id).await?))
     }
@@ -213,27 +264,59 @@ fn user_id(headers: &HeaderMap) -> Result<&str, ApiError> {
     Ok(id)
 }
 
-fn loopback_host(headers: &HeaderMap) -> Result<(), ApiError> {
+/// Refuse a request whose `Host` is not one `hosts` answers.
+fn allowed_host(hosts: &Hosts, headers: &HeaderMap) -> Result<(), ApiError> {
     let host = headers
         .get(header::HOST)
         .and_then(|h| h.to_str().ok())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    // Drop the port: `[::1]:8080` keeps its brackets, `localhost:8080` its name.
-    let name = match host.find(']') {
-        Some(end) => &host[..=end],
-        None => host.split(':').next().unwrap_or_default(),
+    let (name, _) = split_host(&host);
+    let loopback = matches!(name, "localhost" | "127.0.0.1" | "[::1]");
+    let (allowed, answered) = match hosts {
+        Hosts::Any => return Ok(()),
+        Hosts::Loopback => (loopback, "localhost"),
+        Hosts::Allowed {
+            hosts,
+            loopback: on_loopback,
+        } => (
+            (*on_loopback && loopback) || hosts.iter().any(|a| host_matches(a, &host)),
+            "its allowed hosts",
+        ),
     };
-    match name {
-        "localhost" | "127.0.0.1" | "[::1]" => Ok(()),
-        _ => Err(ApiError {
+    match allowed {
+        true => Ok(()),
+        false => Err(ApiError {
             status: StatusCode::FORBIDDEN,
             code: "forbidden_host",
             message: format!(
-                "this server only answers requests addressed to localhost, not `{host}`"
+                "this server only answers requests addressed to {answered}, not `{host}`"
             ),
         }),
     }
+}
+
+/// A `Host` value as name and port: `[::1]:8080` keeps its brackets.
+/// Anything but a port after the name makes the whole value the name, so
+/// `[::1]evil` is not `[::1]`.
+fn split_host(host: &str) -> (&str, Option<&str>) {
+    let end = match host.find(']') {
+        Some(end) => end + 1,
+        None => host.find(':').unwrap_or(host.len()),
+    };
+    let (name, rest) = host.split_at(end);
+    match rest.strip_prefix(':') {
+        Some(port) => (name, Some(port)),
+        None => (host, None),
+    }
+}
+
+/// Whether allowlist entry `allowed` covers `host`: the same name, and the
+/// same port if the entry names one.
+fn host_matches(allowed: &str, host: &str) -> bool {
+    let (name, port) = split_host(allowed);
+    let (host_name, host_port) = split_host(host);
+    name == host_name && (port.is_none() || port == host_port)
 }
 
 // ---- errors ----
@@ -303,6 +386,10 @@ fn log(message: &str) {
 
 async fn health() -> Json<Value> {
     Json(json!({"status": "ok"}))
+}
+
+async fn version() -> Json<Value> {
+    Json(json!({"version": crate::ops::version()}))
 }
 
 async fn create_session(
@@ -510,13 +597,64 @@ mod tests {
             ("192.168.1.5:80", true),
         ] {
             let addr: SocketAddr = addr.parse().unwrap();
+            let hosts = hosts_for(addr, None);
             let mut out = Vec::new();
-            announce(addr, &mut out);
+            announce(addr, &hosts, &mut out);
             let out = String::from_utf8(out).unwrap();
             assert!(out.starts_with(&format!("listening on http://{addr}\n")));
             assert_eq!(out.contains("UNAUTHENTICATED"), warned, "{addr}");
             let expected = if warned { Hosts::Any } else { Hosts::Loopback };
-            assert_eq!(hosts_for(addr), expected, "{addr}");
+            assert_eq!(hosts, expected, "{addr}");
+        }
+    }
+
+    #[test]
+    fn an_allowlist_applies_wherever_the_server_listens_and_silences_the_warning() {
+        let listed = || Some(vec!["athena-vm:18080".to_string()]);
+        for (addr, loopback) in [("100.64.0.1:18080", false), ("127.0.0.1:18080", true)] {
+            let addr: SocketAddr = addr.parse().unwrap();
+            let hosts = hosts_for(addr, listed());
+            assert_eq!(
+                hosts,
+                Hosts::Allowed {
+                    hosts: listed().unwrap(),
+                    loopback
+                }
+            );
+            let mut out = Vec::new();
+            announce(addr, &hosts, &mut out);
+            let out = String::from_utf8(out).unwrap();
+            assert_eq!(
+                out,
+                format!("listening on http://{addr}\nanswering only Host: athena-vm:18080\n")
+            );
+        }
+    }
+
+    #[test]
+    fn the_allowlist_is_a_comma_list_of_hosts_without_schemes() {
+        assert_eq!(allowed_hosts(None).unwrap(), None);
+        assert_eq!(
+            allowed_hosts(Some(" Athena-VM:18080, 100.64.0.1 ,[FD7A::1]:1".into())).unwrap(),
+            Some(vec![
+                "athena-vm:18080".to_string(),
+                "100.64.0.1".to_string(),
+                "[fd7a::1]:1".to_string()
+            ])
+        );
+        for (bad, why) in [
+            ("", "names no host"),
+            (" , ", "names no host"),
+            ("http://athena-vm:18080", "without a scheme"),
+            ("athena vm", "without a scheme"),
+            ("fd7a::1", "IPv6 in brackets"),
+            ("[fd7a::1]x", "IPv6 in brackets"),
+            ("athena-vm:", "HOST:PORT"),
+            (":18080", "HOST:PORT"),
+            ("athena-vm:http", "HOST:PORT"),
+        ] {
+            let err = allowed_hosts(Some(bad.into())).unwrap_err().to_string();
+            assert!(err.contains(why), "{bad:?}: {err}");
         }
     }
 
@@ -552,33 +690,82 @@ mod tests {
         }
     }
 
+    fn host(value: &'static str) -> HeaderMap {
+        headers(&[("host", HeaderValue::from_static(value))])
+    }
+
+    fn refused(hosts: &Hosts, map: &HeaderMap) -> String {
+        let err = allowed_host(hosts, map).unwrap_err();
+        assert_eq!(
+            (err.status, err.code),
+            (StatusCode::FORBIDDEN, "forbidden_host")
+        );
+        err.message
+    }
+
     #[test]
     fn a_loopback_server_answers_only_loopback_host_names() {
-        for host in [
+        for value in [
             "localhost",
             "LOCALHOST:8080",
             "127.0.0.1:1",
             "[::1]",
             "[::1]:8080",
         ] {
-            let map = headers(&[("host", HeaderValue::from_static(host))]);
-            assert!(loopback_host(&map).is_ok(), "{host}");
+            let ok = allowed_host(&Hosts::Loopback, &host(value));
+            assert!(ok.is_ok(), "{value}");
         }
-        for host in [
+        for value in [
             "evil.example",
             "evil.example:8080",
             "127.0.0.1.nip.io",
             "[::2]:1",
+            "[::1]evil",
         ] {
-            let map = headers(&[("host", HeaderValue::from_static(host))]);
-            let err = loopback_host(&map).unwrap_err();
-            assert_eq!(
-                (err.status, err.code),
-                (StatusCode::FORBIDDEN, "forbidden_host")
-            );
-            assert!(err.message.contains(host), "{}", err.message);
+            let message = refused(&Hosts::Loopback, &host(value));
+            assert!(message.contains("addressed to localhost"), "{message}");
+            assert!(message.contains(value), "{message}");
         }
-        assert!(loopback_host(&headers(&[])).is_err());
+        refused(&Hosts::Loopback, &headers(&[]));
+        assert!(allowed_host(&Hosts::Any, &host("evil.example")).is_ok());
+    }
+
+    #[test]
+    fn an_allowlisted_server_answers_listed_hosts_and_on_loopback_loopback_names() {
+        let allowed = |loopback| Hosts::Allowed {
+            hosts: vec![
+                "athena-vm:18080".into(),
+                "100.64.0.1".into(),
+                "[fd7a::1]:18080".into(),
+            ],
+            loopback,
+        };
+        for value in [
+            "athena-vm:18080",
+            "ATHENA-VM:18080",
+            "100.64.0.1",
+            "100.64.0.1:18080",
+            "[fd7a::1]:18080",
+        ] {
+            for loopback in [false, true] {
+                let ok = allowed_host(&allowed(loopback), &host(value));
+                assert!(ok.is_ok(), "{value} {loopback}");
+            }
+        }
+        for value in [
+            "athena-vm",
+            "athena-vm:18081",
+            "athena-vm.evil.example:18080",
+            "100.64.0.10",
+            "[fd7a::1]",
+            "[fd7a::1]x:18080",
+        ] {
+            let message = refused(&allowed(true), &host(value));
+            assert!(message.contains("its allowed hosts"), "{message}");
+        }
+        assert!(allowed_host(&allowed(true), &host("localhost:18080")).is_ok());
+        refused(&allowed(false), &host("localhost:18080"));
+        refused(&allowed(true), &headers(&[]));
     }
 
     #[test]

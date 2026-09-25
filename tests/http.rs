@@ -160,6 +160,30 @@ async fn the_health_check_needs_no_user() {
 }
 
 #[tokio::test]
+async fn the_version_needs_no_user_and_ignores_the_host() {
+    let tmp = TempDb::new();
+    let service = service(&tmp);
+    let (agent, _) = mock_agent(&service, []);
+    let router = http::router(service.clone(), Arc::new(agent), Hosts::Loopback);
+    let mut request = request("GET", "/version", None, None);
+    request
+        .headers_mut()
+        .insert(header::HOST, "attacker.example".parse().unwrap());
+
+    let (status, body) = call(&router, request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({"version": athena::ops::version()}));
+    assert_eq!(
+        count(
+            &tmp.raw(),
+            "SELECT COUNT(*) FROM users WHERE transport = 'http'"
+        ),
+        0
+    );
+}
+
+#[tokio::test]
 async fn every_user_endpoint_refuses_a_request_that_does_not_say_who_is_asking() {
     let tmp = TempDb::new();
     let service = service(&tmp);
@@ -748,6 +772,7 @@ async fn the_server_answers_over_tcp_and_finishes_turns_in_flight_before_it_stop
     let (interrupt, next) = interrupts();
     let server = tokio::spawn(http::serve_until_interrupted(
         listener,
+        Hosts::Loopback,
         service.clone(),
         Arc::new(agent),
         next,
@@ -791,6 +816,7 @@ async fn a_second_interrupt_quits_without_waiting_for_turns_in_flight() {
     let (interrupt, next) = interrupts();
     let server = tokio::spawn(http::serve_until_interrupted(
         listener,
+        Hosts::Loopback,
         service.clone(),
         Arc::new(agent),
         next,
@@ -836,6 +862,8 @@ fn athena_serve(
         .env("ATHENA_DB", tmp.path())
         .env_remove("AGENT_MODEL")
         .env_remove("ATHENA_ADDR")
+        .env_remove("ATHENA_ALLOWED_HOSTS")
+        .env_remove("ATHENA_VERSION")
         .env_remove("OPENROUTER_API_KEY");
     if let Some(key) = key {
         command.env("OPENROUTER_API_KEY", key);
@@ -861,13 +889,20 @@ fn the_binary_serves_until_sigterm_and_then_exits_cleanly() {
     serves_until("TERM");
 }
 
-/// Start `athena serve`, use it, send it `signal`, and check it shut down
-/// gracefully rather than being killed.
-fn serves_until(signal: &str) {
-    let tmp = TempDb::new();
-    let dir = WorkDir::new();
-    // A key that is never used: nothing here reaches the model.
-    let mut child = athena_serve(&dir, &tmp, &["--addr", "127.0.0.1:0"], Some("unused-key"))
+/// A running `athena serve` on a free loopback port: the process, the
+/// address it announced, and the rest of its stderr.
+struct Serving {
+    child: std::process::Child,
+    addr: String,
+    stderr: std::io::BufReader<std::process::ChildStderr>,
+}
+
+/// Start `athena serve` on 127.0.0.1 with `env` set. A key that is never
+/// used: nothing here reaches the model.
+fn start_serving(dir: &WorkDir, tmp: &TempDb, env: &[(&str, &str)]) -> Serving {
+    let mut command = athena_serve(dir, tmp, &["--addr", "127.0.0.1:0"], Some("unused-key"));
+    command.envs(env.iter().copied());
+    let mut child = command
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -880,11 +915,58 @@ fn serves_until(signal: &str) {
         .strip_prefix("listening on http://")
         .unwrap_or_else(|| panic!("unexpected first line: {line}"))
         .to_string();
+    Serving {
+        child,
+        addr,
+        stderr,
+    }
+}
 
-    let health = blocking_request(
-        &addr,
-        "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-    );
+impl Serving {
+    /// `GET path` as `alice`, addressed to `host`.
+    fn get(&self, path: &str, host: &str) -> String {
+        blocking_request(
+            &self.addr,
+            &format!(
+                "GET {path} HTTP/1.1\r\nHost: {host}\r\n{USER_HEADER}: alice\r\n\
+                 Connection: close\r\n\r\n"
+            ),
+        )
+    }
+
+    /// Stop it with `signal` and return the rest of its stderr once it has
+    /// exited cleanly.
+    fn stop(mut self, signal: &str) -> String {
+        let interrupted = std::process::Command::new("kill")
+            .args([&format!("-{signal}"), &self.child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(interrupted.success());
+        // The timeout only turns a hang into a failure.
+        let (done, exited) = std::sync::mpsc::channel();
+        let mut child = self.child;
+        std::thread::spawn(move || done.send(child.wait()));
+        let status = exited
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("athena serve did not exit after the signal")
+            .unwrap();
+        let mut rest = String::new();
+        self.stderr.read_to_string(&mut rest).unwrap();
+        assert!(status.success(), "{status:?}: {rest}");
+        rest
+    }
+}
+
+/// Start `athena serve`, use it, send it `signal`, and check it shut down
+/// gracefully rather than being killed.
+fn serves_until(signal: &str) {
+    let tmp = TempDb::new();
+    let dir = WorkDir::new();
+    let server = start_serving(&dir, &tmp, &[("ATHENA_VERSION", "sha-test")]);
+    let addr = server.addr.clone();
+
+    let health = server.get("/health", "localhost");
+    let version = server.get("/version", "localhost");
     let body = r#"{"name":"notes"}"#;
     let created = blocking_request(
         &addr,
@@ -894,24 +976,11 @@ fn serves_until(signal: &str) {
             body.len()
         ),
     );
-    let interrupted = std::process::Command::new("kill")
-        .args([&format!("-{signal}"), &child.id().to_string()])
-        .status()
-        .unwrap();
-    // The timeout only turns a hang into a failure.
-    let (done, exited) = std::sync::mpsc::channel();
-    std::thread::spawn(move || done.send(child.wait()));
-    let status = exited
-        .recv_timeout(std::time::Duration::from_secs(60))
-        .expect("athena serve did not exit after the signal")
-        .unwrap();
-    let mut rest = String::new();
-    stderr.read_to_string(&mut rest).unwrap();
+    let rest = server.stop(signal);
 
     assert!(health.starts_with("HTTP/1.1 200 OK"), "{health}");
+    assert!(version.ends_with(r#"{"version":"sha-test"}"#), "{version}");
     assert!(created.starts_with("HTTP/1.1 201 Created"), "{created}");
-    assert!(interrupted.success());
-    assert!(status.success(), "{status:?}: {rest}");
     assert!(rest.contains("shutting down"), "{rest}");
     assert!(!rest.contains("WARNING"), "loopback must not warn: {rest}");
     assert!(!session_id(&tmp.raw(), "http", "alice", "notes").is_empty());
@@ -942,4 +1011,70 @@ fn the_binary_refuses_to_serve_without_a_key_or_with_bad_arguments() {
         assert!(stderr.contains(why), "{args:?}: {stderr}");
         assert!(!stderr.contains("listening on http"), "{args:?}: {stderr}");
     }
+}
+
+#[test]
+fn the_binary_answers_only_allowlisted_hosts_and_does_not_warn() {
+    let tmp = TempDb::new();
+    let dir = WorkDir::new();
+    let server = start_serving(
+        &dir,
+        &tmp,
+        &[("ATHENA_ALLOWED_HOSTS", "athena.test, other.test:1")],
+    );
+    let port = server.addr.rsplit(':').next().unwrap().to_string();
+
+    let listed = server.get("/sessions", &format!("athena.test:{port}"));
+    let loopback = server.get("/sessions", "localhost");
+    let wrong_port = server.get("/sessions", &format!("other.test:{port}"));
+    let foreign = server.get("/sessions", "evil.example");
+    let rest = server.stop("TERM");
+
+    assert!(listed.starts_with("HTTP/1.1 200 OK"), "{listed}");
+    assert!(loopback.starts_with("HTTP/1.1 200 OK"), "{loopback}");
+    for refused in [&wrong_port, &foreign] {
+        assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+        assert!(refused.contains("forbidden_host"), "{refused}");
+    }
+    assert!(
+        rest.starts_with("answering only Host: athena.test, other.test:1\n"),
+        "{rest}"
+    );
+    assert!(!rest.contains("WARNING"), "{rest}");
+}
+
+#[test]
+fn the_binary_refuses_to_serve_without_an_absolute_database_path() {
+    let dir = WorkDir::new();
+    let tmp = TempDb::new();
+
+    for (db, why) in [
+        (None, "ATHENA_DB is not set"),
+        (Some("agent.db"), "must be an absolute path"),
+    ] {
+        let mut command = athena_serve(&dir, &tmp, &[], Some("unused-key"));
+        match db {
+            Some(db) => command.env("ATHENA_DB", db),
+            None => command.env_remove("ATHENA_DB"),
+        };
+        let out = command.output().unwrap();
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(!out.status.success(), "{db:?}");
+        assert!(stderr.contains(why), "{db:?}: {stderr}");
+    }
+    assert!(!dir.path().join("agent.db").exists());
+}
+
+#[test]
+fn the_binary_refuses_a_malformed_host_allowlist_before_listening() {
+    let tmp = TempDb::new();
+    let out = athena_serve(&WorkDir::new(), &tmp, &[], Some("unused-key"))
+        .env("ATHENA_ALLOWED_HOSTS", "https://athena.test")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+
+    assert!(!out.status.success());
+    assert!(stderr.contains("without a scheme"), "{stderr}");
+    assert!(!stderr.contains("listening on http"), "{stderr}");
 }

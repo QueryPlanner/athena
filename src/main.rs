@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use athena::service::Service;
-use athena::{agent, cli, dotenv, http, shutdown, store, telegram};
+use athena::{agent, cli, dotenv, http, ops, shutdown, store, telegram};
 use std::sync::Arc;
 
 fn main() -> Result<()> {
@@ -17,12 +17,20 @@ fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if ops::requested(&args) {
+        return ops::run(&args, &mut std::io::stdout());
+    }
     let model = agent::model();
     if telegram::requested(&args)? {
+        ops::require_absolute_db()?;
         return telegram::main(&model).await;
     }
+    let serving = args.first().is_some_and(|a| a == "serve");
+    if serving {
+        ops::require_absolute_db()?;
+    }
     let service = Service::new(store::Store::open(&store::path())?, &model, cli::warn);
-    if args.first().is_some_and(|a| a == "serve") {
+    if serving {
         // Up front: a server without a key would fail every turn.
         let agent = agent::build(&agent::client()?, &model, service.memory());
         let stop = shutdown::listen()?;
