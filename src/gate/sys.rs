@@ -4,7 +4,7 @@
 
 use super::http;
 use std::ffi::CString;
-use std::io;
+use std::io::{self, Write};
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use std::os::unix::ffi::OsStrExt;
@@ -143,8 +143,10 @@ impl System for RealSystem {
         Ok(blocks_to_bytes(stat.f_bavail, stat.f_frsize))
     }
 
+    /// Never panics: once CI's SSH channel closes, stderr fails with
+    /// EPIPE, and a panic then could leave the units stopped.
     fn say(&self, line: &str) {
-        eprintln!("{line}");
+        let _ = writeln!(io::stderr(), "{line}");
     }
 }
 

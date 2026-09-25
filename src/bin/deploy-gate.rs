@@ -3,6 +3,11 @@
 use athena::gate::{self, Gate, RealSystem};
 
 fn main() {
+    // A CI connection that drops mid-deploy sends SIGHUP. Dying then could
+    // leave the units stopped, so finish the operation (and its rollback).
+    // SAFETY: called before any other thread exists; SIG_IGN is a valid
+    // disposition.
+    unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
     // Lossy on purpose: a non-UTF-8 word cannot match the whitelist, so it
     // is rejected like any other unknown word.
     let args: Vec<String> = std::env::args_os()

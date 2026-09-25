@@ -396,13 +396,15 @@ impl Vm {
     pub fn write_state(&self, env: Env, digest: &str, version: &str) {
         let state = json!({"digest": digest, "version": version, "deployed_at": "x"});
         self.write(
-            &format!("var/lib/athena/{env}/state.json"),
+            &format!("var/lib/athena/gate/{env}.state.json"),
             &state.to_string(),
         );
     }
 
     pub fn state(&self, env: Env) -> Value {
-        let path = self.root().join(format!("var/lib/athena/{env}/state.json"));
+        let path = self
+            .root()
+            .join(format!("var/lib/athena/gate/{env}.state.json"));
         serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
     }
 

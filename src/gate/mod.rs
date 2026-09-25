@@ -207,6 +207,21 @@ impl<'a> Gate<'a> {
         let addr = envfile::get(&vars, "ATHENA_ADDR")
             .and_then(|a| a.parse::<SocketAddr>().ok())
             .ok_or_else(|| failed(format!("{} needs ATHENA_ADDR=<ip>:<port>", path.display())))?;
+        // The gate sends `Host: <ATHENA_ADDR>`; a server that refuses it
+        // would fail every health check and roll every deploy back.
+        if let Some(hosts) = envfile::get(&vars, "ATHENA_ALLOWED_HOSTS") {
+            let (full, ip) = (addr.to_string(), addr.ip().to_string());
+            if !hosts
+                .split(',')
+                .map(str::trim)
+                .any(|h| h == full || h == ip)
+            {
+                let file = path.display();
+                return Err(failed(format!(
+                    "{file}: ATHENA_ALLOWED_HOSTS must include {full}"
+                )));
+            }
+        }
         Ok(Settings { vars, addr })
     }
 

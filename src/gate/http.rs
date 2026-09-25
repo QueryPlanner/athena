@@ -12,13 +12,16 @@ use super::sys::{Request, Response};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 
+pub const MAX_RESPONSE_BYTES: u64 = 1 << 20;
+
 pub fn send(request: &Request) -> io::Result<Response> {
     let mut stream = TcpStream::connect_timeout(&request.addr, request.timeout)?;
     stream.set_read_timeout(Some(request.timeout))?;
     stream.set_write_timeout(Some(request.timeout))?;
     stream.write_all(encode(request).as_bytes())?;
+    // A compromised staging server must not exhaust a root process's memory.
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw)?;
+    stream.take(MAX_RESPONSE_BYTES).read_to_end(&mut raw)?;
     decode(&raw)
 }
 
@@ -102,7 +105,7 @@ mod tests {
             }
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
-            reader.get_mut().write_all(reply.as_bytes()).unwrap();
+            let _ = reader.get_mut().write_all(reply.as_bytes());
             head + &String::from_utf8(body).unwrap()
         });
         (addr, handle)
@@ -136,6 +139,16 @@ mod tests {
         assert_eq!(response.status, 200);
         let sent = server.join().unwrap();
         assert!(sent.contains("Content-Length: 0\r\n") && !sent.contains("Content-Type"));
+    }
+
+    #[test]
+    fn a_response_is_read_up_to_a_cap() {
+        let huge: &'static str =
+            Box::leak(format!("HTTP/1.0 200 OK\r\n\r\n{}", "x".repeat(2 << 20)).into_boxed_str());
+        let (addr, server) = serve_once(huge);
+        let response = send(&request(addr, "GET", None)).unwrap();
+        assert_eq!(response.body.len() as u64, MAX_RESPONSE_BYTES - 19);
+        server.join().unwrap();
     }
 
     #[test]

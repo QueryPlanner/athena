@@ -88,10 +88,10 @@ fn short_digest(hex: &str) -> String {
 
 impl Gate<'_> {
     pub(super) fn deploy(&self, env: Env, digest: &Digest) -> Result<Value> {
-        let _lock = self.lock()?;
         if env == Env::Prod {
             self.require_staged(digest)?;
         }
+        let _lock = self.lock()?;
         // Everything that can fail without changing anything goes first.
         let settings = self.settings(env)?;
         let config = self.gate_config()?;
@@ -118,6 +118,8 @@ impl Gate<'_> {
             "deployed_at": time::rfc3339(self.sys.now()),
         });
         let path = self.layout.state(env);
+        let dir = path.parent().unwrap_or(self.layout.root());
+        fs::create_dir_all(dir).context(format!("creating {}", dir.display()))?;
         write_atomic(&path, format!("{state}\n").as_bytes(), 0o644, None)?;
         let pruned = self.prune_releases(config.keep)?;
         self.say(format!("{env} now runs {digest} as {version}"));
@@ -137,7 +139,7 @@ impl Gate<'_> {
         match staged.as_ref().and_then(|s| s["digest"].as_str()) {
             Some(d) if d == digest.as_str() => Ok(()),
             Some(d) => Err(Failure::Rejected(format!(
-                "{digest} is not what staging runs ({d}); deploy it to staging first"
+                "{digest} is not what staging runs ({d:?}); deploy it to staging first"
             ))),
             None => Err(Failure::Rejected(
                 "staging has no recorded deployment; deploy to staging first".into(),
@@ -172,10 +174,7 @@ impl Gate<'_> {
         }
         let reference = format!("{}@{digest}", config.repo);
         let tmp_arg = tmp.to_string_lossy();
-        self.exec_ok(&Cmd::new(
-            &config.oras,
-            &["pull", &reference, "-o", &tmp_arg],
-        ))?;
+        self.exec_ok(&oras(config, &["pull", &reference, "-o", &tmp_arg]))?;
         if !tmp.join("athena").is_file() {
             return Err(failed(format!("{reference} has no `athena` file")));
         }
@@ -194,7 +193,7 @@ impl Gate<'_> {
 
     /// The commit CI recorded in the manifest, else the short digest.
     fn fetch_version(&self, config: &GateConfig, reference: &str, digest: &Digest) -> String {
-        let cmd = Cmd::new(&config.oras, &["manifest", "fetch", reference]);
+        let cmd = oras(config, &["manifest", "fetch", reference]);
         let found = match self.exec_ok(&cmd) {
             Ok(out) => revision(&out.stdout),
             Err(e) => {
@@ -381,6 +380,11 @@ impl Gate<'_> {
         }
         Ok(pruned)
     }
+}
+
+/// ORAS reads its registry config from `$HOME`, which `Cmd` clears.
+fn oras(config: &GateConfig, args: &[&str]) -> Cmd {
+    Cmd::new(&config.oras, args).with_env(vec![("HOME".into(), "/root".into())])
 }
 
 fn release_name(path: &Path) -> Option<String> {
@@ -697,7 +701,11 @@ mod tests {
         assert_has(&err, &["no previous release"]);
         assert!(err.ends_with("staging is stopped"), "{err}");
         assert_eq!(vm.fake.count("systemctl stop"), 2);
-        assert!(!vm.root().join("var/lib/athena/staging/state.json").exists());
+        assert!(
+            !vm.root()
+                .join("var/lib/athena/gate/staging.state.json")
+                .exists()
+        );
     }
 
     #[test]
@@ -932,6 +940,37 @@ mod tests {
             .to_string();
         assert!(err.contains("needs ATHENA_ADDR=<ip>:<port>"), "{err}");
         assert_eq!(vm.fake.effects(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_host_allowlist_must_admit_the_address_the_gate_probes() {
+        for (hosts, ok) in [
+            ("athena-vm:18081", false),
+            ("127.0.0.1:18080", false),
+            ("athena-vm:18081, 127.0.0.1:18081", true),
+            ("127.0.0.1", true),
+        ] {
+            let vm = Vm::new();
+            vm.set_env_var(Env::Staging, "ATHENA_ALLOWED_HOSTS", hosts);
+            let result = vm.gate().deploy(Env::Staging, &digest(HEX_A));
+            assert_eq!(result.is_ok(), ok, "{hosts}: {result:?}");
+            if !ok {
+                let err = result.unwrap_err().to_string();
+                assert_has(&err, &["ATHENA_ALLOWED_HOSTS must include 127.0.0.1:18081"]);
+                assert_eq!(vm.fake.effects(), Vec::<String>::new());
+            }
+        }
+    }
+
+    #[test]
+    fn oras_runs_as_root_with_home_set() {
+        let vm = Vm::new();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        for needle in ["oras pull", "oras manifest fetch"] {
+            let cmd = vm.fake.find_run(needle).unwrap();
+            assert_eq!(cmd.env, [("HOME".to_string(), "/root".to_string())]);
+            assert_eq!(cmd.user, None);
+        }
     }
 
     #[test]

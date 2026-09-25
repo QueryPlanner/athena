@@ -156,7 +156,10 @@ impl Gate<'_> {
         let source = self.layout.backups(env).join(file);
         // The backups directory belongs to the service user: a symlink
         // planted there must not make root read another file.
-        let regular = fs::symlink_metadata(&source).is_ok_and(|m| m.file_type().is_file());
+        let not_link =
+            |p: &Path| fs::symlink_metadata(p).is_ok_and(|m| !m.file_type().is_symlink());
+        let regular = not_link(&self.layout.backups(env))
+            && fs::symlink_metadata(&source).is_ok_and(|m| m.file_type().is_file());
         if !regular {
             return Err(failed(format!("{} is not a backup file", source.display())));
         }
@@ -233,9 +236,13 @@ impl Gate<'_> {
 fn stage_copy(source: &Path, staged: &Path) -> io::Result<()> {
     let mut from = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        // Non-blocking, so a FIFO swapped in cannot hang the open.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(source)?;
     let meta = from.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
     remove_file_if_exists(staged)?;
     let mut to = OpenOptions::new()
         .write(true)
@@ -478,7 +485,11 @@ mod tests {
         let out = vm.gate().status(Env::Staging).unwrap();
         assert_eq!(out["state"], vm.state(Env::Staging));
         assert_eq!(out["current"], HEX_A);
-        fs::write(vm.root().join("var/lib/athena/staging/state.json"), "{").unwrap();
+        fs::write(
+            vm.root().join("var/lib/athena/gate/staging.state.json"),
+            "{",
+        )
+        .unwrap();
         let err = vm.gate().status(Env::Staging).unwrap_err().to_string();
         assert!(err.contains("state.json: "), "{err}");
     }
@@ -557,6 +568,23 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert!(stage_copy(&link, &tmp.path().join("staged")).is_err());
         assert!(!tmp.path().join("staged").exists());
+        let err = stage_copy(tmp.path(), &tmp.path().join("staged")).unwrap_err();
+        assert_eq!(err.to_string(), "not a regular file");
+    }
+
+    #[test]
+    fn restore_refuses_a_backups_directory_that_is_a_symlink() {
+        let vm = deployed();
+        let elsewhere = vm.root().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(elsewhere.join("20260901T000000Z.db"), "root only").unwrap();
+        let backups = vm.root().join("var/lib/athena/staging/backups");
+        std::os::unix::fs::symlink(&elsewhere, &backups).unwrap();
+        let err = vm
+            .gate()
+            .restore(Env::Staging, "20260901T000000Z.db")
+            .unwrap_err();
+        assert_has(&err.to_string(), &["is not a backup file"]);
     }
 
     #[test]

@@ -69,8 +69,10 @@ impl Layout {
         self.data(env).join("backups")
     }
 
+    /// Root-only: the data directory is writable by the service, and
+    /// `promote` trusts this file.
     pub fn state(&self, env: Env) -> PathBuf {
-        self.data(env).join("state.json")
+        self.athena_data().join(format!("gate/{env}.state.json"))
     }
 }
 
@@ -101,7 +103,7 @@ mod tests {
             "/var/lib/athena/.gate.lock",
             "/var/lib/athena/staging/agent.db",
             "/var/lib/athena/prod/backups",
-            "/var/lib/athena/staging/state.json",
+            "/var/lib/athena/gate/staging.state.json",
         ];
         for (path, want) in paths.iter().zip(expected) {
             assert_eq!(path, Path::new(want));

@@ -16,6 +16,13 @@ restrict,command="sudo /opt/athena/bin/deploy-gate --key-env staging" ssh-ed2551
 restrict,command="sudo /opt/athena/bin/deploy-gate --key-env prod" ssh-ed25519 AAAA... ci-prod
 ```
 
+sudo drops `SSH_ORIGINAL_COMMAND` by default, so sudoers needs:
+
+```
+deploy ALL=(root) NOPASSWD: /opt/athena/bin/deploy-gate *
+Defaults!/opt/athena/bin/deploy-gate env_keep += "SSH_ORIGINAL_COMMAND"
+```
+
 CI sends the command as the SSH command line, for example
 `ssh deploy@vm deploy staging sha256:...`. The gate reads it from
 `SSH_ORIGINAL_COMMAND`, splits it on whitespace (no shell is involved) and
@@ -81,7 +88,7 @@ Progress lines go to stderr. The last thing on stdout is one JSON line:
     second for up to 60 s. `/version` must report the new version.
 11. Starts `athena-telegram@staging` if `systemctl is-enabled` says it is
     enabled.
-12. Writes `/var/lib/athena/staging/state.json`
+12. Writes `/var/lib/athena/gate/staging.state.json`
     (`{"digest","version","deployed_at"}`), then prunes the release cache to
     the `ATHENA_KEEP_RELEASES` most recently used releases. A release that
     staging or prod points at is never removed.
@@ -130,6 +137,14 @@ not expanded.
   secret is never world-readable, even briefly.
 - Backup file names cannot contain `/`, so `restore` cannot read outside the
   backups directory.
+- `state.json` lives in `/var/lib/athena/gate/`, which only root can write.
+  The service can write its own data directory, and `promote` trusts
+  staging's state, so a compromised staging service must not be able to
+  forge it.
+- Progress writes to stderr never panic, and SIGHUP is ignored, so a CI
+  connection that drops mid-deploy does not leave the units stopped.
+- `ATHENA_ALLOWED_HOSTS`, when set, must include `ATHENA_ADDR`: the gate
+  sends that as `Host`. HTTP responses are read up to 1 MiB.
 - HTTP goes only to the `ATHENA_ADDR` socket address from the env file,
   which must parse as `ip:port`.
 

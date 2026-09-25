@@ -56,7 +56,8 @@ it needs no user header. Every other endpoint is unchanged.
 
 - **Repository:** `ghcr.io/queryplanner/athena`
 - **Artifact type:** `application/vnd.athena.release.v1`
-- **Contents:** two files, `athena` and `deploy-gate`, both
+- **Contents:** two files, `athena` and `deploy-gate` (pushed by bare name from
+  the directory holding them, so `oras pull -o DIR` writes `DIR/athena`), both
   `x86_64-unknown-linux-gnu`, built on `ubuntu-22.04`, with media type
   `application/octet-stream`.
 - **Tags:**
@@ -86,14 +87,17 @@ The sandbox image is a separate Docker image:
 | `/etc/athena/gate.env` | root, 0644 | `ATHENA_REPO=ghcr.io/queryplanner/athena`, `ATHENA_KEEP_RELEASES=3`, `ORAS=/usr/local/bin/oras` |
 | `/var/lib/athena/<env>/agent.db` | athena | the database |
 | `/var/lib/athena/<env>/backups/` | athena | last 10 per env |
-| `/var/lib/athena/<env>/state.json` | root | written by deploy-gate: `{"digest":..., "version":..., "deployed_at":...}` |
+| `/var/lib/athena/gate/<env>.state.json` | root, 0644 (dir root 0755) | written by deploy-gate, outside the athena-writable `<env>/` dir because `promote` trusts it: `{"digest":..., "version":..., "deployed_at":...}` |
 | `/var/lib/athena/otel/{traces,logs}.jsonl` | otelcol | collector file export, rotated |
 | `/var/lib/openobserve/` | openobserve | OpenObserve data |
 
 **Users**
 - `athena` (system user) runs the services.
 - `deploy` (system user with a shell) is used only through forced-command SSH keys.
-- sudoers: `deploy ALL=(root) NOPASSWD: /opt/athena/bin/deploy-gate *`
+- sudoers: `deploy ALL=(root) NOPASSWD: /opt/athena/bin/deploy-gate *`, plus
+  `Defaults!/opt/athena/bin/deploy-gate env_keep += "SSH_ORIGINAL_COMMAND"`
+  (sudo's `env_reset` drops it otherwise, and every CI command is rejected).
+- `/var/lib/athena` itself is root-owned 0755; `<env>/` under it is athena's.
 
 **Ports** (all bound to the VM's tailnet IP unless noted)
 
@@ -160,7 +164,7 @@ with `rejected: ...` on stderr before any side effect.
 9. `systemctl start athena-serve@staging`, then poll
    `http://<ATHENA_ADDR>/health` and `/version` for up to 60 s.
 10. Start telegram if its unit is enabled for that env.
-11. Write `state.json`, then prune releases.
+11. Write `state.json` (`/var/lib/athena/gate/<env>.state.json`), then prune releases.
 
 On a failed health check it puts the previous `current` back, restarts, and exits 1.
 
