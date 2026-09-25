@@ -2,8 +2,7 @@
 
 use anyhow::Result;
 use athena::service::Service;
-use athena::shutdown::Signals;
-use athena::{agent, cli, dotenv, http, store, telegram};
+use athena::{agent, cli, dotenv, http, shutdown, store, telegram};
 use std::sync::Arc;
 
 fn main() -> Result<()> {
@@ -26,7 +25,7 @@ async fn run() -> Result<()> {
     if args.first().is_some_and(|a| a == "serve") {
         // Up front: a server without a key would fail every turn.
         let agent = agent::build(&agent::client()?, &model, service.memory());
-        let stop = Signals::listen()?.waiter();
+        let stop = shutdown::listen()?;
         return http::run(&args[1..], Arc::new(service), Arc::new(agent), stop).await;
     }
     let make_agent = || Ok(agent::build(&agent::client()?, &model, service.memory()));

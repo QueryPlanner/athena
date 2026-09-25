@@ -27,7 +27,7 @@
 use crate::agent;
 use crate::runner::Run;
 use crate::service::{self, Service, Session, User};
-use crate::shutdown::Signals;
+use crate::shutdown;
 use crate::store::{self, Store};
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
@@ -35,7 +35,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
-use teloxide::dispatching::{DefaultKey, Dispatcher, UpdateFilterExt};
+use teloxide::dispatching::{DefaultKey, Dispatcher, ShutdownToken, UpdateFilterExt};
 use teloxide::prelude::{Requester, Update};
 use teloxide::types::{BotCommand, ChatAction, ChatId, Message};
 use teloxide::update_listeners::Polling;
@@ -736,8 +736,8 @@ where
 pub type TelegramDispatcher = Dispatcher<Bot, Infallible, DefaultKey>;
 
 /// The teloxide dispatcher for `app`. Messages go to [`Telegram::handle`];
-/// other updates are logged. Stop it with its `shutdown_token()`, as
-/// [`serve_until_stopped`] does on a stop signal.
+/// other updates are logged. Stop it with its `shutdown_token()`: `main`
+/// does that on SIGINT or SIGTERM, tests do it directly.
 pub fn dispatcher<R: Run + 'static>(bot: Bot, app: Arc<Telegram<R>>) -> TelegramDispatcher {
     let log = app.log.clone();
     let handler = Update::filter_message().endpoint(on_message::<R>);
@@ -748,6 +748,24 @@ pub fn dispatcher<R: Run + 'static>(bot: Bot, app: Arc<Telegram<R>>) -> Telegram
             async move { log(&format!("ignoring update {}: not a message", update.id.0)) }
         });
     builder.build()
+}
+
+/// Shut the dispatcher down on the first stop signal from `stop` that
+/// arrives while it is polling; `serve` then waits for the turns in flight.
+/// This is what teloxide's own Ctrl-C handler does, for SIGTERM too. A
+/// signal before polling has started is ignored.
+pub fn stop_on<F: Future<Output = ()> + Send + 'static>(
+    token: ShutdownToken,
+    stop: impl Fn() -> F + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            stop().await;
+            if token.shutdown().is_ok() {
+                break;
+            }
+        }
+    })
 }
 
 async fn on_message<R: Run + 'static>(
@@ -804,40 +822,10 @@ pub async fn serve<R: Run + 'static>(
     Ok(())
 }
 
-/// [`serve`] until the first stop signal, then stop gracefully: no new
-/// updates, and the turns in flight finish and reply. A signal before
-/// polling has started stops at once, since nothing is in flight yet. A
-/// second signal quits without waiting for the turns in flight, as `serve`
-/// does in http.rs.
-pub async fn serve_until_stopped<R: Run + 'static, F: Future<Output = ()>>(
-    dispatcher: &mut TelegramDispatcher,
-    bot: Bot,
-    app: &Telegram<R>,
-    stop: impl Fn() -> F,
-) -> Result<()> {
-    let token = dispatcher.shutdown_token();
-    let served = serve(dispatcher, bot, app);
-    tokio::pin!(served);
-    tokio::select! {
-        result = &mut served => return result,
-        () = stop() => {}
-    }
-    if token.shutdown().is_err() {
-        (app.log)("stopped before polling started");
-        return Ok(());
-    }
-    (app.log)("stopping after the turns in flight; signal again (Ctrl-C) to quit now");
-    tokio::select! {
-        result = served => result,
-        () = stop() => bail!("stopped twice; quit without waiting for the turns in flight"),
-    }
-}
-
 /// `athena telegram`, wired to the environment: the token, the database,
 /// OpenRouter. Every setting is checked before the database is opened.
 pub async fn main(model: &str) -> Result<()> {
-    // First, so a stop signal during startup never takes the default action.
-    let signals = Signals::listen()?;
+    let stop = shutdown::listen()?;
     let config = Config::from_env()?;
     let client = agent::client()?;
     let store = Store::open(&store::path())?;
@@ -851,8 +839,9 @@ pub async fn main(model: &str) -> Result<()> {
     ));
     let bot = config.bot();
     let mut dispatcher = dispatcher(bot.clone(), app.clone());
+    stop_on(dispatcher.shutdown_token(), stop);
     log_to_stderr("polling for messages; Ctrl-C or SIGTERM stops");
-    serve_until_stopped(&mut dispatcher, bot, &app, signals.waiter()).await
+    serve(&mut dispatcher, bot, &app).await
 }
 
 #[cfg(test)]

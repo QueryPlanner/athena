@@ -239,20 +239,3 @@ pub fn mock_agent_with_memory(
     let builder = AgentBuilder::new(model.clone()).memory(memory);
     (agent::configure(builder), model)
 }
-
-/// Interrupts a test sends by hand, standing in for SIGINT or
-/// SIGTERM. Each call of the returned function waits for the next one.
-pub fn interrupts() -> (
-    tokio::sync::mpsc::UnboundedSender<()>,
-    impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
-) {
-    let (send, receive) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let receive = Arc::new(tokio::sync::Mutex::new(receive));
-    let next = move || {
-        let receive = receive.clone();
-        Box::pin(async move {
-            receive.lock().await.recv().await;
-        }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
-    };
-    (send, next)
-}

@@ -699,6 +699,22 @@ async fn a_turn_that_panics_mid_stream_still_ends_the_stream_with_an_error_event
 
 // ---- the server ----
 
+/// Interrupts a test sends by hand, standing in for Ctrl-C.
+fn interrupts() -> (
+    mpsc::UnboundedSender<()>,
+    impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+) {
+    let (send, receive) = mpsc::unbounded_channel::<()>();
+    let receive = Arc::new(tokio::sync::Mutex::new(receive));
+    let next = move || {
+        let receive = receive.clone();
+        Box::pin(async move {
+            receive.lock().await.recv().await;
+        }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    };
+    (send, next)
+}
+
 /// Send a raw HTTP/1.1 request that asks the server to close afterwards.
 async fn send_raw(
     addr: std::net::SocketAddr,

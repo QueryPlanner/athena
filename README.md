@@ -49,9 +49,7 @@ malformed `.env` stops `athena` before it touches the database.
 
 `athena serve` and `athena telegram` stop the same way on SIGINT (Ctrl-C)
 and SIGTERM (`kill`, `docker stop`, systemd): they take no new work, let the
-turns in flight finish and reply, then exit 0. A second signal quits at once
-and exits non-zero, losing the turns still running. A signal before the bot
-has started polling stops it straight away. In a container, run `athena`
+turns in flight finish and reply, then exit 0. In a container, run `athena`
 directly (exec-form `CMD ["athena", "serve"]`, or `docker run --init`): a
 shell wrapper as PID 1 does not pass SIGTERM on.
 
@@ -381,7 +379,9 @@ fatal: losing a cost row must never cost you a reply.
   messages that were queued, and a reply whose send fails is lost even
   though its transcript is saved.
 - Stopping takes as long as the slowest turn in flight, and for the bot up
-  to one more long poll (10 s). Docker waits 10 s and systemd 90 s before
+  to one more long poll (10 s). A second signal quits `serve` at once; the
+  bot ignores it, and ignores a signal that arrives before it starts
+  polling. Docker waits 10 s and systemd 90 s before
   SIGKILL, which cannot be caught and loses those turns: raise the grace
   period (`docker stop -t`, `stop_grace_period`, `TimeoutStopSec`) to cover
   a slow tool-using turn.
