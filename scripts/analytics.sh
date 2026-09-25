@@ -55,8 +55,10 @@ done
 
 [ -n "$QUERY" ] || { usage >&2; exit 2; }
 [[ "$ENV_NAME" =~ ^(staging|prod)$ ]] || { echo "analytics: --env must be staging or prod" >&2; exit 2; }
-[[ "$QUERY" =~ ^[a-z0-9_]+$ ]] && [ -f "$QUERIES/$QUERY.sql" ] ||
-    { echo "analytics: no query '$QUERY'; see --list" >&2; exit 2; }
+if ! [[ "$QUERY" =~ ^[a-z0-9_]+$ && -f "$QUERIES/$QUERY.sql" ]]; then
+    echo "analytics: no query '$QUERY'; see --list" >&2
+    exit 2
+fi
 [ -n "$DB" ] || DB=/var/lib/athena/$ENV_NAME/agent.db
 
 WORK=$(mktemp -d)

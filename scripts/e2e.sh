@@ -161,7 +161,9 @@ expect "its run starts at seq 0" "$(q "SELECT first_seq FROM runs WHERE session_
 expect "another user starts with no sessions" "$(athena --user telegram:e2e sessions)" ""
 athena --user telegram:e2e notes "Say hi in one word." >/dev/null
 THEIRS=$(sid notes telegram e2e)
-[ -n "$THEIRS" ] && [ "$THEIRS" != "$NOTES" ] || fail "the same name is a different session for another user"
+if [ -z "$THEIRS" ] || [ "$THEIRS" = "$NOTES" ]; then
+    fail "the same name is a different session for another user"
+fi
 pass "the same name is a different session for another user"
 expect "their session holds only their own turn" "$(messages_in "$THEIRS")" "2"
 expect "the cli user's session was not touched" "$(messages_in "$NOTES")" "2"
