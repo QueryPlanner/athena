@@ -287,6 +287,16 @@ const MIGRATIONS: &[&str] = &[
      CREATE TRIGGER messages_keep_a_session BEFORE UPDATE OF session_id ON messages
      WHEN NOT EXISTS (SELECT 1 FROM sessions WHERE id = NEW.session_id)
      BEGIN SELECT RAISE(ABORT, 'no such session'); END;",
+    // 4: the session each user is currently talking in, for transports that
+    // keep a conversation going across messages (Telegram). At most one per
+    // user. Nothing enforces here that the session is the user's own:
+    // `Store::select_session` only writes one that is, and
+    // `Store::selected_session` only reads one that is.
+    "CREATE TABLE selected_sessions (
+         user_id     INTEGER NOT NULL PRIMARY KEY REFERENCES users (id),
+         session_id  TEXT NOT NULL REFERENCES sessions (id),
+         selected_at INTEGER NOT NULL
+     );",
 ];
 
 /// The schema version this build writes.
@@ -322,6 +332,10 @@ const EXPECTED_COLUMNS: &[(&str, &[&str])] = &[
     ("runs", RUN_COLUMNS),
     ("users", &["id", "transport", "external_id", "created_at"]),
     ("sessions", &["id", "user_id", "name", "created_at"]),
+    (
+        "selected_sessions",
+        &["user_id", "session_id", "selected_at"],
+    ),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -621,6 +635,34 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// Make `session_id` the session `user` is talking in. Returns false,
+    /// and changes nothing, unless `user` owns that session.
+    pub fn select_session(&self, user: &User, session_id: &str) -> Result<bool> {
+        let changed = self.db().execute(
+            "INSERT INTO selected_sessions (user_id, session_id, selected_at)
+             SELECT user_id, id, ?3 FROM sessions WHERE id = ?2 AND user_id = ?1
+             ON CONFLICT (user_id) DO UPDATE
+             SET session_id = excluded.session_id, selected_at = excluded.selected_at",
+            rusqlite::params![user.id, session_id, now_millis()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// The session `user` last selected, if any and if it is still theirs.
+    pub fn selected_session(&self, user: &User) -> Result<Option<Session>> {
+        Ok(self
+            .db()
+            .query_row(
+                "SELECT s.id, s.name, s.created_at
+                 FROM selected_sessions AS c
+                 JOIN sessions AS s ON s.id = c.session_id AND s.user_id = c.user_id
+                 WHERE c.user_id = ?1",
+                [user.id],
+                session_row,
+            )
+            .optional()?)
+    }
+
     /// A session's transcript, oldest first. Does not check ownership:
     /// callers look the session up through [`Store::session`] first.
     pub(crate) fn load(&self, session_id: &str) -> Result<Vec<Message>> {
@@ -889,7 +931,10 @@ mod tests {
         drop(db);
         drop(store);
         let _ = std::fs::remove_file(&path);
-        assert_eq!(tables, ["messages", "runs", "sessions", "users"]);
+        assert_eq!(
+            tables,
+            ["messages", "runs", "selected_sessions", "sessions", "users"]
+        );
         assert!(fk);
     }
 
@@ -1268,7 +1313,8 @@ mod tests {
             .db()
             .execute_batch(
                 "PRAGMA foreign_keys = OFF;
-                 DROP TABLE runs; DROP TABLE messages; DROP TABLE sessions; DROP TABLE users;",
+                 DROP TABLE runs; DROP TABLE messages; DROP TABLE selected_sessions;
+                 DROP TABLE sessions; DROP TABLE users;",
             )
             .unwrap();
         assert!(store.sessions(&user).is_err());
@@ -1277,12 +1323,59 @@ mod tests {
         assert!(store.open_session(&user, "s").is_err());
         assert!(store.create_session(&user, "t").is_err());
         assert!(store.user("cli", "local").is_err());
+        assert!(store.select_session(&user, &id).is_err());
+        assert!(store.selected_session(&user).is_err());
         assert!(store.load(&id).is_err());
         assert!(store.next_seq(&id).is_err());
         assert!(matches!(
             store.append(&id, None, &[]),
             Err(AppendError::Storage(_))
         ));
+    }
+
+    #[test]
+    fn a_user_can_select_only_their_own_session_and_reselect_later() {
+        let store = store();
+        let user = store.user("telegram", "1").unwrap();
+        let stranger = store.user("telegram", "2").unwrap();
+        let a = store.open_session(&user, "a").unwrap();
+        let b = store.open_session(&user, "b").unwrap();
+        let theirs = store.open_session(&stranger, "a").unwrap();
+
+        assert_eq!(store.selected_session(&user).unwrap(), None);
+        assert!(store.select_session(&user, &a.id).unwrap());
+        assert_eq!(store.selected_session(&user).unwrap(), Some(a));
+        assert!(store.select_session(&user, &b.id).unwrap());
+        assert_eq!(store.selected_session(&user).unwrap(), Some(b.clone()));
+
+        // Someone else's session and a missing one change nothing.
+        assert!(!store.select_session(&user, &theirs.id).unwrap());
+        assert!(!store.select_session(&user, "no-such-id").unwrap());
+        assert_eq!(store.selected_session(&user).unwrap(), Some(b));
+        assert_eq!(store.selected_session(&stranger).unwrap(), None);
+        let rows: i64 = store
+            .db()
+            .query_row("SELECT COUNT(*) FROM selected_sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn a_selection_pointing_at_another_users_session_is_never_read() {
+        // Only a raw write can make one; the read must still not follow it.
+        let store = store();
+        let user = store.user("telegram", "1").unwrap();
+        let stranger = store.user("telegram", "2").unwrap();
+        let theirs = store.open_session(&stranger, "secret").unwrap();
+        store
+            .db()
+            .execute(
+                "INSERT INTO selected_sessions VALUES (?1, ?2, 0)",
+                rusqlite::params![user.id(), theirs.id],
+            )
+            .unwrap();
+
+        assert_eq!(store.selected_session(&user).unwrap(), None);
     }
 
     #[test]

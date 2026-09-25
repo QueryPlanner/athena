@@ -22,6 +22,7 @@ fn from_fixture(sql: &str) -> TempDb {
 const V0_MAIN: &str = include_str!("fixtures/v0_main.sql");
 const V0_RUN_OBSERVABILITY: &str = include_str!("fixtures/v0_run_observability.sql");
 const V2_RUN_TELEMETRY: &str = include_str!("fixtures/v2_run_telemetry.sql");
+const V3_USERS_SESSIONS: &str = include_str!("fixtures/v3_users_sessions.sql");
 
 /// Every row of a table, every column, in rowid order, as SQLite holds it.
 fn dump(db: &Connection, table: &str) -> Vec<Vec<Value>> {
@@ -168,9 +169,62 @@ async fn a_database_at_schema_2_gains_owners_without_changing_a_row() {
     assert_eq!(runs(&db, "broken").last().unwrap(), &run_row(0, 1, 1, "ok"));
 }
 
+/// The upgrade this build adds: main at 040beeb, schema version 3, users
+/// and sessions, two of them Telegram users. Migration 4 only adds
+/// `selected_sessions`; every existing row of every table must survive it.
+#[tokio::test]
+async fn a_database_at_schema_3_gains_session_selection_without_changing_a_row() {
+    const TABLES: [&str; 4] = ["messages", "runs", "users", "sessions"];
+    let tmp = from_fixture(V3_USERS_SESSIONS);
+    let before: Vec<Vec<Vec<Value>>> = {
+        let db = tmp.raw();
+        assert_eq!(user_version(&db), 3);
+        TABLES.iter().map(|t| dump(&db, t)).collect()
+    };
+    let sizes: Vec<usize> = before.iter().map(Vec::len).collect();
+    assert_eq!(sizes, [14, 3, 3, 6]);
+
+    let (service, _) = tmp.service();
+    let db = tmp.raw();
+
+    // Every row of every table, every column and rowid, as it was.
+    assert_eq!(user_version(&db), store::SCHEMA_VERSION as i64);
+    let after: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
+    assert_eq!(after, before);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM selected_sessions"), 0);
+
+    // An existing Telegram user selects an existing session and talks in it.
+    let store = tmp.open();
+    let user = service.user("telegram", "111111").await.unwrap();
+    let notes = session(&service, &user, "notes").await;
+    assert!(store.select_session(&user, &notes.id).unwrap());
+    assert_eq!(store.selected_session(&user).unwrap(), Some(notes.clone()));
+    let (agent, _) = mock_agent(&service, [MockTurn::text("noted")]);
+    service
+        .send(&agent, &user, &notes.id, "hello")
+        .await
+        .unwrap();
+
+    // The old rows are still exactly as they were; only new ones were added.
+    let now: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
+    for ((table, old), new) in TABLES.iter().zip(&before).zip(&now) {
+        assert_eq!(&new[..old.len()], &old[..], "{table}");
+    }
+    assert_eq!(now[0].len(), 16);
+    assert_eq!(runs(&db, &notes.id), [run_row(0, 1, 1, "ok")]);
+    // The cli user's migrated sessions are untouched and still theirs.
+    assert_eq!(
+        owners(&db)
+            .into_iter()
+            .filter(|o| o.2 == "cli:local")
+            .collect::<Vec<_>>(),
+        owned_by_cli(&["broken", "research", "testsess"])
+    );
+}
+
 #[test]
 fn reopening_a_current_database_changes_nothing() {
-    let tmp = from_fixture(V2_RUN_TELEMETRY);
+    let tmp = from_fixture(V3_USERS_SESSIONS);
     drop(tmp.open());
     let first = describe_schema(&tmp.raw());
     let rows = dump(&tmp.raw(), "messages");

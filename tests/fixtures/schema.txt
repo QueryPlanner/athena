@@ -1,4 +1,4 @@
-user_version 3
+user_version 4
 
 table messages
   session_id TEXT NOT NULL PK1
@@ -28,6 +28,13 @@ table runs
   foreign key session_id REFERENCES sessions (id)
   index runs_by_session (session_id, started_at) from c
   unique index (run_id) from pk
+
+table selected_sessions
+  user_id INTEGER NOT NULL PK1
+  session_id TEXT NOT NULL
+  selected_at INTEGER NOT NULL
+  foreign key session_id REFERENCES sessions (id)
+  foreign key user_id REFERENCES users (id)
 
 table sessions
   id TEXT NOT NULL PK1
