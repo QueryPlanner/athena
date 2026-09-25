@@ -70,8 +70,10 @@ mem_total_mb=""; mem_avail_mb=""
 if [ -r /proc/meminfo ]; then
     mem_total_mb=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo)
     mem_avail_mb=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo)
-    [ "${mem_avail_mb:-0}" -ge 1100 ] ||
-        WARNINGS+=("only ${mem_avail_mb} MB available; Athena x2 + otelcol + OpenObserve can use up to ~1.8 GB at their MemoryMax caps")
+    # MemoryMax caps: athena-serve x2 + athena-telegram@prod + OpenObserve at
+    # 512M each, otelcol-contrib at 256M.
+    [ "${mem_avail_mb:-0}" -ge 2304 ] ||
+        WARNINGS+=("only ${mem_avail_mb} MB available; Athena's services can use up to 2304 MB at their MemoryMax caps (serve x2, telegram and OpenObserve at 512M, otelcol at 256M); if the host runs out, the kernel OOM-kills its largest process, which may be another app")
 fi
 disk_free_mb=$(df -Pm / 2>/dev/null | awk 'NR==2 {print $4}')
 [ "${disk_free_mb:-0}" -ge 2048 ] || WARNINGS+=("under 2 GB free on /; deploy-gate refuses deploys under 1 GB")
