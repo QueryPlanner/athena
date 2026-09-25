@@ -31,12 +31,12 @@ pub use sys::{Cmd, Output, RealSystem, Request, Response, System};
 
 use serde_json::{Value, json};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::os::unix::fs::{OpenOptionsExt, chown};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The system user the services run as. Binaries from a release are only
 /// ever executed as this user, never as root.
@@ -45,6 +45,9 @@ pub const ATHENA_USER: &str = "athena";
 pub const MIN_FREE_BYTES: u64 = 1 << 30;
 pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// How long a held lock is retried before it counts as another gate.
+const LOCK_WAIT: Duration = Duration::from_secs(1);
+const LOCK_RETRY: Duration = Duration::from_millis(10);
 /// How long one health or version request may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -237,9 +240,24 @@ impl<'a> Gate<'a> {
             .write(true)
             .open(&path)
             .context(&what)?;
-        file.try_lock()
-            .map_err(|e| failed(format!("{what}: {e} (another deploy-gate is running)")))?;
-        Ok(file)
+        // A child process that any thread spawns shares this open file
+        // until its exec closes it, so a lock just released elsewhere can
+        // look held for a moment. Only contention that outlasts
+        // LOCK_WAIT is another deploy-gate.
+        let started = Instant::now();
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(TryLockError::WouldBlock) if started.elapsed() < LOCK_WAIT => {
+                    std::thread::sleep(LOCK_RETRY);
+                }
+                Err(e) => {
+                    return Err(failed(format!(
+                        "{what}: {e} (another deploy-gate is running)"
+                    )));
+                }
+            }
+        }
     }
 
     fn check_disk(&self) -> Result<()> {
@@ -505,6 +523,29 @@ mod tests {
             (code, &out["command"], &out["restored"]),
             (0, &json!("restore"), &json!("20260901T000000Z.db"))
         );
+    }
+
+    /// Regression: a process spawned by another thread briefly shares the
+    /// lock file's open description (until its exec closes it), and with it
+    /// the flock. A released lock must not look held because of that.
+    #[test]
+    fn a_child_spawned_by_another_thread_does_not_make_the_lock_look_held() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let vm = Vm::new();
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    std::process::Command::new("/usr/bin/true")
+                        .status()
+                        .unwrap();
+                }
+            });
+            let gate = vm.gate();
+            let failures = (0..2000).filter(|_| gate.lock().is_err()).count();
+            stop.store(true, Ordering::Relaxed);
+            assert_eq!(failures, 0);
+        });
     }
 
     #[test]
