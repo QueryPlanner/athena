@@ -27,6 +27,7 @@
 use crate::agent;
 use crate::runner::Run;
 use crate::service::{self, Service, Session, User};
+use crate::shutdown::Signals;
 use crate::store::{self, Store};
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
@@ -735,13 +736,9 @@ where
 pub type TelegramDispatcher = Dispatcher<Bot, Infallible, DefaultKey>;
 
 /// The teloxide dispatcher for `app`. Messages go to [`Telegram::handle`];
-/// other updates are logged. With `ctrlc`, Ctrl-C (SIGINT) shuts it down
-/// gracefully; tests stop it with its `shutdown_token()` instead.
-pub fn dispatcher<R: Run + 'static>(
-    bot: Bot,
-    app: Arc<Telegram<R>>,
-    ctrlc: bool,
-) -> TelegramDispatcher {
+/// other updates are logged. Stop it with its `shutdown_token()`, as
+/// [`serve_until_stopped`] does on a stop signal.
+pub fn dispatcher<R: Run + 'static>(bot: Bot, app: Arc<Telegram<R>>) -> TelegramDispatcher {
     let log = app.log.clone();
     let handler = Update::filter_message().endpoint(on_message::<R>);
     let builder = Dispatcher::builder(bot, handler)
@@ -750,11 +747,7 @@ pub fn dispatcher<R: Run + 'static>(
             let log = log.clone();
             async move { log(&format!("ignoring update {}: not a message", update.id.0)) }
         });
-    if ctrlc {
-        builder.enable_ctrlc_handler().build()
-    } else {
-        builder.build()
-    }
+    builder.build()
 }
 
 async fn on_message<R: Run + 'static>(
@@ -811,9 +804,40 @@ pub async fn serve<R: Run + 'static>(
     Ok(())
 }
 
+/// [`serve`] until the first stop signal, then stop gracefully: no new
+/// updates, and the turns in flight finish and reply. A signal before
+/// polling has started stops at once, since nothing is in flight yet. A
+/// second signal quits without waiting for the turns in flight, as `serve`
+/// does in http.rs.
+pub async fn serve_until_stopped<R: Run + 'static, F: Future<Output = ()>>(
+    dispatcher: &mut TelegramDispatcher,
+    bot: Bot,
+    app: &Telegram<R>,
+    stop: impl Fn() -> F,
+) -> Result<()> {
+    let token = dispatcher.shutdown_token();
+    let served = serve(dispatcher, bot, app);
+    tokio::pin!(served);
+    tokio::select! {
+        result = &mut served => return result,
+        () = stop() => {}
+    }
+    if token.shutdown().is_err() {
+        (app.log)("stopped before polling started");
+        return Ok(());
+    }
+    (app.log)("stopping after the turns in flight; signal again (Ctrl-C) to quit now");
+    tokio::select! {
+        result = served => result,
+        () = stop() => bail!("stopped twice; quit without waiting for the turns in flight"),
+    }
+}
+
 /// `athena telegram`, wired to the environment: the token, the database,
 /// OpenRouter. Every setting is checked before the database is opened.
 pub async fn main(model: &str) -> Result<()> {
+    // First, so a stop signal during startup never takes the default action.
+    let signals = Signals::listen()?;
     let config = Config::from_env()?;
     let client = agent::client()?;
     let store = Store::open(&store::path())?;
@@ -826,9 +850,9 @@ pub async fn main(model: &str) -> Result<()> {
         Arc::new(log_to_stderr),
     ));
     let bot = config.bot();
-    let mut dispatcher = dispatcher(bot.clone(), app.clone(), true);
-    log_to_stderr("polling for messages; Ctrl-C stops");
-    serve(&mut dispatcher, bot, &app).await
+    let mut dispatcher = dispatcher(bot.clone(), app.clone());
+    log_to_stderr("polling for messages; Ctrl-C or SIGTERM stops");
+    serve_until_stopped(&mut dispatcher, bot, &app, signals.waiter()).await
 }
 
 #[cfg(test)]

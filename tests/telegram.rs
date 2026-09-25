@@ -63,7 +63,7 @@ struct Running {
 
 async fn run<R: Run + 'static>(api: &FakeApi, app: Arc<Telegram<R>>) -> Running {
     let bot = bot(&api.url);
-    let mut dispatcher = telegram::dispatcher(bot.clone(), app.clone(), false);
+    let mut dispatcher = telegram::dispatcher(bot.clone(), app.clone());
     let stop = dispatcher.shutdown_token();
     let task = tokio::spawn(async move { telegram::serve(&mut dispatcher, bot, &app).await });
     // Polling has started once the first long poll arrives.
@@ -295,6 +295,119 @@ async fn shutdown_waits_for_a_turn_in_flight_to_reply() {
     assert_eq!(sessions(&tmp, "1"), [("default".to_string(), 2)]);
 }
 
+/// `serve_until_stopped` in a task, stopped by signals the test sends.
+fn until_stopped<R: Run + 'static>(
+    url: &str,
+    app: Arc<Telegram<R>>,
+) -> (
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+    mpsc::UnboundedSender<()>,
+) {
+    let (signal, next) = interrupts();
+    let bot = bot(url);
+    let mut dispatcher = telegram::dispatcher(bot.clone(), app.clone());
+    let task = tokio::spawn(async move {
+        telegram::serve_until_stopped(&mut dispatcher, bot, &app, next).await
+    });
+    (task, signal)
+}
+
+async fn final_poll(api: &FakeApi) {
+    // Polling stops with a last getUpdates that asks for nothing new.
+    api.wait_for("the final getUpdates", |calls| {
+        calls
+            .iter()
+            .any(|c| c.method == "getUpdates" && c.body["timeout"] == 0)
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_signal_ends_polling_and_lets_the_turn_in_flight_reply() {
+    let tmp = TempDb::new();
+    let api = FakeApi::start().await;
+    let gate = Arc::new(Semaphore::new(0));
+    let (started, mut starts) = mpsc::unbounded_channel();
+    let (app, logged) = app(&tmp, |s| Parked {
+        inner: mock_agent(s, [MockTurn::text("finished anyway")]).0,
+        started,
+        gate: gate.clone(),
+    });
+    let (task, signal) = until_stopped(&api.url, app);
+    polls(&api, 1).await;
+
+    api.push(text_from(1, "long job"));
+    starts.recv().await.unwrap();
+    signal.send(()).unwrap();
+    final_poll(&api).await;
+    assert!(!task.is_finished(), "stopped with a turn still running");
+    gate.add_permits(1);
+    task.await.unwrap().unwrap();
+
+    let sent = api.calls_to("sendMessage");
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].text(), "finished anyway");
+    assert_eq!(sessions(&tmp, "1"), [("default".to_string(), 2)]);
+    assert!(
+        logged
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("stopping after the turns in flight")),
+        "{logged:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_stop_signal_quits_without_waiting_for_turns_in_flight() {
+    let tmp = TempDb::new();
+    let api = FakeApi::start().await;
+    let gate = Arc::new(Semaphore::new(0));
+    let (started, mut starts) = mpsc::unbounded_channel();
+    let (app, _) = app(&tmp, |s| Parked {
+        inner: mock_agent(s, [MockTurn::text("never sent")]).0,
+        started,
+        gate: gate.clone(),
+    });
+    let (task, signal) = until_stopped(&api.url, app);
+    polls(&api, 1).await;
+
+    api.push(text_from(1, "long job"));
+    starts.recv().await.unwrap();
+    signal.send(()).unwrap();
+    final_poll(&api).await;
+    signal.send(()).unwrap();
+    // The turn is still parked, so only the second signal can end this.
+    let err = task.await.unwrap().unwrap_err();
+
+    assert!(err.to_string().contains("stopped twice"), "{err}");
+    assert!(api.calls_to("sendMessage").is_empty());
+    gate.add_permits(1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_signal_during_startup_stops_at_once() {
+    let tmp = TempDb::new();
+    // Accepts connections and never answers, so startup's first Bot API
+    // call (registering the command menu) waits for as long as the test
+    // lets it.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", silent.local_addr().unwrap());
+    let (app, logged) = app(&tmp, |s| mock_agent(s, []).0);
+    let (task, signal) = until_stopped(&url, app);
+
+    signal.send(()).unwrap();
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(30), task)
+        .await
+        .expect("a signal during startup did not stop the bot");
+
+    stopped.unwrap().unwrap();
+    assert_eq!(
+        logged.lock().unwrap().clone(),
+        ["stopped before polling started"]
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn bot_api_errors_are_logged_retried_or_survived() {
     let tmp = TempDb::new();
@@ -356,7 +469,7 @@ async fn a_refused_or_unreachable_api_fails_serve_without_leaking_the_token() {
     );
     let (refused, _) = app(&tmp, |s| mock_agent(s, []).0);
     let refused_bot = bot(&api.url);
-    let mut dispatcher = telegram::dispatcher(refused_bot.clone(), refused.clone(), false);
+    let mut dispatcher = telegram::dispatcher(refused_bot.clone(), refused.clone());
     let err = telegram::serve(&mut dispatcher, refused_bot, &refused)
         .await
         .unwrap_err();
@@ -372,7 +485,7 @@ async fn a_refused_or_unreachable_api_fails_serve_without_leaking_the_token() {
     };
     let (unreachable, logged) = app(&tmp, |s| mock_agent(s, []).0);
     let bot = bot(&closed);
-    let mut dispatcher = telegram::dispatcher(bot.clone(), unreachable.clone(), false);
+    let mut dispatcher = telegram::dispatcher(bot.clone(), unreachable.clone());
     let err = telegram::serve(&mut dispatcher, bot, &unreachable)
         .await
         .unwrap_err();
@@ -404,10 +517,14 @@ fn start_binary(dir: &WorkDir, tmp: &TempDb, api: &FakeApi) -> Child {
         .unwrap()
 }
 
-/// Ctrl-C the process and return its stderr once it has exited cleanly.
-async fn interrupt(child: Child) -> String {
+/// Send the process `signal` (`INT` for Ctrl-C, `TERM` as `docker stop`
+/// and systemd do) and return its stderr once it has exited cleanly.
+async fn stop(child: Child, signal: &str) -> String {
     let pid = child.id().to_string();
-    let status = Command::new("kill").args(["-INT", &pid]).status().unwrap();
+    let status = Command::new("kill")
+        .args([&format!("-{signal}"), &pid])
+        .status()
+        .unwrap();
     assert!(status.success());
     let out = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap())
         .await
@@ -436,7 +553,7 @@ async fn the_binary_serves_commands_and_remembers_the_session_across_a_restart()
     api.push(text_from(77, "/new notes"));
     api.push(text_from(77, "/switch work"));
     let first = api.messages_to(77, 3).await;
-    let stderr = interrupt(child).await;
+    let stderr = stop(child, "TERM").await;
 
     assert_eq!(first[2], "Switched to `work` (0 messages).");
     assert!(stderr.contains("polling for messages"), "{stderr}");
@@ -449,7 +566,7 @@ async fn the_binary_serves_commands_and_remembers_the_session_across_a_restart()
     polls(&api, before + 1).await;
     api.push(text_from(77, "/sessions"));
     let all = api.messages_to(77, 4).await;
-    interrupt(child).await;
+    stop(child, "INT").await;
 
     assert_eq!(
         all[3],
