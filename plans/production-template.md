@@ -319,7 +319,7 @@ so it is easy to find, back up, or remove.
 | `/etc/athena/{staging,prod}.env` | secrets, 0600 root | – |
 | `/var/lib/athena/{staging,prod}/agent.db` | SQLite (WAL) | – |
 | `/var/lib/athena/{staging,prod}/backups/` | pre-deploy DB backups | the last 10 per env. `deploy-gate` refuses to deploy when free disk is under 1 GB. |
-| `/var/lib/athena/{staging,prod}/telemetry/` | Athena's own `traces-`/`logs-YYYYMMDD.jsonl`, one file per signal per UTC day | `ATHENA_TELEMETRY_RETENTION_DAYS`, default 30 |
+| `/var/lib/athena/{staging,prod}/telemetry/` | Athena's own `traces-`/`logs-<role>-YYYYMMDD.jsonl`, one file per signal per process per UTC day | `ATHENA_TELEMETRY_RETENTION_DAYS`, default 30 |
 
 `setup-host.sh --uninstall` stops the units and removes the three roots. It removes
 the DB only with `--purge`.

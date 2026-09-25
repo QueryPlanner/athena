@@ -45,7 +45,7 @@ Rules for `serve` and `telegram`:
 | `ATHENA_SANDBOX_TIMEOUT_SECS` | agent | default `1800`, minimum 60 |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | all | OTLP/HTTP base URL; on the VM OpenObserve, `http://<tailnet-ip>:5080/api/default` (`/v1/traces` and `/v1/logs` are appended). **Unset means no OTLP export.** |
 | `OTEL_EXPORTER_OTLP_HEADERS` | all | `Authorization=Basic%20<base64 of OpenObserve root email:password>`, written by `setup-host.sh` into the env file only |
-| `ATHENA_TELEMETRY_DIR` | all | e.g. `/var/lib/athena/<env>/telemetry`: daily `traces-YYYYMMDD.jsonl` and `logs-YYYYMMDD.jsonl`. **Unset means no files.** With neither this nor the endpoint, telemetry is off and logs go to stderr only. |
+| `ATHENA_TELEMETRY_DIR` | all | e.g. `/var/lib/athena/<env>/telemetry`: daily `traces-<role>-YYYYMMDD.jsonl` and `logs-<role>-YYYYMMDD.jsonl`, `<role>` being the process (`serve`, `telegram`, `cli`), so every file has one writer. **Unset means no files.** With neither this nor the endpoint, telemetry is off and logs go to stderr only. |
 | `ATHENA_TELEMETRY_RETENTION_DAYS` | all | default `30`; files of older days are deleted |
 | `OTEL_SERVICE_NAME` | all | default `athena` |
 | `ATHENA_RECORD_CONTENT` | all | `1` records prompt and response content on spans. Default off. Ignored when `ATHENA_ENV=prod`. |
@@ -91,7 +91,7 @@ The sandbox image is a separate Docker image:
 | `/var/lib/athena/<env>/agent.db` | athena | the database |
 | `/var/lib/athena/<env>/backups/` | athena | last 10 per env |
 | `/var/lib/athena/gate/<env>.state.json` | root, 0644 (dir root 0755) | written by deploy-gate, outside the athena-writable `<env>/` dir because `promote` trusts it: `{"digest":..., "version":..., "deployed_at":...}` |
-| `/var/lib/athena/<env>/telemetry/{traces,logs}-YYYYMMDD.jsonl` | athena, dir 0750, files 0640 | Athena's own export (`ATHENA_TELEMETRY_DIR`), one file per signal per UTC day, pruned after `ATHENA_TELEMETRY_RETENTION_DAYS` |
+| `/var/lib/athena/<env>/telemetry/{traces,logs}-<role>-YYYYMMDD.jsonl` | athena, dir 0750, files 0640 | Athena's own export (`ATHENA_TELEMETRY_DIR`), one file per signal per process role (`serve`, `telegram`, `cli`) per UTC day, pruned after `ATHENA_TELEMETRY_RETENTION_DAYS` |
 | `/var/lib/openobserve/` | openobserve | OpenObserve data |
 
 **Users**

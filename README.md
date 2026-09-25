@@ -597,8 +597,10 @@ background thread.
   `OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic%20<base64 of user:password>`
   (`%20` is the space; values are URL-decoded). The other standard
   `OTEL_EXPORTER_OTLP_*` variables (timeout, per-signal endpoints) work too.
-- **JSON Lines files** when `ATHENA_TELEMETRY_DIR` is set: `traces-YYYYMMDD.jsonl`
-  and `logs-YYYYMMDD.jsonl`, one object per line, a new file each UTC day,
+- **JSON Lines files** when `ATHENA_TELEMETRY_DIR` is set:
+  `traces-<role>-YYYYMMDD.jsonl` and `logs-<role>-YYYYMMDD.jsonl`, where the
+  role is the process (`serve`, `telegram` or `cli`) so each file has exactly
+  one writer. One object per line, a new file each UTC day,
   files older than `ATHENA_TELEMETRY_RETENTION_DAYS` deleted. The schema is
   Athena's own and flat (`trace_id`, `span_id`, `parent_span_id`, `name`,
   `start_unix_nano`, `duration_ms`, `status`, `attributes`, `resource`, ...);

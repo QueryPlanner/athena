@@ -2,9 +2,13 @@
 //! (`analytics/queries/`).
 //!
 //! With `ATHENA_TELEMETRY_DIR` set, every exported batch is appended to
-//! `traces-YYYYMMDD.jsonl` or `logs-YYYYMMDD.jsonl` in that directory, named
-//! after the UTC day the batch was written. The first write of a day deletes
-//! files of that signal older than the retention: with 30 days, today's file
+//! `traces-<role>-YYYYMMDD.jsonl` or `logs-<role>-YYYYMMDD.jsonl` in that
+//! directory. `<role>` is the process ([`Role`]: `serve`, `telegram` or
+//! `cli`), so each file has exactly one writer even though prod's serve and
+//! telegram share the directory; the date is the UTC day the batch was
+//! written. The first write of a day deletes this signal's files older than
+//! the retention, whichever process wrote them (and files named
+//! `traces-YYYYMMDD.jsonl` by earlier versions): with 30 days, today's file
 //! and the 29 before it are kept.
 //!
 //! The schema is Athena's own and flat, not OTLP/JSON: one object per line.
@@ -33,12 +37,7 @@
 //! just before midnight UTC can land in the next day's file.
 //!
 //! Exporters run on the batch processors' own threads, so the blocking file
-//! writes never run on the async runtime. Each batch is written with one
-//! `write_all` to a file opened with `O_APPEND`: on a local Linux file system
-//! (ext4, xfs) that is one `write` call, which the kernel keeps whole, so
-//! prod's two processes (serve and telegram) can share a day's file without
-//! splitting each other's lines. POSIX does not promise it for every size
-//! and file system.
+//! writes never run on the async runtime.
 //!
 //! Pruning never costs data: a batch is written first, and a failed prune is
 //! reported as the export's error once, on the day's first write.
@@ -60,6 +59,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+pub use super::Role;
+
 /// Where the current time comes from; tests move it by hand.
 pub trait Clock: Send + Sync + Debug {
     fn now(&self) -> SystemTime;
@@ -75,9 +76,10 @@ impl Clock for SystemClock {
     }
 }
 
-/// The span and log exporters writing to one directory.
+/// The span and log exporters of process `role`, writing to one directory.
 pub fn exporters(
     dir: &Path,
+    role: Role,
     retention_days: NonZeroU32,
     clock: Arc<dyn Clock>,
 ) -> io::Result<super::Exporters<SpanFiles, LogFiles>> {
@@ -85,6 +87,7 @@ pub fn exporters(
     let files = |prefix| DailyFiles {
         dir: dir.to_path_buf(),
         prefix,
+        role,
         retention_days,
         clock: clock.clone(),
         open: Mutex::new(None),
@@ -101,11 +104,12 @@ pub fn exporters(
     })
 }
 
-/// Appends lines to `<prefix>-YYYYMMDD.jsonl`, one file per UTC day.
+/// Appends lines to `<prefix>-<role>-YYYYMMDD.jsonl`, one file per UTC day.
 #[derive(Debug)]
 struct DailyFiles {
     dir: PathBuf,
     prefix: &'static str,
+    role: Role,
     retention_days: NonZeroU32,
     clock: Arc<dyn Clock>,
     /// The day (days since the epoch) and file written to last.
@@ -123,9 +127,12 @@ impl DailyFiles {
         if !matches!(&*open, Some((day, _)) if *day == today) {
             // Yesterday's file closes here.
             *open = None;
-            let path = self
-                .dir
-                .join(format!("{}-{}.jsonl", self.prefix, date(today)));
+            let path = self.dir.join(format!(
+                "{}-{}-{}.jsonl",
+                self.prefix,
+                self.role.as_str(),
+                date(today)
+            ));
             let file = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -148,14 +155,16 @@ impl DailyFiles {
         Ok(())
     }
 
-    /// Delete `path` if it is this signal's file for a day before
-    /// `oldest_kept` (`YYYYMMDD`).
+    /// Delete `path` if it is this signal's file, from any process
+    /// (`<prefix>-<role>-YYYYMMDD.jsonl`) or from before roles were in the
+    /// name (`<prefix>-YYYYMMDD.jsonl`), for a day before `oldest_kept`.
     fn prune_entry(&self, path: &Path, oldest_kept: &str) -> io::Result<()> {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let dated = name
             .strip_prefix(self.prefix)
             .and_then(|rest| rest.strip_prefix('-'))
             .and_then(|rest| rest.strip_suffix(".jsonl"))
+            .map(|rest| rest.rsplit_once('-').map_or(rest, |(_, date)| date))
             .filter(|d| d.len() == 8 && d.bytes().all(|b| b.is_ascii_digit()));
         // YYYYMMDD strings sort like the dates they name.
         if dated.is_none_or(|d| d >= oldest_kept) {
@@ -495,14 +504,14 @@ mod tests {
     #[test]
     fn a_span_is_one_flat_json_line() {
         let dir = TempDir::new();
-        let mut files = exporters(&dir.0, days(30), FakeClock::at(NOON)).unwrap();
+        let mut files = exporters(&dir.0, Role::Serve, days(30), FakeClock::at(NOON)).unwrap();
         files.spans.set_resource(&resource());
         let failed = span("execute_tool", 0x00f0_67aa_0ba9_02b7, Status::error("boom"));
         let root = span("invoke_agent athena", 0, Status::Ok);
         let unset = span("chat", 1, Status::Unset);
         export_spans(&files.spans, vec![failed, root, unset]).unwrap();
 
-        let lines = dir.lines("traces-20260925.jsonl");
+        let lines = dir.lines("traces-serve-20260925.jsonl");
         assert_eq!(
             lines[0],
             json!({
@@ -577,7 +586,7 @@ mod tests {
     #[test]
     fn a_log_record_is_one_flat_json_line() {
         let dir = TempDir::new();
-        let files = exporters(&dir.0, days(30), FakeClock::at(NOON)).unwrap();
+        let files = exporters(&dir.0, Role::Serve, days(30), FakeClock::at(NOON)).unwrap();
         let provider = SdkLoggerProvider::builder()
             .with_resource(resource())
             .with_simple_exporter(files.logs)
@@ -600,7 +609,7 @@ mod tests {
         logger.emit(logger.create_log_record());
         provider.shutdown().unwrap();
 
-        let lines = dir.lines("logs-20260925.jsonl");
+        let lines = dir.lines("logs-serve-20260925.jsonl");
         assert_eq!(
             lines[0],
             json!({
@@ -639,16 +648,21 @@ mod tests {
     fn a_new_day_opens_a_new_file_and_prunes_files_past_the_retention() {
         let dir = TempDir::new();
         let clock = FakeClock::at(NOON);
-        let files = exporters(&dir.0, days(30), clock.clone()).unwrap();
+        let files = exporters(&dir.0, Role::Serve, days(30), clock.clone()).unwrap();
         let keep = [
-            "traces-20260827.jsonl", // 29 days before: inside 30 days
-            "logs-20200101.jsonl",   // another signal's file
-            "traces-2026082.jsonl",  // not a date
+            "traces-telegram-20260827.jsonl", // 29 days before: inside 30 days
+            "logs-serve-20200101.jsonl",      // another signal's file
+            "traces-serve-2026082.jsonl",     // not a date
             "traces-2026082x.jsonl",
             "traces.jsonl",
             "notes.txt",
         ];
-        let expired = ["traces-20260826.jsonl", "traces-19991231.jsonl"];
+        // Any process's, and the names from before roles.
+        let expired = [
+            "traces-telegram-20260826.jsonl",
+            "traces-cli-19991231.jsonl",
+            "traces-20260101.jsonl",
+        ];
         for name in keep.iter().chain(&expired) {
             fs::write(dir.0.join(name), "{}\n").unwrap();
         }
@@ -660,14 +674,14 @@ mod tests {
         export_spans(&files.spans, vec![span("a", 0, Status::Unset)]).unwrap();
         export_spans(&files.spans, vec![span("b", 0, Status::Unset)]).unwrap();
         let mut want: BTreeSet<String> = keep.iter().map(|s| s.to_string()).collect();
-        want.insert("traces-20260925.jsonl".into());
+        want.insert("traces-serve-20260925.jsonl".into());
         assert_eq!(dir.files(), want);
 
         clock.advance(DAY);
         export_spans(&files.spans, vec![span("c", 0, Status::Unset)]).unwrap();
         // The day change pruned again: 20260827 is now 30 days old.
-        want.remove("traces-20260827.jsonl");
-        want.insert("traces-20260926.jsonl".into());
+        want.remove("traces-telegram-20260827.jsonl");
+        want.insert("traces-serve-20260926.jsonl".into());
         assert_eq!(dir.files(), want);
 
         let names = |file| {
@@ -676,9 +690,9 @@ mod tests {
                 .map(|l| l["name"].clone())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(names("traces-20260925.jsonl"), ["a", "b"]);
-        assert_eq!(names("traces-20260926.jsonl"), ["c"]);
-        let mode = fs::metadata(dir.0.join("traces-20260925.jsonl"))
+        assert_eq!(names("traces-serve-20260925.jsonl"), ["a", "b"]);
+        assert_eq!(names("traces-serve-20260926.jsonl"), ["c"]);
+        let mode = fs::metadata(dir.0.join("traces-serve-20260925.jsonl"))
             .unwrap()
             .permissions();
         assert_eq!(
@@ -690,7 +704,7 @@ mod tests {
     #[test]
     fn a_failed_prune_is_reported_once_and_loses_no_spans() {
         let dir = TempDir::new();
-        let files = exporters(&dir.0, days(1), FakeClock::at(NOON)).unwrap();
+        let files = exporters(&dir.0, Role::Serve, days(1), FakeClock::at(NOON)).unwrap();
         // A directory where an expired file would be: removing it fails.
         fs::create_dir(dir.0.join("traces-20260924.jsonl")).unwrap();
         let error = export_spans(&files.spans, vec![span("a", 0, Status::Unset)])
@@ -700,7 +714,7 @@ mod tests {
         // The rest of the day is not pruned again, so it writes cleanly.
         export_spans(&files.spans, vec![span("b", 0, Status::Unset)]).unwrap();
         let names: Vec<Value> = dir
-            .lines("traces-20260925.jsonl")
+            .lines("traces-serve-20260925.jsonl")
             .iter()
             .map(|l| l["name"].clone())
             .collect();
@@ -710,7 +724,7 @@ mod tests {
     #[test]
     fn a_directory_that_is_gone_fails_the_export() {
         let dir = TempDir::new();
-        let files = exporters(&dir.0, days(1), FakeClock::at(NOON)).unwrap();
+        let files = exporters(&dir.0, Role::Serve, days(1), FakeClock::at(NOON)).unwrap();
 
         fs::remove_dir_all(&dir.0).unwrap();
         let error = export_spans(&files.spans, vec![span("a", 0, Status::Unset)])
@@ -722,7 +736,7 @@ mod tests {
     #[test]
     fn a_file_the_other_process_pruned_first_is_not_an_error() {
         let dir = TempDir::new();
-        let files = exporters(&dir.0, days(1), FakeClock::at(NOON)).unwrap();
+        let files = exporters(&dir.0, Role::Serve, days(1), FakeClock::at(NOON)).unwrap();
         let old = dir.0.join("traces-20260924.jsonl");
         fs::write(&old, "{}\n").unwrap();
         files.spans.files.prune_entry(&old, "20260925").unwrap();

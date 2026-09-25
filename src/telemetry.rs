@@ -63,6 +63,34 @@ const SCOPE: &str = "athena";
 /// How long JSONL files are kept without `ATHENA_TELEMETRY_RETENTION_DAYS`.
 pub const DEFAULT_RETENTION_DAYS: NonZeroU32 = NonZeroU32::new(30).expect("30 is not 0");
 
+/// Which process is exporting: the subcommand, `cli` for everything else.
+/// It names the JSONL files, so each file has one writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Serve,
+    Telegram,
+    Cli,
+}
+
+impl Role {
+    /// The role of `athena <args>` (the arguments after the program name).
+    pub fn from_args(args: &[String]) -> Self {
+        match args.first().map(String::as_str) {
+            Some("serve") => Self::Serve,
+            Some("telegram") => Self::Telegram,
+            _ => Self::Cli,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Serve => "serve",
+            Self::Telegram => "telegram",
+            Self::Cli => "cli",
+        }
+    }
+}
+
 /// Everything telemetry is configured by. See [`Settings::from_env`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
@@ -202,15 +230,16 @@ impl Sinks {
         }
     }
 
-    /// The sinks `settings` switch on: OTLP, JSONL files, both or neither.
-    pub fn from_settings(settings: &Settings) -> Result<Self> {
+    /// The sinks `settings` switch on for process `role`: OTLP, JSONL
+    /// files, both or neither.
+    pub fn from_settings(settings: &Settings, role: Role) -> Result<Self> {
         let mut sinks = Self::new(settings);
         if settings.endpoint.is_some() {
             sinks = sinks.with(otlp_exporters()?);
         }
         if let Some(dir) = &settings.telemetry_dir {
             let clock = Arc::new(jsonl::SystemClock);
-            let files = jsonl::exporters(dir, settings.retention_days, clock)
+            let files = jsonl::exporters(dir, role, settings.retention_days, clock)
                 .with_context(|| format!("creating ATHENA_TELEMETRY_DIR {}", dir.display()))?;
             sinks = sinks.with(files);
         }
@@ -319,10 +348,10 @@ where
 }
 
 /// Configure telemetry from the environment and install it for the whole
-/// process. Call once, before anything logs.
-pub fn init() -> Result<Telemetry> {
+/// process, which runs as `role`. Call once, before anything logs.
+pub fn init(role: Role) -> Result<Telemetry> {
     let settings = Settings::from_env()?;
-    let sinks = Sinks::from_settings(&settings)?;
+    let sinks = Sinks::from_settings(&settings, role)?;
     let (layers, telemetry) = layers(&settings, sinks, std::io::stderr);
     tracing_subscriber::registry()
         .with(layers)
@@ -440,7 +469,11 @@ mod tests {
                 log_filter: DEFAULT_LOG_FILTER.into(),
             }
         );
-        assert!(Sinks::from_settings(&settings).unwrap().is_empty());
+        assert!(
+            Sinks::from_settings(&settings, Role::Cli)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -510,6 +543,18 @@ mod tests {
     }
 
     #[test]
+    fn the_role_is_the_subcommand() {
+        let role = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            Role::from_args(&args).as_str()
+        };
+        assert_eq!(role(&["serve", "--addr", "x"]), "serve");
+        assert_eq!(role(&["telegram"]), "telegram");
+        assert_eq!(role(&["eval", "run"]), "cli");
+        assert_eq!(role(&[]), "cli");
+    }
+
+    #[test]
     fn only_prod_strips_content() {
         assert!(settings(&[("ATHENA_ENV", "prod")]).strips_content());
         assert!(!settings(&[("ATHENA_ENV", "staging")]).strips_content());
@@ -545,13 +590,20 @@ mod tests {
         let files = ("ATHENA_TELEMETRY_DIR", path);
 
         assert_eq!(
-            Sinks::from_settings(&settings(&[endpoint])).unwrap().len(),
+            Sinks::from_settings(&settings(&[endpoint]), Role::Serve)
+                .unwrap()
+                .len(),
             1
         );
         assert!(!dir.0.exists());
-        assert_eq!(Sinks::from_settings(&settings(&[files])).unwrap().len(), 1);
+        assert_eq!(
+            Sinks::from_settings(&settings(&[files]), Role::Serve)
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(dir.0.join("telemetry").is_dir());
-        let both = Sinks::from_settings(&settings(&[endpoint, files])).unwrap();
+        let both = Sinks::from_settings(&settings(&[endpoint, files]), Role::Serve).unwrap();
         assert_eq!(both.len(), 2);
         assert!(!both.is_empty());
     }
@@ -561,13 +613,11 @@ mod tests {
         let dir = TempDir::new();
         std::fs::write(&dir.0, "a file, not a directory").unwrap();
         let below = dir.0.join("telemetry");
-        let error = Sinks::from_settings(&settings(&[(
-            "ATHENA_TELEMETRY_DIR",
-            below.to_str().unwrap(),
-        )]))
-        .err()
-        .expect("a directory under a file")
-        .to_string();
+        let files = settings(&[("ATHENA_TELEMETRY_DIR", below.to_str().unwrap())]);
+        let error = Sinks::from_settings(&files, Role::Telegram)
+            .err()
+            .expect("a directory under a file")
+            .to_string();
         assert!(error.contains("creating ATHENA_TELEMETRY_DIR"), "{error}");
         let _ = std::fs::remove_file(&dir.0);
     }

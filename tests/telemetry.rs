@@ -597,7 +597,9 @@ fn athena_serve_exports_to_openobserve_and_files_and_flushes_on_sigterm() {
         .collect();
     files.sort();
     assert_eq!(files.len(), 2, "{files:?}");
-    assert!(files[0].starts_with("logs-") && files[1].starts_with("traces-"));
+    // One writer per file: the role is in the name.
+    assert!(files[0].starts_with("logs-serve-"), "{files:?}");
+    assert!(files[1].starts_with("traces-serve-"), "{files:?}");
     let spans = std::fs::read_to_string(telemetry_dir.join(&files[1])).unwrap();
     let probes: Vec<Value> = spans
         .lines()

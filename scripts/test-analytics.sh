@@ -12,8 +12,8 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 sqlite3 "$WORK/agent.db" <"$REPO_ROOT/tests/fixtures/v3_users_sessions.sql"
 mkdir -p "$WORK/lib/prod/telemetry" "$WORK/lib/staging/telemetry"
-cp "$REPO_ROOT/analytics/testdata/traces-20260921.jsonl" "$WORK/lib/prod/telemetry/"
-cp "$REPO_ROOT/analytics/testdata/traces-20260922.jsonl" "$WORK/lib/staging/telemetry/"
+cp "$REPO_ROOT/analytics/testdata/traces-serve-20260921.jsonl" "$WORK/lib/prod/telemetry/"
+cp "$REPO_ROOT/analytics/testdata/traces-telegram-20260922.jsonl" "$WORK/lib/staging/telemetry/"
 
 q() { # query name -> JSON rows
     "$REPO_ROOT/scripts/analytics.sh" --json --db "$WORK/agent.db" \
