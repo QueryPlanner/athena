@@ -10,3 +10,4 @@ pub mod service;
 pub mod shutdown;
 pub mod store;
 pub mod telegram;
+pub mod telemetry;

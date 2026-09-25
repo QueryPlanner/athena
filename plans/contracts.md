@@ -217,4 +217,7 @@ On a failed health check it puts the previous `current` back, restarts, and exit
 - Each turn gets an Athena `invoke_agent` span carrying `gen_ai.conversation.id`,
   `athena.run_id`, `athena.transport`, and `enduser.pseudo.id` (a hash).
 - rig's own spans nest under it.
-- Logs go through `tracing` (JSON to stderr when OTel is off, plus OTLP when on).
+- Logs go through `tracing`: plain text to stderr always (so the CLI REPL
+  stays readable), plus OTLP when on.
+- HTTP accepts W3C `traceparent` and, when OTel is on, answers with
+  `x-trace-id` and `traceparent` response headers.

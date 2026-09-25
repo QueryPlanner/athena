@@ -339,6 +339,55 @@ unredacted copy of the response and it dominates row size (1737 bytes versus
 Telemetry is written after the transcript and its failure is warned about, not
 fatal: losing a cost row must never cost you a reply.
 
+## Observability
+
+Every process logs through `tracing`. Log lines go to stderr in plain text,
+one per event, with a timestamp and level. `RUST_LOG` picks what stderr shows;
+the default is `warn,athena=info`. The CLI's own output (replies, `warning:`
+lines) still prints directly, so the REPL looks the same as before.
+
+OpenTelemetry is off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set. When it is,
+spans and log events also go over OTLP/HTTP (protobuf) to that endpoint, to
+`/v1/traces` and `/v1/logs`. The other standard `OTEL_EXPORTER_OTLP_*`
+variables (headers, timeout, per-signal endpoints) work too. Buffered data is
+exported on exit, after `serve` or `telegram` has let its turns finish.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (off) | collector base URL, e.g. `http://127.0.0.1:4318` |
+| `OTEL_SERVICE_NAME` | `athena` | resource `service.name` |
+| `ATHENA_VERSION` | `<crate version>-dev` | resource `service.version` |
+| `ATHENA_ENV` | unset | resource `deployment.environment.name` |
+| `ATHENA_RECORD_CONTENT` | off | `1` puts prompt and reply text on spans |
+| `RUST_LOG` | `warn,athena=info` | stderr filter only; export always takes `info` and up |
+
+What a turn exports:
+
+- `invoke_agent athena`, one span per turn, from `Service`. It carries
+  `gen_ai.operation.name`, `gen_ai.agent.name`, `gen_ai.conversation.id` (the
+  session id), `athena.run_id` (join it to the `runs` table),
+  `athena.transport`, `enduser.pseudo.id`, and the run's input and output
+  token totals. A failed turn has status `ERROR` and `error.type` (`model`,
+  `storage`, `conflict`).
+- Rig's `chat` or `chat_streaming` span per model call and `execute_tool` per
+  tool call, nested under it. Rig adopts Athena's span rather than opening
+  its own.
+- For HTTP, a server span per request named after the route, such as
+  `POST /sessions/{id}/messages`. A W3C `traceparent` header on the request
+  makes it part of the caller's trace. Responses carry `x-trace-id` and
+  `traceparent` so an eval or client can look the trace up. Without
+  OpenTelemetry neither header is sent.
+
+`enduser.pseudo.id` is the first 16 bytes of SHA-256 over
+`transport:external_id`, in hex. It keeps raw Telegram ids out of the
+backend, but it is unsalted, and Telegram ids are numbers anyone can
+enumerate. Treat it as internal data, not as anonymous.
+
+Content capture is off by default. Log events never include prompt or reply
+text. With `ATHENA_RECORD_CONTENT=1`, Rig records the prompt on the turn span
+and model input, output, tool arguments and tool results on its own spans. Keep it off in
+production; turn it on in staging only while no real users talk to it.
+
 ## Known limits
 
 - **The HTTP API is unauthenticated. Do not expose it publicly.** Whoever
@@ -394,8 +443,9 @@ fatal: losing a cost row must never cost you a reply.
   unless given a session name, and `sessions` does not mark the selection
   (`selected_sessions` is readable with `sqlite3`). `Service` does not
   expose selection yet; `telegram.rs` reads it from `Store` directly.
-- Provider errors are logged to stderr in full and can include account
-  details from the provider's error body. Message text is never logged.
+- Provider errors are logged in full (stderr, and OTLP when it is on) and
+  can include account details from the provider's error body. Message text
+  is never logged.
 - Turns on one session are serialized within a process. Across processes
   they are not: the second one to finish is refused with `Conflict` rather
   than interleaved.

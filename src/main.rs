@@ -2,17 +2,22 @@
 
 use anyhow::Result;
 use athena::service::Service;
-use athena::{agent, cli, dotenv, http, shutdown, store, telegram};
+use athena::{agent, cli, dotenv, http, shutdown, store, telegram, telemetry};
 use std::sync::Arc;
 
 fn main() -> Result<()> {
     // Before the runtime exists: setting environment variables is only
     // sound while this is the only thread.
     dotenv::load(".env")?;
-    tokio::runtime::Builder::new_multi_thread()
+    let telemetry = telemetry::init()?;
+    let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run())
+        .block_on(run());
+    // After `run`: servers return only once their turns have drained, so
+    // the last batch of spans and logs includes them.
+    telemetry.shutdown();
+    result
 }
 
 async fn run() -> Result<()> {
