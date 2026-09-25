@@ -39,6 +39,8 @@ as is.
     cargo run -- usage                       # per-session token totals
     cargo run -- --user telegram:42 ...      # any of the above as another user
     ATHENA_DB=/tmp/x.db cargo run -- ...     # use another database file
+    cargo run -- serve                       # HTTP API on 127.0.0.1:8080
+    cargo run -- serve --addr 127.0.0.1:9000 # or ATHENA_ADDR=...
 
 A session name is created on first use and resumes the conversation after
 that, tool history included. `sessions new NAME` creates one explicitly and
@@ -69,6 +71,7 @@ id that does not exist.
     src/store.rs       the database: migrations, Rig conversation memory, runs
     src/runner.rs      the Run trait and the run record
     src/cli.rs         the CLI transport: arguments, output, REPL
+    src/http.rs        the HTTP transport: JSON API, SSE streaming, `serve`
     src/main.rs        wiring: real database, provider, stdin/stdout
     tests/             integration tests, upgrade fixtures, schema snapshot
     scripts/           coverage gate and live end-to-end test
@@ -116,9 +119,97 @@ Errors are `service::Error`: `NotFound`, `AlreadyExists`, `Invalid`,
 
 The agent is a parameter of `send`, not part of the service, so listing and
 creating sessions needs no API key and one service can serve any number of
-tasks. `send`'s future is `Send`; a transport that must not lose a paid-for
-reply when its client disconnects should `tokio::spawn` it, because dropping
-the future cancels the turn.
+tasks. Dropping `send`'s future cancels the turn. A transport whose client
+can go away uses one of these instead (the service behind an `Arc`):
+
+    let turn = service.send_detached(agent, &user, &id, "hi").await?;  // Turn
+    let mut turn = service.send_stream(agent, &user, &id, "hi").await?;
+    while let Some(event) = turn.next().await { ... }  // Text, ToolCall, then Done(Result<Turn>)
+    service.idle().await;                             // on shutdown
+
+Both check the request and wait for the session in the caller's future, so
+a caller that gives up while queued behind another turn leaves nothing
+behind. Once the turn holds the session it runs in its own task, with every
+guarantee above, and finishes and is saved even if nobody is listening any
+more. `idle` waits for those tasks. `send_stream` drives Rig's streaming
+agent, which loads and appends through the same memory and receipt as the
+blocking one; its `Done` carries exactly what `send` would have returned.
+
+## HTTP API
+
+`athena serve` listens on `--addr`, else `ATHENA_ADDR`, else
+`127.0.0.1:8080`. It needs `OPENROUTER_API_KEY` at startup. It is
+unauthenticated: read Known limits before listening anywhere but loopback.
+On any other address it still starts, and prints a warning.
+
+Every request except `/health` names its user in a header:
+
+    X-Athena-User: alice          # the user ("http", "alice")
+
+A missing, blank, non-ASCII or over-256-byte value is `400`. `src/http.rs`
+turns the header into a user in one place, the `Caller` extractor, so
+authentication replaces that and nothing else. While listening on loopback,
+a request whose `Host` is not `localhost`, `127.0.0.1` or `[::1]` is `403`,
+so a web page cannot reach the API by pointing its own domain at 127.0.0.1
+(DNS rebinding).
+
+| Method and path | Body | Success |
+|---|---|---|
+| `GET /health` | | `200 {"status":"ok"}` |
+| `POST /sessions` | `{"name":"notes"}` | `201 {"id","name","created_at"}` |
+| `GET /sessions` | | `200 {"sessions":[{"id","name","created_at","messages"}]}` |
+| `GET /sessions/{id}/messages` | | `200 {"messages":[...]}` |
+| `POST /sessions/{id}/messages` | `{"text":"hi"}` | `200 {"reply","run":{...}}` |
+| `POST /sessions/{id}/messages/stream` | `{"text":"hi"}` | `200 text/event-stream` |
+| `GET /usage` | | `200 {"usage":[{"session_id","name","runs","model_calls","input_tokens","output_tokens","cached_input_tokens"}]}` |
+
+`messages` are Rig's own message JSON, exactly as stored, tool calls and
+tool results included. That format belongs to Rig and can change with a Rig
+upgrade.
+
+`run` is the turn's `runs` row without `calls_json` (raw provider
+responses): `run_id`, `session_id`, `status`, `error`, `model`,
+`first_seq`, `last_seq`, `model_calls`, `input_tokens`, `output_tokens`,
+`total_tokens`, `cached_input_tokens`, `reasoning_tokens`, `started_at`,
+`ended_at`.
+
+A streamed turn sends these events, then closes the stream:
+
+    event: delta       data: {"text":"4"}                          0 or more
+    event: tool_call   data: {"name":"add","arguments":{"a":21,"b":21}}  0 or more
+    event: done        data: {"reply":"42","run":{...}}            last, on success
+    event: error       data: {"error":{"code":"model","message":"..."}}  last, on failure
+
+`done.reply` is the reply. Concatenated deltas can differ from it, because
+text the model writes next to a tool call is streamed too. Keep-alive
+comments (`:` lines) arrive every 15 s during long tool calls. A bad request
+(bad body, empty text, someone else's session) is refused with a status
+code before the stream starts.
+
+Errors are `{"error":{"code","message"}}`:
+
+| Status | `code` | When |
+|---|---|---|
+| 400 | `invalid` | bad or missing header, body not JSON, empty name or text |
+| 403 | `forbidden_host` | see above |
+| 404 | `not_found` | no such session **for this user**, including another user's |
+| 409 | `already_exists` | session name taken |
+| 409 | `conflict` | another process wrote to the session mid-turn; send again |
+| 502 | `model` | the model failed; details in the server log and `runs.error` |
+| 500 | `storage` | the database failed; details in the server log |
+| (SSE) | `internal` | the turn crashed; details in the server log |
+
+Another user's session id gets the same `404` as an id that does not exist.
+`model` and `storage` messages are generic, because provider and database
+errors can carry details an unauthenticated client should not see.
+
+A turn that has started finishes and is saved even if its client
+disconnects, streamed or not. Ctrl-C stops accepting requests, lets open
+ones finish and waits for every turn still running, then exits. A second
+Ctrl-C quits at once, and the turns in flight are lost as in a crash.
+
+    curl -s localhost:8080/sessions -H 'X-Athena-User: alice' -d '{"name":"notes"}'
+    curl -N localhost:8080/sessions/$ID/messages/stream -H 'X-Athena-User: alice' -d '{"text":"hi"}'
 
 ## How persistence works
 
@@ -192,16 +283,39 @@ fatal: losing a cost row must never cost you a reply.
 
 ## Known limits
 
-- A crash mid-turn loses that turn. Persistence granularity is one append
-  per turn, not per model call.
-- Dropping `send`'s future (a disconnected client) cancels the turn. If that
-  happens after the append but before the run row, the transcript has rows
-  no run covers.
-- No streaming; a long tool chain is silent until it finishes. Rig's
-  streaming driver appends to the same memory, so a streaming `send` can
-  reuse the session lock and the receipt.
+- **The HTTP API is unauthenticated. Do not expose it publicly.** Whoever
+  can reach the port can act as any user by setting `X-Athena-User`, read
+  every session, spend the OpenRouter credit, and use the agent's tools on
+  the server's machine, including `read_file` on any path the process can
+  read. Loopback is the default, and a loopback server refuses foreign
+  `Host` headers, but every local process is still trusted. Authentication
+  replaces `Caller` in `src/http.rs`; until then, put an authenticating
+  proxy in front before listening anywhere else.
+- Every distinct `X-Athena-User` value creates a `users` row, even for a
+  read. There is no rate limit or cap beyond the 256-byte header limit.
+- A crash mid-turn loses that turn, and so does a second Ctrl-C while
+  `serve` drains. Persistence granularity is one append per turn, not per
+  model call.
+- Dropping `send`'s future cancels the turn. If that happens after the
+  append but before the run row, the transcript has rows no run covers.
+  `send_detached` and `send_stream` do not have this problem.
+- A turn that panics (a bug) records no run. The session is unlocked, and
+  a streamed client gets an `internal` error event.
+- A streamed turn's `calls_json` holds what Rig's streaming driver
+  reports for each call. With Rig's mock model that raw payload is the
+  stream's terminal record, not a whole response; it has not yet been
+  compared with a blocking call's payload from OpenRouter. The blocking
+  HTTP endpoint and the CLI use the blocking driver.
+- Deltas already streamed cannot be taken back. If the transcript then
+  fails to save, the client has seen text that the `error` event says was
+  not kept.
+- Axum answers some malformed requests itself, not in this API's JSON
+  error shape: unknown paths (empty `404`), wrong methods (`405`), and
+  bodies over 2 MB (`413`).
+- Only SIGINT (Ctrl-C) shuts `serve` down gracefully. SIGTERM, as sent by
+  most process managers, stops it at once.
 - Context grows forever, and every turn re-sends the whole history.
-- Only a CLI transport so far. HTTP and Telegram call `service::Service`.
+- Transports so far: the CLI and HTTP. They call `service::Service`.
 - Turns on one session are serialized within a process. Across processes
   they are not: the second one to finish is refused with `Conflict` rather
   than interleaved.

@@ -18,6 +18,8 @@ commands:
   sessions             list your sessions: name, message count
   sessions new NAME    create an empty session; prints name and id
   usage                token totals per session
+  serve [--addr ADDR]  run the HTTP API (default 127.0.0.1:8080, or
+                       ATHENA_ADDR); unauthenticated, see README
 
 --user acts as another user, e.g. telegram:42. The default is cli:local.";
 
