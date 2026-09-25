@@ -64,6 +64,9 @@ it needs no user header. Every other endpoint is unchanged.
   - `v*` added to the same digest on release tags.
 - **Annotation:** `org.opencontainers.image.source=https://github.com/QueryPlanner/athena`,
   so the package links to the repo.
+- **Annotation:** `org.opencontainers.image.revision=<full git sha>`
+  (`oras push --annotation` on the manifest). `deploy-gate` writes it into
+  `ATHENA_VERSION`. Without it the version is `sha256:<first 12 hex digits>`.
 - **Pull:** anonymous `oras pull ghcr.io/queryplanner/athena@sha256:...` works once
   the package is made public (one-time human step).
 

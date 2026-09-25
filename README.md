@@ -131,6 +131,8 @@ id that does not exist.
     src/http.rs        the HTTP transport: JSON API, SSE streaming, `serve`
     src/telegram.rs    the Telegram transport: commands, sessions, the bot
     src/main.rs        wiring: real database, provider, stdin/stdout
+    src/gate/          deploy-gate, the only program CI runs on the VM (DEPLOY.md)
+    src/bin/           deploy-gate's wiring
     tests/             integration tests, upgrade fixtures, schema snapshot
     scripts/           coverage gate and live end-to-end test
 
