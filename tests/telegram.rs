@@ -482,7 +482,10 @@ async fn the_binary_serves_commands_and_remembers_the_session_across_a_restart()
     let stderr = stop(child, "TERM").await;
 
     assert_eq!(first[2], "Switched to `work` (0 messages).");
-    assert!(stderr.contains("polling for messages"), "{stderr}");
+    assert!(
+        stderr.contains("telegram: polling for messages"),
+        "{stderr}"
+    );
     assert!(!stderr.contains(&secret()), "{stderr}");
     assert_eq!(selected(&tmp, "77").as_deref(), Some("work"));
 

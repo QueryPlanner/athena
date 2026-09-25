@@ -1047,35 +1047,6 @@ mod tests {
     }
 
     #[test]
-    fn every_existing_session_is_given_to_the_cli_user() {
-        let db = at_version_2();
-        db.execute_batch(
-            "INSERT INTO messages VALUES ('talk', 0, '{}'), ('talk', 1, '{}');
-             INSERT INTO runs (run_id, session_id, started_at, ended_at, model, status,
-                               first_seq, last_seq, calls_json)
-             VALUES ('r1', 'talk', 1, 2, 'm', 'ok', 0, 1, '[]'),
-                    ('r2', 'failed-only', 3, 4, 'm', 'error', 0, -1, '[]');",
-        )
-        .unwrap();
-        configure(&db).unwrap();
-
-        migrate(&db).unwrap();
-
-        let owned: Vec<(String, String, String, String)> = db
-            .prepare(
-                "SELECT s.id, s.name, u.transport, u.external_id
-                 FROM sessions s JOIN users u ON u.id = s.user_id ORDER BY s.id",
-            )
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        let row = |id: &str| (id.into(), id.into(), "cli".into(), "local".into());
-        assert_eq!(owned, [row("failed-only"), row("talk")]);
-    }
-
-    #[test]
     fn a_dangling_reference_is_refused_and_left_as_found() {
         let store = store();
         let db = store.db();

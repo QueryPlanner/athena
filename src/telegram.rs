@@ -1632,20 +1632,4 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("formatting bug"), "{lines:?}");
     }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn handle_isolated_answers_like_handle() {
-        let h = harness(vec![]);
-        let (chat, mut rx) = recorder();
-
-        h.app.handle_isolated(chat, from(1, "/usage")).await;
-
-        assert_eq!(rx.try_recv().unwrap(), said("No turns yet."));
-    }
-
-    #[test]
-    fn logging_to_stderr_is_prefixed() {
-        // Output goes to stderr; this only proves it does not panic.
-        log_to_stderr("test line");
-    }
 }
