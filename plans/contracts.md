@@ -117,7 +117,7 @@ The sandbox image is a separate Docker image:
   - `Restart=on-failure`, `RestartSec=5`, `TimeoutStopSec=120`;
   - hardening: `ProtectSystem=strict`, `ReadWritePaths=/var/lib/athena/%i`,
     `ProtectHome=yes`, `PrivateTmp=yes`, `NoNewPrivileges=yes`, `ProtectProc=invisible`,
-    `MemoryMax=512M`.
+    `MemoryMax=128M` (measured idle RSS of `athena serve`: ~15 MB).
 - `athena-telegram@.service`: the same, with `ExecStart=… telegram`. It is
   **enabled for prod only**.
 - `athena@.target`: `Wants=` both units, so `systemctl start athena@staging.target`

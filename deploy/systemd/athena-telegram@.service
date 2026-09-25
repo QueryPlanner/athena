@@ -22,7 +22,7 @@ RestartSec=5
 TimeoutStopSec=120
 
 # Hardening
-MemoryMax=512M
+MemoryMax=128M
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/athena/%i
