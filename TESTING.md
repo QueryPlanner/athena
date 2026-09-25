@@ -42,6 +42,11 @@ what it did does not count.
 
 ## Integration tests
 
+Tests that run the real binary must run it in an empty directory, as
+`athena_in` in `tests/cli.rs` does. The binary loads `.env` from its working
+directory, and in the repository that file holds a developer's real keys:
+a "no API key" test would find one and call the provider.
+
 `tests/common/mod.rs` has the helpers:
 
 - `TempDb`: a real database file that is deleted on drop. `tmp.service()`
@@ -57,6 +62,21 @@ what it did does not count.
 - `cli_user`, `session` and `session_id`: the `cli:local` user, a session by
   name, and a session's id looked up in the database.
 - `raw_rows` and `runs`: the stored transcript and telemetry, by session id.
+- `mock_agent_with_memory` and `mock_stream_agent`: the production agent
+  around any memory (a wrapper that parks a turn, say), in front of a
+  scripted blocking or streaming model. One mock model scripts blocking
+  turns or streaming turns, never both, so a test of both endpoints builds
+  two agents on the same memory. `streamed_text` and `streamed_add_turns`
+  script streaming turns. Every scripted stream must end with
+  `MockStreamEvent::final_response`: without it Rig treats the turn as
+  truncated and fails it.
+
+`tests/http.rs` drives the HTTP API in-process through the router
+(`tower::ServiceExt::oneshot`), the server over real loopback TCP, and
+`athena serve` as the built binary, stopped with SIGINT so its coverage is
+written. A client that disconnects is simulated by dropping the response
+body or the request future, which is what hyper does when a socket closes.
+Turns are parked inside a wrapping memory (`ParkedAppend`), never timed.
 
 `tests/telegram.rs` drives the Telegram transport through
 `tests/telegram/fake_api.rs`, a fake Bot API server on a local port. Point
@@ -132,8 +152,7 @@ not shown by the CLI yet. Read it from the `selected_sessions` table.
 ### Running it
 
 ```
-source ~/.zshrc          # or export OPENROUTER_API_KEY
-./scripts/e2e.sh
+./scripts/e2e.sh         # key from .env, or export OPENROUTER_API_KEY
 ```
 
 It builds the binary, points `ATHENA_DB` at a throwaway file, and prints one
@@ -178,6 +197,19 @@ assuming the code is wrong. The model may have refused or rephrased.
    and a turn is run. Every old message and run is unchanged, all three old
    sessions (one with only a failed run) belong to `cli:local`, and the new
    turn starts at seq 12.
+7. The HTTP API: `athena serve` on a free loopback port, driven with
+   curl. Health needs no user; a missing `X-Athena-User` is 400 and a
+   foreign `Host` 403, and neither creates a user. Sessions are created
+   (201, the stored id) and refused when duplicated (409). A blocking
+   message makes a tool call and returns the stored run's id; the
+   transcript endpoint returns every stored row. A streamed message sends
+   deltas and ends with exactly one `done`, every `event:` line has a
+   `data:` line, and `done` names the stored run, which counted tokens
+   and starts where the previous run ended. A second user gets the same
+   404 for the first user's session as for a missing one, on every
+   endpoint, and lists nothing. A client that hangs up mid-stream still
+   gets an ok run and a whole transcript. Ctrl-C while a stream is running
+   lets it end with `done`, saves its run, and exits 0.
 
 8. The Telegram bot: `scripts/fake_telegram.py`, a fake Bot API server,
    and the real `athena telegram` binary against it through
@@ -206,6 +238,8 @@ commands. Follow these rules:
 - Assert on database state, or on a distinctive token like `ZEBRA-7391`
   matched case-insensitively. Never assert on the model's exact phrasing.
 - Retry only checks that depend on the model's choices, and only once.
+- A section that starts a background process appends its pid to
+  `BACKGROUND`, so every exit, failures included, kills it.
 - A new invariant belongs in both places: a hermetic integration test
   proves the code, and an e2e check proves it holds against the real
   provider.

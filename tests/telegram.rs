@@ -387,10 +387,12 @@ async fn a_refused_or_unreachable_api_fails_serve_without_leaking_the_token() {
 // ---------------- the real binary ----------------
 
 /// `athena telegram` against the fake API, with a key the model is never
-/// called with: these tests only use commands.
-fn start_binary(tmp: &TempDb, api: &FakeApi) -> Child {
+/// called with: these tests only use commands. It runs in `dir`, an empty
+/// directory, so a developer's `.env` in the repository never reaches it.
+fn start_binary(dir: &WorkDir, tmp: &TempDb, api: &FakeApi) -> Child {
     Command::new(env!("CARGO_BIN_EXE_athena"))
         .arg("telegram")
+        .current_dir(dir.path())
         .env("ATHENA_DB", tmp.path())
         .env("TELEGRAM_BOT_TOKEN", token())
         .env("TELEGRAM_API_URL", &api.url)
@@ -425,9 +427,10 @@ async fn polls(api: &FakeApi, n: usize) {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_binary_serves_commands_and_remembers_the_session_across_a_restart() {
     let tmp = TempDb::new();
+    let dir = WorkDir::new();
     let api = FakeApi::start().await;
 
-    let child = start_binary(&tmp, &api);
+    let child = start_binary(&dir, &tmp, &api);
     polls(&api, 1).await;
     api.push(text_from(77, "/new work"));
     api.push(text_from(77, "/new notes"));
@@ -442,7 +445,7 @@ async fn the_binary_serves_commands_and_remembers_the_session_across_a_restart()
 
     // A new process picks up where the old one left off.
     let before = api.calls_to("getUpdates").len();
-    let child = start_binary(&tmp, &api);
+    let child = start_binary(&dir, &tmp, &api);
     polls(&api, before + 1).await;
     api.push(text_from(77, "/sessions"));
     let all = api.messages_to(77, 4).await;
@@ -463,9 +466,11 @@ async fn the_binary_serves_commands_and_remembers_the_session_across_a_restart()
 #[test]
 fn the_binary_checks_its_settings_before_touching_the_database() {
     let tmp = TempDb::new();
+    let dir = WorkDir::new();
     let run = |args: &[&str], token: Option<&str>| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_athena"));
         cmd.args(args)
+            .current_dir(dir.path())
             .env("ATHENA_DB", tmp.path())
             .env("OPENROUTER_API_KEY", "unused")
             .env_remove("TELEGRAM_API_URL");
