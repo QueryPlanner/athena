@@ -1,0 +1,22 @@
+{
+  "title": "athena",
+  "pages": [
+    "---Start---",
+    "index",
+    "getting-started",
+    "make-an-agent",
+    "configuration",
+    "---Transports---",
+    "cli",
+    "http-api",
+    "telegram",
+    "---Internals---",
+    "architecture",
+    "persistence",
+    "usage-and-cost",
+    "---Operate---",
+    "deployment",
+    "testing",
+    "known-limits"
+  ]
+}

@@ -1,0 +1,66 @@
+---
+title: Testing
+description: The three test layers, the coverage gate and schema-change rules.
+---
+
+| Layer | Command | Network | What it proves |
+|---|---|---|---|
+| Unit | `cargo test --lib` | none | Each function's rules, including the error paths |
+| Integration | `cargo test --tests` | none | The real Rig agent loop and tools against a scripted model and a real SQLite file; the CLI in-process and as a binary; the Telegram bot against a fake Bot API; upgrades from every earlier schema |
+| End-to-end | `scripts/e2e.sh` | OpenRouter | The real provider, several processes, one database |
+
+Every change runs the first two. Run the third before merging anything that
+touches the agent loop, storage or a transport.
+
+## Before opening a PR
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+./scripts/coverage.sh
+```
+
+CI runs the same three commands on every pull request.
+
+## Coverage
+
+Every source line must be executed by at least one test, with no
+exclusions. If a line cannot be reached from a test, change the design
+rather than excluding the line:
+
+- Environment variables are read by a one-line function that passes the
+  value to a pure function you can test: `agent::model_or_default`,
+  `store::path_or_default`, `runner::keep_raw`.
+- The provider is kept apart from the agent's definition, so tests build
+  the production agent around a mock model: `agent::configure`.
+- The CLI takes its input, output and agent factory as parameters:
+  `cli::run`.
+
+Coverage is a floor, not the goal. A test that runs a line without checking
+what it did does not count.
+
+## Schema changes
+
+1. Append a migration to `MIGRATIONS` in `src/store.rs`. Never edit or
+   reorder one that has shipped.
+2. Before writing it, save a fixture of the schema it upgrades from as
+   `tests/fixtures/v<N>_<name>.sql`, with realistic rows. Never edit a
+   fixture afterwards.
+3. Add an upgrade test to `tests/upgrade.rs` for that fixture.
+4. Update `EXPECTED_COLUMNS`, then replace `tests/fixtures/schema.txt` with
+   the text the snapshot test prints.
+5. If the change affects what a user sees, add an upgrade section to
+   `scripts/e2e.sh`.
+
+[TESTING.md](https://github.com/QueryPlanner/athena/blob/main/TESTING.md)
+has the full rules, the test helpers and what the end-to-end script covers.
+
+## End-to-end
+
+```bash
+./scripts/e2e.sh         # key from .env, or export OPENROUTER_API_KEY
+```
+
+It builds the binary, points `ATHENA_DB` at a throwaway file, and prints one
+`PASS` or `FAIL` line per check. Checks read the database, not the model's
+wording. On failure the database is kept and its path printed.

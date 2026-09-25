@@ -1,0 +1,92 @@
+---
+title: HTTP API
+description: JSON endpoints and SSE streaming served by athena serve.
+---
+
+`athena serve` listens on `--addr`, else `ATHENA_ADDR`, else
+`127.0.0.1:8080`. It needs `OPENROUTER_API_KEY` at startup.
+
+<Callout type="error">
+  The API is unauthenticated. On any address other than loopback it still
+  starts, and prints a warning. Read [Known limits](/docs/known-limits) first.
+</Callout>
+
+## Identifying the user
+
+Every request except `/health` names its user in a header:
+
+```http
+X-Athena-User: alice
+```
+
+That is the user `("http", "alice")`. A missing, blank, non-ASCII or
+over-256-byte value is `400`. `src/http.rs` turns the header into a user in
+one place, the `Caller` extractor, so adding authentication means replacing
+that extractor and nothing else.
+
+While listening on loopback, a request whose `Host` is not `localhost`,
+`127.0.0.1` or `[::1]` is `403`. A web page cannot reach the API by pointing
+its own domain at 127.0.0.1 (DNS rebinding).
+
+## Endpoints
+
+| Method and path | Body | Success |
+|---|---|---|
+| `GET /health` | | `200 {"status":"ok"}` |
+| `POST /sessions` | `{"name":"notes"}` | `201 {"id","name","created_at"}` |
+| `GET /sessions` | | `200 {"sessions":[{"id","name","created_at","messages"}]}` |
+| `GET /sessions/{id}/messages` | | `200 {"messages":[...]}` |
+| `POST /sessions/{id}/messages` | `{"text":"hi"}` | `200 {"reply","run":{...}}` |
+| `POST /sessions/{id}/messages/stream` | `{"text":"hi"}` | `200 text/event-stream` |
+| `GET /usage` | | `200 {"usage":[...]}` |
+
+`messages` are Rig's own message JSON, exactly as stored, tool calls and
+tool results included. That format belongs to Rig and can change with a Rig
+upgrade.
+
+`run` is the turn's `runs` row without `calls_json`: `run_id`, `session_id`,
+`status`, `error`, `model`, `first_seq`, `last_seq`, `model_calls`,
+`input_tokens`, `output_tokens`, `total_tokens`, `cached_input_tokens`,
+`reasoning_tokens`, `started_at`, `ended_at`.
+
+```bash
+curl -s localhost:8080/sessions -H 'X-Athena-User: alice' -d '{"name":"notes"}'
+curl -N localhost:8080/sessions/$ID/messages/stream -H 'X-Athena-User: alice' -d '{"text":"hi"}'
+```
+
+## Streaming
+
+A streamed turn sends these events, then closes the stream:
+
+```text
+event: delta       data: {"text":"4"}                                0 or more
+event: tool_call   data: {"name":"add","arguments":{"a":21,"b":21}}  0 or more
+event: done        data: {"reply":"42","run":{...}}                  last, on success
+event: error       data: {"error":{"code":"model","message":"..."}}  last, on failure
+```
+
+`done.reply` is the reply. Concatenated deltas can differ from it, because
+text the model writes next to a tool call is streamed too. Keep-alive
+comments (`:` lines) arrive every 15 s during long tool calls. A bad request
+is refused with a status code before the stream starts.
+
+## Errors
+
+Errors are `{"error":{"code","message"}}`:
+
+| Status | `code` | When |
+|---|---|---|
+| 400 | `invalid` | bad or missing header, body not JSON, empty name or text |
+| 403 | `forbidden_host` | foreign `Host` on loopback |
+| 404 | `not_found` | no such session **for this user**, including another user's |
+| 409 | `already_exists` | session name taken |
+| 409 | `conflict` | another process wrote to the session mid-turn; send again |
+| 502 | `model` | the model failed; details in the server log and `runs.error` |
+| 500 | `storage` | the database failed; details in the server log |
+| (SSE) | `internal` | the turn crashed; details in the server log |
+
+`model` and `storage` messages are generic, because provider and database
+errors can carry details an unauthenticated client should not see.
+
+A turn that has started finishes and is saved even if its client
+disconnects, streamed or not.

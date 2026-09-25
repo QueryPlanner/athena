@@ -1,0 +1,55 @@
+---
+title: Telegram
+description: Run athena as a Telegram bot with per-user sessions.
+---
+
+```bash
+export TELEGRAM_BOT_TOKEN=123456:ABC...   # from @BotFather
+cargo run -- telegram                     # long polling; Ctrl-C stops
+```
+
+`athena telegram` needs `OPENROUTER_API_KEY` and `TELEGRAM_BOT_TOKEN` and
+checks both before it opens the database.
+
+<Callout type="warn">
+  The bot is open to anyone who finds it, and every turn spends the owner's
+  OpenRouter credit. See [Known limits](/docs/known-limits).
+</Callout>
+
+It answers private chats only. A group message is ignored and logged: in a
+group every member would read one member's conversation.
+
+## Users and sessions
+
+Each Telegram user is the user `telegram:<their Telegram user id>`, so
+`cargo run -- --user telegram:ID sessions` shows what the bot stored for
+them. They talk in one session at a time: `default` until they pick
+another. The pick is stored (the `selected_sessions` table), so it survives
+a restart.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `/new NAME` | Create session NAME and switch to it. Without NAME, picks `chat-N`. |
+| `/sessions` | List your sessions with message counts; `*` marks the current one. |
+| `/switch NAME` | Switch to an existing session (`default` always exists). |
+| `/usage` | Turns, model calls and tokens per session. |
+| `/help`, `/start` | What the bot is, the current session, the commands. |
+
+The commands are registered with Telegram's command menu at startup. Any
+other text is a prompt for the current session.
+
+## Behaviour
+
+- While the model works the bot shows "typing...".
+- A reply over Telegram's 4096-character limit is split at a line break near
+  the limit if there is one, else at a space, never inside a character. At
+  most 8 messages, then a note that the rest is in the transcript.
+- A 429 from Telegram is retried after the delay it asks for.
+- Each turn runs in its own task, so a slow model never holds up another
+  user. One user gets one turn at a time: a message that arrives while their
+  turn runs is answered "Still working on your last message..." and dropped.
+  Commands still answer at once.
+- Errors are logged to stderr and answered with one short line; the bot
+  keeps running.
