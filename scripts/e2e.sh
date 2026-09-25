@@ -191,4 +191,129 @@ expect "the new turn appended at seq 12" \
     "$(q "SELECT first_seq FROM runs WHERE session_id='testsess' AND rowid > 3")" "12"
 expect "seq numbers contiguous" "$(contiguous testsess)" "1"
 
-__SECTION8__
+echo
+echo "-- 8. the Telegram bot, against a fake Bot API --"
+# The real `athena telegram` binary polls scripts/fake_telegram.py through
+# TELEGRAM_API_URL. Checks without the model come first, then real turns.
+rm -f "$ATHENA_DB" "$ATHENA_DB-wal" "$ATHENA_DB-shm"
+python3 scripts/fake_telegram.py "$WORK/tg.port" &
+BG_PIDS+=("$!")
+for _ in $(seq 1 100); do [ -s "$WORK/tg.port" ] && break; sleep 0.1; done
+[ -s "$WORK/tg.port" ] || fail "the fake Bot API started"
+TG="http://127.0.0.1:$(cat "$WORK/tg.port")"
+# Token-shaped, so teloxide redacts it, but built here: never a real secret.
+TG_SECRET="not_a_real_secret_$(printf 'x%.0s' $(seq 1 18))"
+
+BOT_PID=""
+start_bot() {
+    TELEGRAM_BOT_TOKEN="123456789:$TG_SECRET" TELEGRAM_API_URL="$TG" \
+        "$BIN" telegram 2>>"$WORK/bot.log" &
+    BOT_PID=$!
+    BG_PIDS+=("$BOT_PID")
+}
+stop_bot() { # description
+    kill -INT "$BOT_PID"
+    if wait "$BOT_PID"; then pass "$1"; else sed 's/^/      /' "$WORK/bot.log"; fail "$1"; fi
+}
+tg_count() { curl -sf "$TG/control/count?method=$1&chat=${2:-0}"; } # method, [chat]
+tg_text() { curl -sf "$TG/control/text?chat=$1&n=$2"; }              # chat, n (1-based)
+tg_send() { curl -sf --data-urlencode "user=$1" --data-urlencode "text=$2" "$TG/control/message" >/dev/null; }
+tg_wait() { # method, chat, n, description: wait until the fake saw n such calls
+    for _ in $(seq 1 1200); do
+        [ "$(tg_count "$1" "$2")" -ge "$3" ] && return 0
+        kill -0 "$BOT_PID" 2>/dev/null || { sed 's/^/      /' "$WORK/bot.log"; fail "$4 (the bot exited)"; }
+        sleep 0.1
+    done
+    sed 's/^/      /' "$WORK/bot.log"
+    fail "$4 (timed out)"
+}
+tg_say() { # user, text: send it, wait for the next reply to that user, print it
+    local n=$(($(tg_count sendMessage "$1") + 1))
+    tg_send "$1" "$2"
+    tg_wait sendMessage "$1" "$n" "a reply to telegram user $1 for '$2'"
+    tg_text "$1" "$n"
+}
+tg_selected() { # telegram user id: name of their selected session
+    q "SELECT s.name FROM selected_sessions c JOIN sessions s ON s.id = c.session_id
+       JOIN users u ON u.id = c.user_id
+       WHERE u.transport = 'telegram' AND u.external_id = '$1'"
+}
+tg_sessions() { # telegram user id: their sessions, as the CLI lists them
+    athena --user "telegram:$1" sessions | tr '\t\n' ': '
+}
+
+start_bot
+tg_wait getUpdates 0 1 "the bot started polling"
+expect "the command menu was registered" "$(tg_count setMyCommands)" "1"
+
+reply=$(tg_say 9001 "/new side")
+expect "/new answers" "$reply" "Started session \`side\`. Your messages go to it now."
+expect "/new created the session for that telegram user" "$(tg_sessions 9001)" "side:0 messages "
+expect "/new stored the selection" "$(tg_selected 9001)" "side"
+expect "/sessions marks it" "$(tg_say 9001 /sessions)" "$(printf 'Your sessions:\n* side (0 messages)')"
+expect "/switch default answers" "$(tg_say 9001 "/switch default")" "Switched to \`default\` (0 messages)."
+expect "/switch stored the selection" "$(tg_selected 9001)" "default"
+reply=$(tg_say 9001 "/switch nope")
+case "$reply" in "You have no session named \`nope\`"*) pass "/switch refuses a missing session";;
+    *) fail "/switch refuses a missing session (got '$reply')";; esac
+expect "and does not create it" "$(tg_sessions 9001)" "default:0 messages side:0 messages "
+reply=$(tg_say 9003 "/switch side")
+case "$reply" in "You have no session named \`side\`"*) pass "another user cannot switch to it";;
+    *) fail "another user cannot switch to it (got '$reply')";; esac
+expect "the other user has no sessions" "$(tg_sessions 9003)" ""
+
+stop_bot "Ctrl-C stops the bot cleanly"
+polls=$(tg_count getUpdates)
+start_bot
+tg_wait getUpdates 0 $((polls + 1)) "the restarted bot started polling"
+expect "after a restart the selection is still current" \
+    "$(tg_say 9001 /sessions)" "$(printf 'Your sessions:\n* default (0 messages)\n  side (0 messages)')"
+expect "the old process's messages were not handled again" "$(tg_count sendMessage 9001)" "5"
+
+# From here on, real turns against OpenRouter.
+reply=$(tg_say 9002 "Remember this code word: OTTER-5150. Reply with just OK.")
+case "$reply" in
+    "" | "The model failed"* | "Something went wrong"*)
+        sed 's/^/      /' "$WORK/bot.log"
+        fail "a prompt gets a model reply through the Bot API (got '$reply')";;
+esac
+pass "a prompt gets a model reply through the Bot API"
+expect "a first message creates the user and their default session" \
+    "$(tg_sessions 9002)" "default:2 messages "
+DEFAULT_9002=$(sid default telegram 9002)
+expect "one run recorded, status ok" \
+    "$(q "SELECT COUNT(*) || ' ' || status FROM runs WHERE session_id='$DEFAULT_9002'")" "1 ok"
+[ "$(tg_count sendChatAction 9002)" -ge 1 ] || fail "the bot showed typing before replying"
+pass "the bot showed typing before replying"
+
+tg_say 9001 "Say hi in one word." >/dev/null
+expect "a prompt goes to the selected session" "$(tg_sessions 9001)" "default:2 messages side:0 messages "
+tg_say 9001 "/switch side" >/dev/null
+tg_say 9001 "Say hello in one word." >/dev/null
+expect "after /switch, prompts go to the new selection" \
+    "$(tg_sessions 9001)" "default:2 messages side:2 messages "
+
+tg_say 9002 "/new other" >/dev/null
+tg_say 9002 "/switch default" >/dev/null
+recalled=""
+for attempt in 1 2; do
+    reply=$(tg_say 9002 "What code word did I give you? Reply with just the code word.")
+    if echo "$reply" | grep -qi 'otter-5150'; then recalled=yes; break; fi
+    echo "      reply on attempt $attempt: $reply"
+done
+[ -n "$recalled" ] || fail "switching back resumes the conversation"
+pass "switching back resumes the conversation"
+expect "the code word never reached the other telegram user's sessions" \
+    "$(q "SELECT COUNT(*) FROM messages m JOIN sessions s ON s.id = m.session_id
+          JOIN users u ON u.id = s.user_id
+          WHERE u.external_id = '9001' AND m.json LIKE '%OTTER%'")" "0"
+expect "/usage answers from the database" "$(tg_say 9002 /usage | cut -d: -f1)" "default"
+
+stop_bot "the restarted bot stops cleanly"
+expect "no session lacks an owner" \
+    "$(q "SELECT COUNT(*) FROM sessions s LEFT JOIN users u ON u.id = s.user_id WHERE u.id IS NULL")" "0"
+if grep -q "$TG_SECRET" "$WORK/bot.log"; then fail "the bot token never reaches the log"; fi
+pass "the bot token never reaches the log"
+
+echo
+echo "All end-to-end checks passed."

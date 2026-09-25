@@ -70,7 +70,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # a long poll the bot abandoned when it shut down
 
     def body(self):
         length = int(self.headers.get("Content-Length") or 0)

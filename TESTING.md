@@ -180,15 +180,20 @@ assuming the code is wrong. The model may have refused or rephrased.
    turn starts at seq 12.
 
 8. The Telegram bot: `scripts/fake_telegram.py`, a fake Bot API server,
-   and the real `athena telegram` binary against it, with the real model.
-   A message from a new Telegram user creates that user and their `default`
-   session, stores the turn and one run, and the reply comes back through
-   the fake API after a typing indicator. `/new` creates and selects a
-   session and the next prompt lands there; `/switch default` goes back and
-   the model recalls a code word from before. A second Telegram user gets a
-   separate session and only their own replies. Ctrl-C stops the bot with
-   exit status 0, and after a restart `/sessions` still marks the selected
-   session. The bot token never appears in the bot's log.
+   and the real `athena telegram` binary against it through
+   `TELEGRAM_API_URL`. Checks that need no model run first: the command
+   menu is registered; `/new` creates and selects a session for that
+   Telegram user; `/sessions` marks it; `/switch` moves and stores the
+   selection, refuses a missing session and creates nothing; another user
+   cannot switch into it. Ctrl-C exits with status 0, and after a restart
+   `/sessions` still marks the selection and old updates are not handled
+   again. Then real turns: a new Telegram user's prompt creates the user
+   and their `default` session, stores one ok run, shows typing, and the
+   model's reply comes back through the fake API. Prompts go to the
+   selected session; `/switch` back resumes a conversation (a code word,
+   retried once), and it never reaches the other user's sessions. The bot
+   token never appears in the bot's log. Without a valid key the model-free
+   checks still pass and the first turn check fails.
 
 ### Extending it
 
