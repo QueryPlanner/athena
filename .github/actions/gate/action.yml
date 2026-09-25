@@ -18,12 +18,21 @@ inputs:
   ssh-key:
     description: Private key for deploy@VM (the environment's DEPLOY_SSH_KEY secret).
     required: true
+  ts-authkey:
+    description: >-
+      Tailscale auth key (secrets.TS_AUTH_KEY): reusable and ephemeral,
+      ideally pre-tagged tag:ci. Expires (90 days at most); rotate it then.
+      Used when set; otherwise the OAuth client below.
+    required: false
+    default: ""
   ts-oauth-client-id:
-    description: Tailscale OAuth client id (secrets.TS_OAUTH_CLIENT_ID).
-    required: true
+    description: Tailscale OAuth client id (secrets.TS_OAUTH_CLIENT_ID). Does not expire.
+    required: false
+    default: ""
   ts-oauth-secret:
     description: Tailscale OAuth client secret (secrets.TS_OAUTH_SECRET).
-    required: true
+    required: false
+    default: ""
 
 outputs:
   result:
@@ -40,18 +49,27 @@ runs:
         KNOWN_HOSTS: ${{ inputs.known-hosts }}
         SSH_KEY: ${{ inputs.ssh-key }}
         TS_ID: ${{ inputs.ts-oauth-client-id }}
+        TS_KEY: ${{ inputs.ts-authkey }}
       run: |
         missing=""
         [ -n "$HOST" ] || missing="$missing VM_HOST(variable)"
         [ -n "$KNOWN_HOSTS" ] || missing="$missing VM_KNOWN_HOSTS(variable)"
         [ -n "$SSH_KEY" ] || missing="$missing DEPLOY_SSH_KEY(environment secret)"
-        [ -n "$TS_ID" ] || missing="$missing TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET(secrets)"
+        [ -n "$TS_KEY$TS_ID" ] || missing="$missing TS_AUTH_KEY or TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET(secrets)"
         if [ -n "$missing" ]; then
           echo "::error::not configured:$missing. See SETUP.md (scripts/init-github.sh)."
           exit 1
         fi
 
-    - name: Join the tailnet (tag:ci, ephemeral)
+    - name: Join the tailnet (auth key, ephemeral)
+      if: inputs.ts-authkey != ''
+      uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
+      with:
+        authkey: ${{ inputs.ts-authkey }}
+        ping: ${{ inputs.host }}
+
+    - name: Join the tailnet (OAuth, tag:ci, ephemeral)
+      if: inputs.ts-authkey == ''
       uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
       with:
         oauth-client-id: ${{ inputs.ts-oauth-client-id }}

@@ -223,10 +223,10 @@ else
     if [ "${ruleset:-0}" -gt 0 ]; then check "v* tag ruleset" pass "$ruleset tag ruleset(s)"
     else check "v* tag ruleset" fail "no tag ruleset: init-github.sh"; fi
     secrets=$(gh secret list --repo "$REPO" --json name --jq '.[].name' 2>/dev/null || true)
-    for name in TS_OAUTH_CLIENT_ID TS_OAUTH_SECRET; do
-        if grep -qx "$name" <<<"$secrets"; then check "secret $name" pass present
-        else check "secret $name" fail "missing: gh secret set $name"; fi
-    done
+    if grep -qx TS_AUTH_KEY <<<"$secrets"; then check "tailscale credential" pass "TS_AUTH_KEY (expires; rotate)"
+    elif grep -qx TS_OAUTH_CLIENT_ID <<<"$secrets" && grep -qx TS_OAUTH_SECRET <<<"$secrets"; then
+        check "tailscale credential" pass "OAuth client"
+    else check "tailscale credential" fail "missing: gh secret set TS_AUTH_KEY"; fi
     if gh variable get VM_KNOWN_HOSTS --repo "$REPO" >/dev/null 2>&1; then check "variable VM_KNOWN_HOSTS" pass set
     else check "variable VM_KNOWN_HOSTS" fail "missing: init-github.sh --vm-host"; fi
 

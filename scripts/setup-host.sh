@@ -249,7 +249,9 @@ render() {
     printf '%s\n' "$content"
 }
 
-random_secret() { head -c 32 /dev/urandom | base64 | tr -d '/+=\n' | head -c 32; }
+# 28 random base64 letters and digits, then "-Aa0": OpenObserve rejects a
+# root password without a lowercase, uppercase, digit and special character.
+random_secret() { printf '%s-Aa0' "$(head -c 48 /dev/urandom | base64 | tr -d '/+=\n' | head -c 28)"; }
 
 confirm() {
     [ "$ASSUME_YES" = 1 ] && return 0

@@ -189,7 +189,7 @@ On a failed health check it puts the previous `current` back, restarts, and exit
 
 | Name | Kind | Scope |
 |---|---|---|
-| `TS_OAUTH_CLIENT_ID`, `TS_OAUTH_SECRET` | secret | repo (Tailscale OAuth client, tag `tag:ci`) |
+| `TS_AUTH_KEY` (or `TS_OAUTH_CLIENT_ID` + `TS_OAUTH_SECRET`) | secret | repo. Auth key: reusable, ephemeral, ideally pre-tagged `tag:ci`; expires, so rotate it. The OAuth client doesn't expire. |
 | `DEPLOY_SSH_KEY` | secret | environment `staging`; another in environment `prod` |
 | `VM_HOST` | variable | e.g. `100.124.202.79` |
 | `VM_KNOWN_HOSTS` | variable | the VM's host key line |

@@ -5,7 +5,7 @@
 #   - a ruleset protecting v* tags (only admins create; no delete/move)
 #   - variables VM_HOST and VM_KNOWN_HOSTS
 #   - the DEPLOY_SSH_KEY secret in each environment
-# It checks, but never sets, TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET: the human
+# It checks, but never sets, TS_AUTH_KEY or TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET: the human
 # types those into `gh secret set` (SETUP.md). Secret values are read from
 # files and never printed.
 #
@@ -194,11 +194,13 @@ fi
 
 step "repository secrets (checked, never set here)"
 secrets=$(gh secret list --repo "$REPO" --json name --jq '.[].name' 2>/dev/null || true)
-for name in TS_OAUTH_CLIENT_ID TS_OAUTH_SECRET; do
-    if grep -qx "$name" <<<"$secrets"; then echo "  $name present" >&2; else
-        TODO+=("secret $name missing: type it yourself with: gh secret set $name --repo $REPO")
-    fi
-done
+if grep -qx TS_AUTH_KEY <<<"$secrets"; then
+    echo "  TS_AUTH_KEY present (auth key; rotate before it expires)" >&2
+elif grep -qx TS_OAUTH_CLIENT_ID <<<"$secrets" && grep -qx TS_OAUTH_SECRET <<<"$secrets"; then
+    echo "  TS_OAUTH_CLIENT_ID and TS_OAUTH_SECRET present" >&2
+else
+    TODO+=("no Tailscale credential for CI: gh secret set TS_AUTH_KEY --repo $REPO (or the OAuth pair TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET)")
+fi
 
 echo
 if [ "$DRY_RUN" = 1 ]; then echo "Dry run: ${#CHANGED[@]} change(s) would be made to $REPO."; else

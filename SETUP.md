@@ -93,6 +93,8 @@ package it would add; it never touches Docker, ufw, sshd, Caddy or Tailscale.
    **`tag:ci`**. Copy the client id and secret.
 3. In a terminal (not the chat), type them into GitHub:
    ```bash
+   gh secret set TS_AUTH_KEY          # simplest: a reusable, ephemeral auth key (expires; rotate)
+   # or, to never rotate, an OAuth client (auth_keys scope, tag:ci):
    gh secret set TS_OAUTH_CLIENT_ID   # paste the id at the prompt
    gh secret set TS_OAUTH_SECRET      # paste the secret at the prompt
    ```
