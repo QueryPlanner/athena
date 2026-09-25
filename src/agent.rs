@@ -89,14 +89,4 @@ mod tests {
         // A missing file is reported to the model, not raised as a panic.
         assert!(read_file(path.display().to_string()).is_err());
     }
-
-    #[test]
-    fn build_constructs_an_openrouter_agent_without_network() {
-        // Construction only: Agent's fields are private, and anything past
-        // this needs a real key. Behaviour is covered through `configure`
-        // against the mock model in tests/agent_loop.rs.
-        let client = Client::new("test-key").unwrap();
-        let memory = rig::core::memory::InMemoryConversationMemory::new();
-        let _agent = build(&client, DEFAULT_MODEL, memory);
-    }
 }

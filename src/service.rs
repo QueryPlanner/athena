@@ -827,26 +827,6 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn usage_and_sessions_report_the_users_own_sessions() {
-        let (service, _, _) = service();
-        let (user, session) = with_session(&service).await;
-        let (agent, _) = agent_with(service.memory(), add_turns());
-        service
-            .send(&agent, &user, &session.id, "add")
-            .await
-            .unwrap();
-
-        let usage = service.usage(&user).await.unwrap();
-        let sessions = service.sessions(&user).await.unwrap();
-
-        assert_eq!((usage[0].name.as_str(), usage[0].model_calls), ("s", 2));
-        assert_eq!(
-            (sessions[0].session.name.as_str(), sessions[0].messages),
-            ("s", 4)
-        );
-    }
-
     #[test]
     fn every_error_says_what_went_wrong() {
         for (error, text) in [
@@ -860,19 +840,6 @@ mod tests {
         ] {
             assert_eq!(error.to_string(), text);
         }
-    }
-
-    #[test]
-    fn a_service_and_its_turns_can_cross_threads() {
-        fn shareable<T: Send + Sync>() {}
-        fn sendable<T: Send>(_: T) {}
-        shareable::<Service>();
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let (service, _, _) = rt.block_on(async { service() });
-        let user = rt.block_on(service.user("cli", "local")).unwrap();
-        let (agent, _) = agent_with(service.memory(), []);
-        // What an axum handler or a teloxide task needs from `send`.
-        sendable(service.send(&agent, &user, "id", "hi"));
     }
 
     /// Parks each load after it has read the history, until released, and

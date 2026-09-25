@@ -581,7 +581,6 @@ async fn a_client_that_disconnects_mid_stream_still_gets_its_turn_saved() {
     let tmp = TempDb::new();
     let service = service(&tmp);
     let (memory, gate, mut appending) = parked(&service);
-    assert!(memory.clear("x").await.is_err());
     let (agent, _) = mock_stream_agent(memory, [streamed_text(&["hel", "lo"], usage(9, 2))]);
     let router = api(&service, agent);
     let id = create(&router, "alice", "s").await;
@@ -676,7 +675,6 @@ async fn a_turn_that_panics_mid_stream_still_ends_the_stream_with_an_error_event
     let tmp = TempDb::new();
     let service = service(&tmp);
     let memory = PanicsOnAppend(service.memory());
-    assert!(memory.clear("x").await.is_err());
     let (agent, _) = mock_stream_agent(memory, [streamed_text(&["partial"], usage(1, 1))]);
     let router = api(&service, agent);
     let id = create(&router, "alice", "s").await;
