@@ -329,6 +329,14 @@ ensure_users() {
                 --shell /usr/sbin/nologin openobserve
             changed "user openobserve"
         fi
+        # Same command as the otelcol-contrib package's preinst, which skips
+        # it when the user exists. Created early so the collector's env file
+        # can be group-owned before the package is installed.
+        if id otelcol-contrib >/dev/null 2>&1; then same "user otelcol-contrib"; else
+            run useradd --system --user-group --no-create-home --shell /sbin/nologin otelcol-contrib
+            stamp_set user-otelcol-contrib created
+            changed "user otelcol-contrib (runs the collector)"
+        fi
     fi
 }
 
@@ -375,9 +383,41 @@ install_duckdb() {
     changed "installed duckdb $DUCKDB_VERSION"
 }
 
+# Runs after install_openobserve: the collector's env file is derived from
+# OpenObserve's. Our config, drop-in and env file go in place BEFORE dpkg,
+# because the package's postinst restarts the collector at once; without them
+# it would start on the vendor config, which listens on 0.0.0.0 (OTLP, pprof,
+# zpages, Jaeger, Zipkin). --force-confold keeps our config.yaml (a conffile)
+# without a prompt, which >/dev/null would otherwise hide on an upgrade.
 install_otelcol() {
     step "otelcol-contrib $OTELCOL_VERSION"
-    local have restart=0
+    local have restart=0 otel
+    otel=$(owner_or_root otelcol-contrib)
+    ensure_dir /var/lib/athena/otel 0750 "$otel"
+    install_file "$REPO_ROOT/deploy/otel/config.yaml" /etc/otelcol-contrib/config.yaml 0644 root:root && restart=1
+    install_file "$REPO_ROOT/deploy/otel/otelcol-contrib.override.conf" \
+        /etc/systemd/system/otelcol-contrib.service.d/athena.conf 0644 root:root && restart=1
+
+    local o2env=/etc/openobserve/openobserve.env colenv=/etc/otelcol-contrib/openobserve.env
+    if [ -f "$colenv" ]; then
+        fix_mode "$colenv" 0640 "root:${otel##*:}"
+        same "$colenv"
+    elif [ "$DRY_RUN" = 1 ]; then
+        changed "would create $colenv (0640 root:otelcol-contrib) with the OpenObserve basic-auth header"
+    else
+        local email pass
+        email=$(sed -n 's/^ZO_ROOT_USER_EMAIL=//p' "$o2env")
+        pass=$(sed -n 's/^ZO_ROOT_USER_PASSWORD=//p' "$o2env")
+        {
+            echo "# Written by setup-host.sh from $o2env. Used by deploy/otel/config.yaml."
+            echo "OPENOBSERVE_OTLP_ENDPOINT=http://$TAILNET_IP:$PORT_O2/api/default"
+            printf 'OPENOBSERVE_AUTH=Basic %s\n' "$(printf '%s:%s' "$email" "$pass" | base64 -w0)"
+        } >"$WORK/col.env"
+        install -D -m 0640 -o root -g "${otel##*:}" "$WORK/col.env" "$colenv"
+        changed "created $colenv"
+        restart=1
+    fi
+
     have=$(dpkg-query -W -f='${Version}' otelcol-contrib 2>/dev/null || true)
     if [ "$have" = "$OTELCOL_VERSION" ]; then
         same "otelcol-contrib $OTELCOL_VERSION"
@@ -386,16 +426,10 @@ install_otelcol() {
     else
         fetch "$OTELCOL_URL" "$OTELCOL_SHA256" "$WORK/otelcol.deb"
         [ -n "$have" ] || stamp_set otelcol-contrib "$OTELCOL_VERSION"
-        dpkg -i "$WORK/otelcol.deb" >/dev/null
+        dpkg --force-confdef --force-confold -i "$WORK/otelcol.deb" >/dev/null
         changed "installed otelcol-contrib $OTELCOL_VERSION"
         restart=1
     fi
-    local otel
-    otel=$(owner_or_root otelcol-contrib)
-    ensure_dir /var/lib/athena/otel 0750 "$otel"
-    install_file "$REPO_ROOT/deploy/otel/config.yaml" /etc/otelcol-contrib/config.yaml 0644 root:root && restart=1
-    install_file "$REPO_ROOT/deploy/otel/otelcol-contrib.override.conf" \
-        /etc/systemd/system/otelcol-contrib.service.d/athena.conf 0644 root:root && restart=1
     OTEL_RESTART=$restart
 }
 
@@ -436,28 +470,6 @@ install_openobserve() {
         changed "created $o2env with a generated root password"
         todo "OpenObserve login: user $O2_EMAIL, password: sudo grep ZO_ROOT_USER_PASSWORD $o2env (UI: http://$TAILNET_IP:$PORT_O2)"
         restart=1
-    fi
-
-    local colenv=/etc/otelcol-contrib/openobserve.env
-    local otel
-    otel=$(owner_or_root otelcol-contrib)
-    if [ -f "$colenv" ]; then
-        fix_mode "$colenv" 0640 "root:${otel##*:}"
-        same "$colenv"
-    elif [ "$DRY_RUN" = 1 ]; then
-        changed "would create $colenv (0640 root:otelcol-contrib) with the OpenObserve basic-auth header"
-    else
-        local email pass
-        email=$(sed -n 's/^ZO_ROOT_USER_EMAIL=//p' "$o2env")
-        pass=$(sed -n 's/^ZO_ROOT_USER_PASSWORD=//p' "$o2env")
-        {
-            echo "# Written by setup-host.sh from $o2env. Used by deploy/otel/config.yaml."
-            echo "OPENOBSERVE_OTLP_ENDPOINT=http://$TAILNET_IP:$PORT_O2/api/default"
-            printf 'OPENOBSERVE_AUTH=Basic %s\n' "$(printf '%s:%s' "$email" "$pass" | base64 -w0)"
-        } >"$WORK/col.env"
-        install -D -m 0640 -o root -g "${otel##*:}" "$WORK/col.env" "$colenv"
-        changed "created $colenv"
-        OTEL_RESTART=1
     fi
 
     install_file "$REPO_ROOT/deploy/systemd/openobserve.service" \
@@ -670,7 +682,10 @@ uninstall() {
         for bin in oras duckdb; do
             if [ -n "$(stamp_get "$bin")" ]; then run rm -f "/usr/local/bin/$bin"; changed "removed /usr/local/bin/$bin"; fi
         done
-        for u in deploy athena openobserve; do
+        local users=(deploy athena openobserve)
+        # Only when this script created it; the package never removes it.
+        [ -n "$(stamp_get user-otelcol-contrib)" ] && users+=(otelcol-contrib)
+        for u in "${users[@]}"; do
             if id "$u" >/dev/null 2>&1; then run userdel -r "$u" >/dev/null 2>&1 || run userdel "$u"; changed "removed user $u"; fi
         done
         [ -d "$STAMPS" ] && run rm -rf "$STAMPS"
@@ -708,8 +723,8 @@ main() {
     OTEL_RESTART=0
     O2_RESTART=0
     if [ "$SKIP_OBSERVABILITY" = 0 ]; then
-        install_otelcol
         install_openobserve
+        install_otelcol
     fi
     install_units
     ensure_env_files
