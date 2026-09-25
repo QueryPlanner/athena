@@ -21,6 +21,13 @@ commands:
   serve [--addr ADDR]  run the HTTP API (default 127.0.0.1:8080, or
                        ATHENA_ADDR); unauthenticated, see README
   telegram             run the Telegram bot (TELEGRAM_BOT_TOKEN; see README)
+  eval run|record|compare
+                       run the eval cases; `athena eval` prints the usage
+  bench --url URL      load-check a running HTTP API (see README)
+  backup DEST          copy the database to the new file DEST, online
+  --version            print the version
+
+serve and telegram need ATHENA_DB set to an absolute path.
 
 --user acts as another user, e.g. telegram:42. The default is cli:local.";
 

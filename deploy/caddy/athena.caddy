@@ -1,0 +1,25 @@
+# Example Caddy snippet for a future public frontend (plan section 10b).
+# setup-host.sh never edits your Caddyfile. To use this, copy it next to your
+# Caddyfile, adjust it, and add `import athena.caddy` yourself.
+#
+# The rule: browsers never talk to Athena directly. Caddy serves the frontend
+# and its backend-for-frontend (BFF); the BFF authenticates end users and
+# calls Athena over the tailnet with X-Athena-User set server-side.
+#
+# app.example.com must resolve to this VM's public IP. Caddy obtains the
+# certificate automatically.
+
+app.example.com {
+	encode zstd gzip
+
+	# The BFF (your app), listening on loopback. Caddy flushes
+	# text/event-stream responses immediately, so relayed SSE works as is.
+	reverse_proxy /api/* 127.0.0.1:3000
+
+	# Static frontend build.
+	root * /srv/athena-frontend
+	file_server
+
+	# Never proxy to Athena's own ports (18080/18081) from here. A public
+	# Athena API needs auth stage 1, rate limits, CORS and size limits first.
+}

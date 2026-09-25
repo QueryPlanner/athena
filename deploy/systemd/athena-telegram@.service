@@ -1,0 +1,45 @@
+# Athena Telegram bot for one environment. Enabled for prod only: two
+# processes polling one bot token conflict (HTTP 409), and staging has no bot.
+# Installed by scripts/setup-host.sh; see plans/contracts.md ("systemd").
+[Unit]
+Description=Athena Telegram bot (%i)
+Documentation=https://github.com/QueryPlanner/athena/blob/main/SETUP.md
+Wants=network-online.target
+# serve runs the migrations; the bot opens the database after it.
+After=network-online.target tailscaled.service athena-serve@%i.service
+PartOf=athena@%i.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=athena
+Group=athena
+EnvironmentFile=/etc/athena/%i.env
+WorkingDirectory=/var/lib/athena/%i
+ExecStart=/opt/athena/%i/current/athena telegram
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=120
+
+# Hardening
+MemoryMax=128M
+NoNewPrivileges=yes
+ProtectSystem=strict
+# agent.db, backups/ and telemetry/ (ATHENA_TELEMETRY_DIR) live here.
+ReadWritePaths=/var/lib/athena/%i
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=athena@%i.target

@@ -1,0 +1,115 @@
+name: deploy-gate
+description: >-
+  Join the tailnet as an ephemeral tag:ci node, then run deploy-gate commands
+  on the VM over SSH. The SSH key is a forced-command key, so each command is
+  only a request that deploy-gate validates; the digest is the only data that
+  crosses. Prints each command's final JSON line to the job summary.
+
+inputs:
+  commands:
+    description: One deploy-gate command per line, e.g. "deploy staging sha256:...".
+    required: true
+  host:
+    description: The VM's tailnet IP or MagicDNS name (vars.VM_HOST).
+    required: true
+  known-hosts:
+    description: The VM's SSH host key line(s) (vars.VM_KNOWN_HOSTS).
+    required: true
+  ssh-key:
+    description: Private key for deploy@VM (the environment's DEPLOY_SSH_KEY secret).
+    required: true
+  ts-authkey:
+    description: >-
+      Tailscale auth key (secrets.TS_AUTH_KEY): reusable and ephemeral,
+      ideally pre-tagged tag:ci. Expires (90 days at most); rotate it then.
+      Used when set; otherwise the OAuth client below.
+    required: false
+    default: ""
+  ts-oauth-client-id:
+    description: Tailscale OAuth client id (secrets.TS_OAUTH_CLIENT_ID). Does not expire.
+    required: false
+    default: ""
+  ts-oauth-secret:
+    description: Tailscale OAuth client secret (secrets.TS_OAUTH_SECRET).
+    required: false
+    default: ""
+
+outputs:
+  result:
+    description: The final JSON line printed by the last command.
+    value: ${{ steps.run.outputs.result }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check configuration
+      shell: bash
+      env:
+        HOST: ${{ inputs.host }}
+        KNOWN_HOSTS: ${{ inputs.known-hosts }}
+        SSH_KEY: ${{ inputs.ssh-key }}
+        TS_ID: ${{ inputs.ts-oauth-client-id }}
+        TS_KEY: ${{ inputs.ts-authkey }}
+      run: |
+        missing=""
+        [ -n "$HOST" ] || missing="$missing VM_HOST(variable)"
+        [ -n "$KNOWN_HOSTS" ] || missing="$missing VM_KNOWN_HOSTS(variable)"
+        [ -n "$SSH_KEY" ] || missing="$missing DEPLOY_SSH_KEY(environment secret)"
+        [ -n "$TS_KEY$TS_ID" ] || missing="$missing TS_AUTH_KEY or TS_OAUTH_CLIENT_ID/TS_OAUTH_SECRET(secrets)"
+        if [ -n "$missing" ]; then
+          echo "::error::not configured:$missing. See SETUP.md (scripts/init-github.sh)."
+          exit 1
+        fi
+
+    - name: Join the tailnet (auth key, ephemeral)
+      if: inputs.ts-authkey != ''
+      uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
+      with:
+        authkey: ${{ inputs.ts-authkey }}
+        ping: ${{ inputs.host }}
+
+    - name: Join the tailnet (OAuth, tag:ci, ephemeral)
+      if: inputs.ts-authkey == ''
+      uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
+      with:
+        oauth-client-id: ${{ inputs.ts-oauth-client-id }}
+        oauth-secret: ${{ inputs.ts-oauth-secret }}
+        tags: tag:ci
+        ping: ${{ inputs.host }}
+
+    - name: Run deploy-gate
+      id: run
+      shell: bash
+      env:
+        HOST: ${{ inputs.host }}
+        KNOWN_HOSTS: ${{ inputs.known-hosts }}
+        SSH_KEY: ${{ inputs.ssh-key }}
+        COMMANDS: ${{ inputs.commands }}
+      run: |
+        set -euo pipefail
+        dir=$(mktemp -d)
+        trap 'rm -rf "$dir"' EXIT
+        umask 077
+        printf '%s\n' "$SSH_KEY" >"$dir/key"
+        printf '%s\n' "$KNOWN_HOSTS" >"$dir/known_hosts"
+        last=""
+        while IFS= read -r cmd; do
+          cmd=$(echo "$cmd" | xargs)
+          [ -n "$cmd" ] || continue
+          echo "::group::deploy-gate $cmd"
+          # stdout is the gate's JSON line; stderr is its human log.
+          out=$(ssh -n -i "$dir/key" -o IdentitiesOnly=yes -o BatchMode=yes \
+                -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$dir/known_hosts" \
+                -o ConnectTimeout=30 -o ServerAliveInterval=30 \
+                "deploy@$HOST" "$cmd")
+          echo "::endgroup::"
+          last=$(printf '%s\n' "$out" | tail -n1)
+          printf '%s\n' "$out"
+          {
+            echo "### \`$cmd\`"
+            echo '```json'
+            echo "$last"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+        done <<<"$COMMANDS"
+        echo "result=$last" >>"$GITHUB_OUTPUT"

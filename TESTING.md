@@ -17,8 +17,15 @@ cargo clippy --all-targets --locked -- -D warnings
 ./scripts/coverage.sh
 ```
 
-CI runs the same three commands on every pull request. `coverage.sh` also runs
-the unit and integration tests.
+CI (`.github/workflows/ci-cd.yml`) runs the same three commands on every pull
+request. `coverage.sh` also runs the unit and integration tests. CI also runs:
+
+- `shellcheck scripts/*.sh`, `scripts/setup-host.sh --dry-run` (no root), and
+  `scripts/test-analytics.sh` (every DuckDB query against fixtures laid out
+  like `/var/lib/athena/<env>/telemetry/`; it passes on DuckDB 1.4 and 1.5);
+- `scripts/smoke-binary.sh target/release/athena`: the release binary serving
+  on loopback with a temp database (`/health`, `/version`, a session, the Host
+  allowlist, SIGTERM, `athena backup`), with no model calls.
 
 ## Coverage
 
@@ -31,7 +38,8 @@ excluding the line. The existing code shows the usual fixes:
 
 - Environment variables are read by a one-line function that passes the
   value to a pure function you can test: `agent::model_or_default`,
-  `store::path_or_default`, `runner::keep_raw`.
+  `store::path_or_default`, `runner::keep_raw`, `ops::version_or_dev`,
+  `ops::absolute_db`, `http::allowed_hosts`.
 - The provider is kept apart from the agent's definition, so tests build
   the production agent around a mock model: `agent::configure`.
 - The CLI takes its input, output and agent factory as parameters:
@@ -70,6 +78,18 @@ a "no API key" test would find one and call the provider.
   script streaming turns. Every scripted stream must end with
   `MockStreamEvent::final_response`: without it Rig treats the turn as
   truncated and fails it.
+
+`tests/telemetry.rs` installs the tracing layers for one thread with
+exporters that keep what they are sent, runs real turns through the router
+and the service, and checks the spans, their nesting and the log records.
+A prod variant checks that content capture never reaches an exporter. It
+also runs `athena serve` against a fake OTLP backend on loopback, shaped like
+OpenObserve (an `/api/default` path and a basic-auth header), with
+`ATHENA_TELEMETRY_DIR` set, and checks that SIGTERM flushes traces and logs to
+both. The JSONL writer's schema, daily rotation and retention are unit-tested
+in `src/telemetry/jsonl.rs` with a fake clock and temp directories; one of
+those tests also checks that `analytics/testdata/traces-*.jsonl` has exactly
+the fields the writer produces, so the SQL fixtures cannot drift from it.
 
 `tests/http.rs` drives the HTTP API in-process through the router
 (`tower::ServiceExt::oneshot`), the server over real loopback TCP, and

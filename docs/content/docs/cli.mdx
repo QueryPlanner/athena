@@ -11,9 +11,23 @@ cargo run -- sessions                    # list your sessions
 cargo run -- sessions new notes          # create an empty session
 cargo run -- usage                       # per-session token totals
 cargo run -- --user telegram:42 ...      # any of the above as another user
-cargo run -- serve                       # HTTP API
-cargo run -- telegram                    # Telegram bot
+ATHENA_DB=$PWD/agent.db cargo run -- serve   # HTTP API
+ATHENA_DB=$PWD/agent.db cargo run -- telegram # Telegram bot
+cargo run -- backup backups/today.db     # online copy of the database
+cargo run -- --version                   # athena 0.1.0-dev, or ATHENA_VERSION
 ```
+
+`serve` and `telegram` refuse to start unless `ATHENA_DB` is an absolute
+path. The other commands default to `agent.db` in the working directory.
+
+## Backups and version
+
+`athena backup DEST` copies the database to the new file `DEST`, creating
+its directories. It is safe while `serve` or `telegram` runs: SQLite's online
+backup copies a consistent snapshot, WAL included. It opens the database
+read-only and never migrates it, refuses an existing `DEST`, and needs no API
+key. `athena --version` prints `athena VERSION`: `ATHENA_VERSION` if set,
+else the crate version with `-dev`.
 
 ## Sessions
 

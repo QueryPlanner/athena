@@ -92,9 +92,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
 /// Receives problems worth an operator's attention. Never message text.
 pub type Log = Arc<dyn Fn(&str) + Send + Sync>;
 
-/// How the binary logs: to stderr.
-pub fn log_to_stderr(message: &str) {
-    eprintln!("telegram: {message}");
+/// How the binary logs: a warning through `tracing`, so to stderr and,
+/// when configured, to OpenTelemetry.
+pub fn log_warning(message: &str) {
+    tracing::warn!(transport = TRANSPORT, "{message}");
 }
 
 // ---------------- configuration ----------------
@@ -829,18 +830,16 @@ pub async fn main(model: &str) -> Result<()> {
     let config = Config::from_env()?;
     let client = agent::client()?;
     let store = Store::open(&store::path())?;
-    let service = Arc::new(Service::new(store.clone(), model, log_to_stderr));
-    let agent = agent::build(&client, model, service.memory());
-    let app = Arc::new(Telegram::new(
-        service,
-        store,
-        agent,
-        Arc::new(log_to_stderr),
-    ));
+    let service = Arc::new(Service::new(store.clone(), model, log_warning));
+    let agent = agent::build(&client, model, service.memory())?;
+    let app = Arc::new(Telegram::new(service, store, agent, Arc::new(log_warning)));
     let bot = config.bot();
     let mut dispatcher = dispatcher(bot.clone(), app.clone());
     stop_on(dispatcher.shutdown_token(), stop);
-    log_to_stderr("polling for messages; Ctrl-C or SIGTERM stops");
+    tracing::info!(
+        transport = TRANSPORT,
+        "polling for messages; Ctrl-C or SIGTERM stops"
+    );
     serve(&mut dispatcher, bot, &app).await
 }
 
@@ -855,6 +854,24 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_binarys_log_is_a_tracing_warning_tagged_with_the_transport() {
+        let path = std::env::temp_dir().join(format!("athena-log-{}", uuid::Uuid::new_v4()));
+        let file = std::fs::File::create(&path).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(file)
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || log_warning("getting updates failed"));
+
+        let out = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(out.contains("WARN"), "{out}");
+        assert!(out.contains("getting updates failed"), "{out}");
+        assert!(out.contains("transport=\"telegram\""), "{out}");
     }
 
     #[test]

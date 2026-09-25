@@ -32,8 +32,8 @@ that, tool history included.
 ## Other transports
 
 ```bash
-cargo run -- serve                       # HTTP API on 127.0.0.1:8080
-cargo run -- telegram                    # Telegram bot; needs TELEGRAM_BOT_TOKEN
+ATHENA_DB=$PWD/agent.db cargo run -- serve     # HTTP API on 127.0.0.1:8080
+ATHENA_DB=$PWD/agent.db cargo run -- telegram  # needs TELEGRAM_BOT_TOKEN
 ```
 
 <Callout type="warn">

@@ -2,24 +2,43 @@
 name = "athena"
 version = "0.1.0"
 edition = "2024"
+# `cargo run` means the agent; deploy-gate runs only on the VM.
+default-run = "athena"
 
 [dependencies]
 anyhow = "1.0.104"
-axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "matched-path", "tokio"] }
 dotenvy = "0.15.7"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+libc = "0.2.189"
+opentelemetry = { version = "0.33.0", default-features = false, features = ["trace", "logs"] }
+opentelemetry-appender-tracing = "0.33.0"
+opentelemetry-http = { version = "0.33.0", default-features = false }
+opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "logs"] }
+opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["trace", "logs"] }
+regex = "1.13.1"
+# The same version and features teloxide already builds, so no new code is compiled.
+# Used by the sandbox client, evals and bench.
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 rig-agent = { version = "0.42.0", features = ["derive"] }
 rig-core = "0.42.0"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["backup", "bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.10.9"
 teloxide = { version = "0.17.0", default-features = false, features = ["rustls"] }
 tokio = { version = "1.53.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-opentelemetry = { version = "0.34.0", default-features = false }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "registry", "std", "ansi"] }
 url = "2.5.8"
 uuid = { version = "1.26.1", features = ["v4"] }
 
 [dev-dependencies]
-axum = { version = "0.8.9", default-features = false, features = ["tokio", "http1", "json"] }
+# `multipart` lets the fake OpenSandbox in tests/ parse file uploads.
+axum = { version = "0.8.9", default-features = false, features = ["tokio", "http1", "json", "multipart", "query"] }
 http-body-util = "0.1.5"
+opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["trace", "logs", "testing"] }
 # Same crate and version as above, plus Rig's scripted mock model for tests.
 rig-core = { version = "0.42.0", features = ["test-utils"] }
 tower = { version = "0.5.3", default-features = false, features = ["util"] }

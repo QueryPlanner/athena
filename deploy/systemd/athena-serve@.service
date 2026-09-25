@@ -1,0 +1,46 @@
+# Athena HTTP API for one environment. %i is `staging` or `prod`.
+# Installed by scripts/setup-host.sh; see plans/contracts.md ("systemd").
+[Unit]
+Description=Athena HTTP API (%i)
+Documentation=https://github.com/QueryPlanner/athena/blob/main/SETUP.md
+# ATHENA_ADDR is the tailnet IP, which exists only once tailscaled is up.
+Wants=network-online.target
+After=network-online.target tailscaled.service
+PartOf=athena@%i.target
+# Binding fails until tailscale0 has its address; keep retrying.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=athena
+Group=athena
+EnvironmentFile=/etc/athena/%i.env
+WorkingDirectory=/var/lib/athena/%i
+ExecStart=/opt/athena/%i/current/athena serve
+Restart=on-failure
+RestartSec=5
+# SIGTERM drains the turns in flight before exiting.
+TimeoutStopSec=120
+
+# Hardening
+MemoryMax=128M
+NoNewPrivileges=yes
+ProtectSystem=strict
+# agent.db, backups/ and telemetry/ (ATHENA_TELEMETRY_DIR) live here.
+ReadWritePaths=/var/lib/athena/%i
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=athena@%i.target

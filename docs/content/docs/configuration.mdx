@@ -12,9 +12,11 @@ works. A malformed `.env` stops athena before it touches the database.
 |---|---|---|---|
 | `OPENROUTER_API_KEY` | anything that talks to the model | none, required | OpenRouter API key |
 | `AGENT_MODEL` | all | `openai/gpt-5.6-luna` | Model id on OpenRouter |
-| `ATHENA_DB` | all | `agent.db` | SQLite database file |
+| `ATHENA_DB` | all | `agent.db`; `serve` and `telegram` require an absolute path | SQLite database file |
+| `ATHENA_VERSION` | `--version`, `GET /version` | `<crate version>-dev` | The deployed release |
 | `RUNS_STORE_RAW` | all | on | `0` drops raw provider responses from `runs.calls_json` |
 | `ATHENA_ADDR` | `serve` | `127.0.0.1:8080` | Listen address; `--addr` wins over it |
+| `ATHENA_ALLOWED_HOSTS` | `serve` | unset | Comma list of `HOST` or `HOST:PORT` the API answers; see [HTTP API](/docs/http-api) |
 | `TELEGRAM_BOT_TOKEN` | `telegram` | none, required | Bot token from @BotFather |
 | `TELEGRAM_API_URL` | `telegram` | `https://api.telegram.org` | Bot API server; the tests point it at a fake one |
 

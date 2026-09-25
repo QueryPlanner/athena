@@ -5,7 +5,7 @@ description: Run athena as a Telegram bot with per-user sessions.
 
 ```bash
 export TELEGRAM_BOT_TOKEN=123456:ABC...   # from @BotFather
-cargo run -- telegram                     # long polling; Ctrl-C stops
+ATHENA_DB=$PWD/agent.db cargo run -- telegram  # long polling; Ctrl-C stops
 ```
 
 `athena telegram` needs `OPENROUTER_API_KEY` and `TELEGRAM_BOT_TOKEN` and

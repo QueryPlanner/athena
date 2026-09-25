@@ -1,0 +1,383 @@
+# CI/CD for Athena. See plans/contracts.md ("CI/CD") and SETUP.md.
+#
+#   pull_request   shellcheck + infra checks, unit, integration
+#   push main      build (release artifact to GHCR, sandbox image)
+#                  -> deploy-staging -> bench-staging -> smoke-staging, eval-staging
+#   push tag v*    require-stage-success -> deploy-prod (approval) -> smoke-prod
+#
+# Public repo rules: every action pinned to a commit SHA, minimal permissions
+# per job, no pull_request_target. Fork PRs get no secrets and never reach
+# the tailnet; only jobs on main and v* tags do.
+name: CI/CD
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions: {}
+
+# Supersede an older run of the same PR; never cancel pushes to main or tags
+# (deploy jobs also queue per environment below).
+concurrency:
+  group: ci-cd-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  ORAS_VERSION: 1.3.4
+  ARTIFACT_TYPE: application/vnd.athena.release.v1
+
+jobs:
+  # ---------------------------------------------------------------- CI ----
+  infra-checks:
+    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: shellcheck
+        run: shellcheck --version && shellcheck scripts/*.sh
+      - name: preflight prints valid JSON
+        run: ./scripts/preflight.sh | jq -e 'has("conflicts") and has("ports")'
+      - name: setup-host.sh --dry-run (no root)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          ssh-keygen -q -t ed25519 -N '' -C ci-staging -f staging
+          ssh-keygen -q -t ed25519 -N '' -C ci-prod -f prod
+          "$GITHUB_WORKSPACE/scripts/setup-host.sh" --dry-run --tailnet-ip 100.64.0.1 \
+            --ci-staging-pubkey staging.pub --ci-prod-pubkey prod.pub \
+            --gate-digest "sha256:$(printf '%064d' 0)" 2>details.txt | tee summary.txt
+          grep -q 'would create /etc/athena/prod.env' summary.txt
+          # Telemetry goes to files and straight to OpenObserve; no collector.
+          grep -q 'ATHENA_TELEMETRY_DIR=/var/lib/athena/prod/telemetry' details.txt
+          grep -q 'OTEL_EXPORTER_OTLP_ENDPOINT=http://100.64.0.1:5080/api/default' details.txt
+          if grep -q '127.0.0.1:4318' details.txt; then
+            echo "::error::an env file still points at the collector"; exit 1
+          fi
+          # Bad input is refused before anything else happens.
+          if "$GITHUB_WORKSPACE/scripts/setup-host.sh" --dry-run --gate-digest sha256:nothex; then
+            echo "::error::setup-host accepted a malformed digest"; exit 1
+          fi
+          "$GITHUB_WORKSPACE/scripts/setup-host.sh" --dry-run --uninstall --purge
+      - name: Analytics queries against fixtures
+        env:
+          DUCKDB_VERSION: 1.5.5
+          DUCKDB_SHA256: c61f21485e6e41d3a0c28ce9904ea18346309cf427b4cf9479bc3564348dc885
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq sqlite3 >/dev/null
+          curl -fsSL -o "$RUNNER_TEMP/duckdb.gz" \
+            "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-linux-amd64.gz"
+          echo "$DUCKDB_SHA256  $RUNNER_TEMP/duckdb.gz" | sha256sum -c -
+          gunzip "$RUNNER_TEMP/duckdb.gz" && chmod +x "$RUNNER_TEMP/duckdb"
+          PATH="$RUNNER_TEMP:$PATH" ./scripts/test-analytics.sh
+
+  unit:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+          components: rustfmt, clippy, llvm-tools-preview
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        with:
+          tool: cargo-llvm-cov
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Tests and 100% line coverage
+        run: ./scripts/coverage.sh
+      - name: Evals against recorded cassettes (no model calls)
+        run: cargo run --locked --quiet -- eval run --target replay
+
+  integration:
+    if: github.event_name == 'pull_request'
+    needs: unit
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Release build
+        run: cargo build --release --locked
+      - name: Smoke-test the real binary
+        run: ./scripts/smoke-binary.sh target/release/athena
+
+  # --------------------------------------------------------- CD: main ----
+  build:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Older glibc than the VM's Ubuntu 24.04, so the binary runs on both.
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      repo: ${{ steps.names.outputs.repo }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Release build
+        run: cargo build --release --locked --bins
+      - name: Names
+        id: names
+        run: echo "repo=ghcr.io/${GITHUB_REPOSITORY,,}" >>"$GITHUB_OUTPUT"
+      - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+        with:
+          version: ${{ env.ORAS_VERSION }}
+      - name: Push the release artifact
+        id: push
+        env:
+          REPO: ${{ steps.names.outputs.repo }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | oras login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          cd target/release
+          ./athena --version
+          oras push "$REPO:sha-$GITHUB_SHA" \
+            --artifact-type "$ARTIFACT_TYPE" \
+            --annotation "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --annotation "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --format json \
+            athena:application/octet-stream deploy-gate:application/octet-stream >"$RUNNER_TEMP/push.json"
+          digest=$(jq -r .digest "$RUNNER_TEMP/push.json")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::unexpected digest '$digest'"; exit 1; }
+          echo "digest=$digest" >>"$GITHUB_OUTPUT"
+          echo "Pushed \`$REPO:sha-$GITHUB_SHA\` = \`$digest\`" >>"$GITHUB_STEP_SUMMARY"
+
+  sandbox-image:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Is there a sandbox image to build?
+        id: check
+        run: |
+          if [ -f deploy/sandbox-image/Dockerfile ]; then
+            echo "present=true" >>"$GITHUB_OUTPUT"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}-sandbox" >>"$GITHUB_OUTPUT"
+          else
+            echo "present=false" >>"$GITHUB_OUTPUT"
+            echo "No deploy/sandbox-image/Dockerfile yet; skipping." >>"$GITHUB_STEP_SUMMARY"
+          fi
+      - if: steps.check.outputs.present == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - if: steps.check.outputs.present == 'true'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - if: steps.check.outputs.present == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: deploy/sandbox-image
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.check.outputs.image }}:latest
+            ${{ steps.check.outputs.image }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+  deploy-staging:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: staging
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/gate
+        with:
+          commands: deploy staging ${{ needs.build.outputs.digest }}
+          host: ${{ vars.VM_HOST }}
+          known-hosts: ${{ vars.VM_KNOWN_HOSTS }}
+          ssh-key: ${{ secrets.DEPLOY_SSH_KEY }}
+          ts-authkey: ${{ secrets.TS_AUTH_KEY }}
+          ts-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          ts-oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+
+  bench-staging:
+    needs: deploy-staging
+    runs-on: ubuntu-24.04
+    environment: staging
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/gate
+        with:
+          commands: bench staging
+          host: ${{ vars.VM_HOST }}
+          known-hosts: ${{ vars.VM_KNOWN_HOSTS }}
+          ssh-key: ${{ secrets.DEPLOY_SSH_KEY }}
+          ts-authkey: ${{ secrets.TS_AUTH_KEY }}
+          ts-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          ts-oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+
+  smoke-staging:
+    needs: bench-staging
+    runs-on: ubuntu-24.04
+    environment: staging
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/gate
+        with:
+          commands: smoke staging
+          host: ${{ vars.VM_HOST }}
+          known-hosts: ${{ vars.VM_KNOWN_HOSTS }}
+          ssh-key: ${{ secrets.DEPLOY_SSH_KEY }}
+          ts-authkey: ${{ secrets.TS_AUTH_KEY }}
+          ts-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          ts-oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+
+  eval-staging:
+    needs: bench-staging
+    # Advisory until the judge is calibrated (plan section 9): a failure is
+    # shown but does not fail the run, so it cannot block a release.
+    continue-on-error: true
+    runs-on: ubuntu-24.04
+    environment: staging
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/gate
+        with:
+          commands: eval staging
+          host: ${{ vars.VM_HOST }}
+          known-hosts: ${{ vars.VM_KNOWN_HOSTS }}
+          ssh-key: ${{ secrets.DEPLOY_SSH_KEY }}
+          ts-authkey: ${{ secrets.TS_AUTH_KEY }}
+          ts-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          ts-oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+
+  # ------------------------------------------------------- CD: v* tag ----
+  require-stage-success:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      packages: read
+    outputs:
+      digest: ${{ steps.resolve.outputs.digest }}
+      repo: ${{ steps.resolve.outputs.repo }}
+    steps:
+      - name: The tagged commit's main run must be green
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci-cd.yml/runs?head_sha=$GITHUB_SHA&event=push&branch=main&status=success" --jq .total_count)
+          if [ "$runs" -lt 1 ]; then
+            echo "::error::no successful push-to-main run of ci-cd.yml for $GITHUB_SHA. Tag a commit that passed staging, or wait for its run to finish and re-run this job."
+            exit 1
+          fi
+          echo "main run for $GITHUB_SHA passed staging ($runs successful run(s))"
+      - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+        with:
+          version: ${{ env.ORAS_VERSION }}
+      - name: Resolve the artifact staging tested
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          printf '%s' "$GH_TOKEN" | oras login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          digest=$(oras resolve "$repo:sha-$GITHUB_SHA")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::cannot resolve $repo:sha-$GITHUB_SHA"; exit 1; }
+          echo "digest=$digest" >>"$GITHUB_OUTPUT"
+          echo "repo=$repo" >>"$GITHUB_OUTPUT"
+          echo "Promoting \`$repo@$digest\` (sha-$GITHUB_SHA) as \`$GITHUB_REF_NAME\`" >>"$GITHUB_STEP_SUMMARY"
+
+  # Waits for the required reviewer. The prod smoke test runs in this job:
+  # a second job on the prod environment would ask for approval again.
+  deploy-prod:
+    needs: require-stage-success
+    runs-on: ubuntu-24.04
+    environment: prod
+    concurrency:
+      group: deploy-prod
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+        with:
+          version: ${{ env.ORAS_VERSION }}
+      - name: Name the release (same bytes, new tag)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ needs.require-stage-success.outputs.repo }}
+          DIGEST: ${{ needs.require-stage-success.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" =~ ^v[A-Za-z0-9._-]{1,127}$ ]] || { echo "::error::'$GITHUB_REF_NAME' is not a valid OCI tag"; exit 1; }
+          printf '%s' "$GH_TOKEN" | oras login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          oras tag "$REPO@$DIGEST" "$GITHUB_REF_NAME"
+      - name: Promote to prod, then smoke-prod
+        uses: ./.github/actions/gate
+        with:
+          commands: |
+            promote prod ${{ needs.require-stage-success.outputs.digest }}
+            smoke prod
+          host: ${{ vars.VM_HOST }}
+          known-hosts: ${{ vars.VM_KNOWN_HOSTS }}
+          ssh-key: ${{ secrets.DEPLOY_SSH_KEY }}
+          ts-authkey: ${{ secrets.TS_AUTH_KEY }}
+          ts-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          ts-oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
