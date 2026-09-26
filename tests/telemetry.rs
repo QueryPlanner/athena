@@ -94,7 +94,7 @@ impl Captured {
             _ => None,
         })
         .unwrap();
-        let mut sinks = Sinks::new(&settings);
+        let mut sinks = Sinks::default();
         if exporting {
             sinks = sinks.with(Exporters {
                 spans: spans.clone(),
@@ -290,7 +290,7 @@ async fn a_turn_is_one_invoke_agent_span_with_rigs_spans_under_it_in_the_callers
     assert_eq!(children(&spans, turn), ["chat", "chat", "execute_tool"]);
     assert_eq!(text(one(&spans, "execute_tool"), "gen_ai.tool.name"), "add");
 
-    // Content capture is off: the prompt and the reply are nowhere.
+    // ATHENA_RECORD_CONTENT is unset: the prompt and the reply are nowhere.
     nowhere(&spans, prompt);
     nowhere(&spans, "alice");
     assert!(attribute(turn, "gen_ai.prompt").is_none());
@@ -374,28 +374,39 @@ async fn a_failed_turn_marks_its_span_as_an_error_and_logs_without_the_prompt() 
 }
 
 #[tokio::test]
-async fn with_content_capture_rig_records_the_prompt_on_athenas_span() {
-    let spans = content_captured_turn("staging").await;
+async fn prod_exports_content_when_athena_record_content_is_1() {
+    let spans = turn_recording_content(Some("1"), "prod").await;
     let turn = one(&spans, "invoke_agent athena");
     assert_eq!(text(turn, "gen_ai.prompt"), "hi there");
+    let keys = content_keys(&spans);
+    assert!(keys.contains(&"gen_ai.prompt".to_string()), "{keys:?}");
+    assert!(
+        keys.contains(&"gen_ai.output.messages".to_string()),
+        "{keys:?}"
+    );
 }
 
 #[tokio::test]
-async fn prod_exports_no_content_even_with_content_capture_on() {
-    let staging = content_captured_turn("staging").await;
-    let captured_keys = content_keys(&staging);
-    assert!(
-        captured_keys.contains(&"gen_ai.prompt".to_string()),
-        "{captured_keys:?}"
-    );
-
-    let prod = content_captured_turn("prod").await;
-    assert_eq!(content_keys(&prod), Vec::<String>::new());
-    nowhere(&prod, "hi there");
-    // What is not content survives.
-    let turn = one(&prod, "invoke_agent athena");
+async fn no_content_is_exported_when_athena_record_content_is_0() {
+    let spans = turn_recording_content(Some("0"), "prod").await;
+    assert_eq!(content_keys(&spans), Vec::<String>::new());
+    nowhere(&spans, "hi there");
+    // What is not content is still there.
+    let turn = one(&spans, "invoke_agent athena");
     assert_eq!(text(turn, "athena.transport"), "cli");
 }
+
+/// Attributes that hold what users typed, what the model answered, or what
+/// tools were given and returned.
+const CONTENT_KEYS: &[&str] = &[
+    "gen_ai.input.messages",
+    "gen_ai.output.messages",
+    "gen_ai.system_instructions",
+    "gen_ai.tool.call.arguments",
+    "gen_ai.tool.call.result",
+    "gen_ai.prompt",
+    "gen_ai.completion",
+];
 
 /// Every content attribute on any span or span event.
 fn content_keys(spans: &[SpanData]) -> Vec<String> {
@@ -406,24 +417,25 @@ fn content_keys(spans: &[SpanData]) -> Vec<String> {
             s.attributes.iter().chain(events)
         })
         .map(|kv| kv.key.to_string())
-        .filter(|k| telemetry::content::CONTENT_KEYS.contains(&k.as_str()))
+        .filter(|k| CONTENT_KEYS.contains(&k.as_str()))
         .collect();
     keys.sort();
     keys.dedup();
     keys
 }
 
-/// One turn with rig's content capture on, exported as `environment`.
-async fn content_captured_turn(environment: &str) -> Vec<SpanData> {
+/// One turn exported as `environment`, with `ATHENA_RECORD_CONTENT` set to
+/// `setting`.
+async fn turn_recording_content(setting: Option<&str>, environment: &str) -> Vec<SpanData> {
     let mut captured = Captured::in_env(true, environment);
     let tmp = TempDb::new();
     let service = Arc::new(tmp.service().0);
     let user = cli_user(&service).await;
     let session = session_of(&service, &user).await;
-    // What ATHENA_RECORD_CONTENT=1 switches on in `agent::configure`.
+    // What `agent::configure` does with the variable's value.
     let agent = AgentBuilder::new(MockCompletionModel::new([MockTurn::text("hello")]))
         .memory(service.memory())
-        .record_content_telemetry(true)
+        .record_content_telemetry(telemetry::record_content_from(setting))
         .build();
 
     service

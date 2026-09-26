@@ -508,7 +508,7 @@ migrate_env_file() {
         $0 == legacy { next }
         $0 == "# Telemetry to the local collector. Remove the line to turn telemetry off." { next }
         $0 == "# 1 records prompts and responses on spans. Keep off in prod; the collector" {
-            print "# 1 records prompts and responses on spans. Ignored for prod."; next }
+            print "# 1 records prompts and responses on spans. Set 0 to stop."; next }
         $0 == "# strips them for prod anyway." { next }
         { print }' "$file" >"$WORK/migrated.env"
     # Same owner and mode: install copies the content, not the metadata.

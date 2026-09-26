@@ -82,7 +82,7 @@ pub fn configure_with(
 ) -> rig::agent::Agent {
     let builder = builder
         .name(NAME)
-        // Prompt and reply text on spans, only with ATHENA_RECORD_CONTENT=1.
+        // Prompt, reply and tool content on spans with ATHENA_RECORD_CONTENT=1.
         .record_content_telemetry(crate::telemetry::record_content())
         .preamble(PREAMBLE)
         .tool(Add)
