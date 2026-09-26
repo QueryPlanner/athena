@@ -141,12 +141,18 @@ conflict, no tailnet IP, not root, checksum mismatch). Fix and re-run.
 The human types these; the agent never sees them.
 
 ```bash
-ssh -t "$VM" 'sudoedit /etc/athena/staging.env'   # OPENROUTER_API_KEY (a spend-capped key)
-ssh -t "$VM" 'sudoedit /etc/athena/prod.env'      # OPENROUTER_API_KEY, TELEGRAM_BOT_TOKEN
+ssh -t "$VM" 'sudoedit /etc/athena/staging.env'   # OPENROUTER_API_KEY (spend-capped), TELEGRAM_BOT_TOKEN (staging bot)
+ssh -t "$VM" 'sudoedit /etc/athena/prod.env'      # OPENROUTER_API_KEY, TELEGRAM_BOT_TOKEN (prod bot)
 ```
 
 Optional in both: `OPEN_SANDBOX_URL` (and `OPEN_SANDBOX_API_KEY`) once the
-sandbox host is ready. Staging has no Telegram bot, on purpose.
+sandbox host is ready.
+
+`TELEGRAM_BOT_TOKEN` is optional per env, but **each env needs its own bot**
+(@BotFather → /newbot): Telegram refuses a second process polling the same
+token (HTTP 409). Leave it empty for an env without a bot. After adding or
+removing a token, re-run `scripts/setup-host.sh` so it enables or disables
+`athena-telegram@<env>`; deploy-gate then starts the bot on every deploy.
 
 The OpenObserve login is `admin@athena.internal`; the human reads the password
 on the VM with `sudo grep ZO_ROOT_USER_PASSWORD /etc/openobserve/openobserve.env`.
@@ -213,17 +219,19 @@ git tag -a v0.1.0 -m "first release" && git push origin v0.1.0
 ```
 
 The tag run checks that this commit passed staging, tags the same artifact
-`v0.1.0` in GHCR, then waits for approval. The human approves `deploy-prod` in
-the Actions tab; it promotes the exact bytes staging tested and smoke-tests
-prod.
+`v0.1.0` in GHCR, promotes the exact bytes staging tested, and smoke-tests
+prod. There is no approval step: pushing the tag *is* the release decision,
+and the `release-tags` ruleset lets only repo admins create `v*` tags. (To
+require an approval anyway, run `init-github.sh --reviewer LOGIN`; that needs
+a public repo or GitHub Enterprise.)
 
 ## Day two
 
 | Task | How |
 |---|---|
 | Deploy to staging | merge to `main` |
-| Release to prod | push a `v*` tag on a commit that passed staging, approve |
-| Roll back | tag the previous good commit (for example `v0.1.1`) and approve; if the schema moved forward, restore a backup first |
+| Release to prod | push a `v*` tag on a commit that passed staging |
+| Roll back | tag the previous good commit (for example `v0.1.1`); if the schema moved forward, restore a backup first |
 | Restore a backup | on the VM: `sudo /opt/athena/bin/deploy-gate restore <env> <backup-file>` |
 | Status | `ssh "$VM" sudo cat /var/lib/athena/prod/state.json` |
 | Logs | `ssh "$VM" journalctl -u athena-serve@prod -f` |

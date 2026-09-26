@@ -13,8 +13,9 @@ it step by step; this skill only restates the rules that must not be broken.
 2. Before any change, show the dry runs of `scripts/setup-host.sh` and
    `scripts/init-github.sh` and wait for an explicit "yes".
 3. Stop at every ⏸ checkpoint in `SETUP.md` (Tailscale admin console, OAuth
-   client, VM secrets, making GHCR packages public, pushing a release tag,
-   approving prod). Tell the user exactly what to do and wait.
+   credential, VM secrets, making GHCR packages public, pushing a release
+   tag). Tell the user exactly what to do and wait. Never push a `v*` tag
+   yourself: the tag is the prod release decision.
 4. Secrets never pass through you. Do not ask for them, read them, echo them
    or put them in files. The user types them into `sudoedit` on the VM or
    `gh secret set` in their own terminal.

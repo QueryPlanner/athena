@@ -121,9 +121,10 @@ The sandbox image is a separate Docker image:
     `ProtectHome=yes`, `PrivateTmp=yes`, `NoNewPrivileges=yes`, `ProtectProc=invisible`,
     `MemoryMax=128M` (measured idle RSS of `athena serve`: ~15 MB).
 - `athena-telegram@.service`: the same, with `ExecStart=… telegram`. It is
-  **enabled for prod only**.
+  **enabled for an env only when that env's file has a `TELEGRAM_BOT_TOKEN`**.
+  Each env has its own bot, because one token can't be polled by two processes.
 - `athena@.target`: `Wants=` both units, so `systemctl start athena@staging.target`
-  works. For staging, only serve is enabled.
+  works.
 - `openobserve.service` comes from `deploy/systemd/openobserve.service` (binary in
   `/usr/local/bin/openobserve`).
 
@@ -202,10 +203,11 @@ On a failed health check it puts the previous `current` back, restarts, and exit
   build and push), then `deploy-staging` (environment `staging`), then
   `bench-staging`, then `smoke-staging` + `eval-staging` (advisory).
 - **push tag `v*`:** `require-stage-success` (the tagged sha's main run must be
-  green), then `deploy-prod` (environment `prod`, required reviewer; `oras tag` the
-  digest with the version, `promote prod`), then `smoke prod`. The prod smoke runs
-  as a step of `deploy-prod`: a separate job on the `prod` environment would ask
-  the reviewer to approve a second time.
+  green), then `deploy-prod` (environment `prod`, v* tags only, **no reviewer**;
+  `oras tag` the digest with the version, `promote prod`), then `smoke prod` as a
+  step of `deploy-prod`.
+- The release decision is pushing the tag. The `release-tags` ruleset lets only
+  repo admins create, move or delete `v*` tags.
 
 **Rules**
 - Actions are pinned to commit SHAs.

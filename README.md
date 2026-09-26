@@ -214,8 +214,9 @@ id that does not exist.
 
 Production is one Linux VM on your Tailscale tailnet running staging and
 prod as systemd services, deployed by GitHub Actions: a merge to `main`
-deploys staging, a `v*` tag promotes the same artifact to prod after your
-approval. Traces and logs go to OpenObserve and to JSONL files for DuckDB.
+deploys staging, and pushing a `v*` tag promotes the same artifact to prod.
+There is no approval step: the tag is the release decision, and only repo
+admins may create `v*` tags. Each env can run its own Telegram bot. Traces and logs go to OpenObserve and to JSONL files for DuckDB.
 Nothing listens on a public interface.
 
 Give this prompt to your coding agent (Claude Code, Codex, Gemini CLI):

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Configure the GitHub side of Athena's CI/CD, idempotently, with `gh api`:
 #   - environment `staging` (deploys from main only)
-#   - environment `prod` (deploys from v* tags only, required reviewer)
+#   - environment `prod` (deploys from v* tags only; no reviewer: pushing the
+#     tag is the release decision, and the ruleset limits tagging to admins)
 #   - a ruleset protecting v* tags (only admins create; no delete/move)
 #   - variables VM_HOST and VM_KNOWN_HOSTS
 #   - the DEPLOY_SSH_KEY secret in each environment
@@ -34,7 +35,8 @@ Usage: init-github.sh [options]
                             for you to compare)
   --staging-key FILE        private key CI uses for staging -> staging DEPLOY_SSH_KEY
   --prod-key FILE           private key CI uses for prod -> prod DEPLOY_SSH_KEY
-  --reviewer LOGIN          prod's required reviewer (default: the repository owner)
+  --reviewer LOGIN          optional: require LOGIN's approval before prod deploys
+                            (default: none; the v* tag is the release decision)
   -h, --help                this help
 EOF
 }
@@ -91,13 +93,12 @@ echo "repository: $REPO" >&2
 login=$(gh api user --jq .login)
 admin=$(gh api "repos/$REPO" --jq .permissions.admin)
 [ "$admin" = true ] || die "$login is not an admin of $REPO; environments and rulesets need admin"
-owner=$(gh api "repos/$REPO" --jq .owner.login)
-owner_type=$(gh api "repos/$REPO" --jq .owner.type)
-if [ -z "$REVIEWER" ]; then
-    [ "$owner_type" = User ] || die "$REPO belongs to an organization; pass --reviewer LOGIN"
-    REVIEWER=$owner
+# Optional: a required reviewer for prod. Off by default; the v* tag is the
+# release decision. Required reviewers need a public repo or GitHub Enterprise.
+reviewer_id=""
+if [ -n "$REVIEWER" ]; then
+    reviewer_id=$(gh api "users/$REVIEWER" --jq .id) || die "no GitHub user $REVIEWER"
 fi
-reviewer_id=$(gh api "users/$REVIEWER" --jq .id) || die "no GitHub user $REVIEWER"
 
 # Environment NAME with one deployment policy of TYPE (branch|tag) PATTERN.
 ensure_environment() {
@@ -123,9 +124,15 @@ ensure_environment() {
 }
 
 ensure_environment staging branch main '{}'
-ensure_environment prod tag 'v*' \
-    "$(jq -n --argjson id "$reviewer_id" '{reviewers: [{type: "User", id: $id}], prevent_self_review: false, wait_timer: 0}')"
-echo "  prod reviewer: $REVIEWER (self-review allowed, so a solo owner can approve)" >&2
+if [ -n "$reviewer_id" ]; then
+    ensure_environment prod tag 'v*' \
+        "$(jq -n --argjson id "$reviewer_id" '{reviewers: [{type: "User", id: $id}], prevent_self_review: false, wait_timer: 0}')"
+    echo "  prod reviewer: $REVIEWER (self-review allowed, so a solo owner can approve)" >&2
+else
+    # PUT replaces the protection rules, so this also removes an old reviewer.
+    ensure_environment prod tag 'v*' '{"reviewers": []}'
+    echo "  prod: no reviewer; pushing a v* tag releases (only admins may tag)" >&2
+fi
 
 step "ruleset $RULESET_NAME (v* tags)"
 ruleset=$(jq -n --arg name "$RULESET_NAME" '{
