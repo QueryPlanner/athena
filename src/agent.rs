@@ -82,8 +82,9 @@ pub fn configure_with(
 ) -> rig::agent::Agent {
     let builder = builder
         .name(NAME)
-        // Prompt, reply and tool content on spans with ATHENA_RECORD_CONTENT=1.
-        .record_content_telemetry(crate::telemetry::record_content())
+        // Always: every prompt, system prompt, reply and tool call goes on
+        // spans, so the telemetry sinks export all of it.
+        .record_content_telemetry(true)
         .preamble(PREAMBLE)
         .tool(Add)
         .add_hook(ToolPolicy::default())

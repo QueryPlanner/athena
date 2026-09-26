@@ -48,7 +48,6 @@ Rules for `serve` and `telegram`:
 | `ATHENA_TELEMETRY_DIR` | all | e.g. `/var/lib/athena/<env>/telemetry`: daily `traces-<role>-YYYYMMDD.jsonl` and `logs-<role>-YYYYMMDD.jsonl`, `<role>` being the process (`serve`, `telegram`, `cli`), so every file has one writer. **Unset means no files.** With neither this nor the endpoint, telemetry is off and logs go to stderr only. |
 | `ATHENA_TELEMETRY_RETENTION_DAYS` | all | default `30`; files of older days are deleted |
 | `OTEL_SERVICE_NAME` | all | default `athena` |
-| `ATHENA_RECORD_CONTENT` | all | `1` or `true` records prompt, system prompt, response and tool content on spans, in every environment including prod; both sinks export it. Unset means off; `deploy/athena.env.template` sets `1`. |
 
 ## HTTP
 

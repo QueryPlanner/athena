@@ -624,7 +624,6 @@ fields, and nothing now checks that for it.
 | `OTEL_SERVICE_NAME` | `athena` | resource `service.name` |
 | `ATHENA_VERSION` | `<crate version>-dev` | resource `service.version` |
 | `ATHENA_ENV` | unset | resource `deployment.environment.name` |
-| `ATHENA_RECORD_CONTENT` | off (`1` in the VM's env files) | `1` puts prompt, system prompt, reply and tool content on spans, in every environment |
 | `RUST_LOG` | `warn,athena=info` | stderr filter only; export always takes `info` and up |
 
 What a turn exports:
@@ -649,16 +648,14 @@ What a turn exports:
 backend, but it is unsalted, and Telegram ids are numbers anyone can
 enumerate. Treat it as internal data, not as anonymous.
 
-Content capture is one switch, `ATHENA_RECORD_CONTENT`, with the same
-meaning in every environment, prod included. Unset, it is off; the env files
-setup-host.sh creates set it to `1`. With `1`, Rig records the prompt on the
-turn span and model input, output, the system prompt, tool arguments and tool
+Everything is exported, always: there is no switch. In every environment,
+prod included, Rig records the prompt on the turn span and model input, output, the system prompt, tool arguments and tool
 results on its own spans (`gen_ai.prompt`, `gen_ai.input.messages`,
 `gen_ai.output.messages`, `gen_ai.system_instructions`,
 `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result`), and both sinks
 export them as they are: OpenObserve and the JSONL files, kept for
 `ATHENA_TELEMETRY_RETENTION_DAYS` (30). That is whatever users typed, so treat
-both as holding user data. Set it to `0` and restart to stop. Athena's own
+both as holding user data. To keep content out, remove the sinks. Athena's own
 log events never include prompt or reply text.
 
 ## Known limits

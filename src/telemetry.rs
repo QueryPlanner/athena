@@ -15,11 +15,11 @@
 //! [`Sinks`], so tests capture spans in memory. [`init`] wires it to the
 //! environment and installs it globally, which a process can do only once.
 //!
-//! What is exported is listed in README "Observability". Athena's own log
-//! events never include prompt or reply text. With `ATHENA_RECORD_CONTENT=1`
-//! (see [`record_content`]), in any environment, rig records prompts, the
-//! system prompt, replies and tool arguments and results on spans, and every
-//! sink exports them.
+//! What is exported is listed in README "Observability". Everything is: in
+//! every environment rig records prompts, the system prompt, replies and
+//! tool arguments and results on spans (`agent::configure` turns that on
+//! unconditionally), and every sink exports them. Athena's own log events
+//! never include prompt or reply text; that content lives on the spans.
 
 pub mod jsonl;
 
@@ -157,19 +157,6 @@ impl Settings {
 /// version marked as a development build.
 fn version_or_dev(configured: Option<String>) -> String {
     configured.unwrap_or_else(|| format!("{}-dev", env!("CARGO_PKG_VERSION")))
-}
-
-/// Whether `ATHENA_RECORD_CONTENT` asks rig to record prompt, system
-/// prompt, reply and tool content on spans. The same switch in every
-/// environment; unset means off.
-pub fn record_content() -> bool {
-    record_content_from(std::env::var("ATHENA_RECORD_CONTENT").ok().as_deref())
-}
-
-/// [`record_content`] for a given value of `ATHENA_RECORD_CONTENT`: `1` or
-/// `true` turns it on.
-pub fn record_content_from(setting: Option<&str>) -> bool {
-    matches!(setting, Some("1" | "true"))
 }
 
 /// A span exporter and a log exporter that go together.
@@ -537,17 +524,6 @@ mod tests {
         assert_eq!(role(&["telegram"]), "telegram");
         assert_eq!(role(&["eval", "run"]), "cli");
         assert_eq!(role(&[]), "cli");
-    }
-
-    #[test]
-    fn content_is_recorded_only_when_asked_for() {
-        assert!(!record_content_from(None));
-        assert!(!record_content_from(Some("0")));
-        assert!(!record_content_from(Some("yes")));
-        assert!(record_content_from(Some("1")));
-        assert!(record_content_from(Some("true")));
-        // The env-reading wrapper; tests never set ATHENA_RECORD_CONTENT.
-        assert!(!record_content());
     }
 
     #[test]

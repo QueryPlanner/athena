@@ -82,8 +82,8 @@ a "no API key" test would find one and call the provider.
 `tests/telemetry.rs` installs the tracing layers for one thread with
 exporters that keep what they are sent, runs real turns through the router
 and the service, and checks the spans, their nesting and the log records.
-With `ATHENA_ENV=prod`, one test checks that `ATHENA_RECORD_CONTENT=1` exports
-the GenAI content attributes and another that `0` exports none. It
+With `ATHENA_ENV=prod` and no setting of any kind, one test checks that the
+agent `agent::configure` builds exports the GenAI content attributes. It
 also runs `athena serve` against a fake OTLP backend on loopback, shaped like
 OpenObserve (an `/api/default` path and a basic-auth header), with
 `ATHENA_TELEMETRY_DIR` set, and checks that SIGTERM flushes traces and logs to

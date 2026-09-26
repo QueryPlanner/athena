@@ -290,10 +290,10 @@ async fn a_turn_is_one_invoke_agent_span_with_rigs_spans_under_it_in_the_callers
     assert_eq!(children(&spans, turn), ["chat", "chat", "execute_tool"]);
     assert_eq!(text(one(&spans, "execute_tool"), "gen_ai.tool.name"), "add");
 
-    // ATHENA_RECORD_CONTENT is unset: the prompt and the reply are nowhere.
-    nowhere(&spans, prompt);
+    // Content is always exported: the prompt is on the turn's span. The user
+    // is only ever a pseudonym, never their id.
+    assert_eq!(text(turn, "gen_ai.prompt"), prompt);
     nowhere(&spans, "alice");
-    assert!(attribute(turn, "gen_ai.prompt").is_none());
 }
 
 #[tokio::test]
@@ -356,7 +356,9 @@ async fn a_failed_turn_marks_its_span_as_an_error_and_logs_without_the_prompt() 
         turn.status
     );
     assert_eq!(text(turn, "error.type"), "model");
-    nowhere(&spans, prompt);
+    // The span carries the prompt (content is always exported); the log
+    // line below must not repeat it.
+    assert_eq!(text(turn, "gen_ai.prompt"), prompt);
 
     // The server log went out as an OpenTelemetry log record, in the
     // turn's trace, and to stderr.
@@ -374,25 +376,23 @@ async fn a_failed_turn_marks_its_span_as_an_error_and_logs_without_the_prompt() 
 }
 
 #[tokio::test]
-async fn prod_exports_content_when_athena_record_content_is_1() {
-    let spans = turn_recording_content(Some("1"), "prod").await;
+async fn prod_exports_every_turns_content() {
+    // The production agent, with no setting of any kind: content is always on.
+    let spans = configured_turn("prod").await;
     let turn = one(&spans, "invoke_agent athena");
     assert_eq!(text(turn, "gen_ai.prompt"), "hi there");
     let keys = content_keys(&spans);
-    assert!(keys.contains(&"gen_ai.prompt".to_string()), "{keys:?}");
-    assert!(
-        keys.contains(&"gen_ai.output.messages".to_string()),
-        "{keys:?}"
-    );
-}
-
-#[tokio::test]
-async fn no_content_is_exported_when_athena_record_content_is_0() {
-    let spans = turn_recording_content(Some("0"), "prod").await;
-    assert_eq!(content_keys(&spans), Vec::<String>::new());
-    nowhere(&spans, "hi there");
+    for key in [
+        "gen_ai.prompt",
+        "gen_ai.output.messages",
+        "gen_ai.system_instructions",
+    ] {
+        assert!(
+            keys.contains(&key.to_string()),
+            "{key} missing from {keys:?}"
+        );
+    }
     // What is not content is still there.
-    let turn = one(&spans, "invoke_agent athena");
     assert_eq!(text(turn, "athena.transport"), "cli");
 }
 
@@ -424,19 +424,17 @@ fn content_keys(spans: &[SpanData]) -> Vec<String> {
     keys
 }
 
-/// One turn exported as `environment`, with `ATHENA_RECORD_CONTENT` set to
-/// `setting`.
-async fn turn_recording_content(setting: Option<&str>, environment: &str) -> Vec<SpanData> {
+/// One turn of the agent `agent::configure` builds, exported as `environment`.
+async fn configured_turn(environment: &str) -> Vec<SpanData> {
     let mut captured = Captured::in_env(true, environment);
     let tmp = TempDb::new();
     let service = Arc::new(tmp.service().0);
     let user = cli_user(&service).await;
     let session = session_of(&service, &user).await;
-    // What `agent::configure` does with the variable's value.
-    let agent = AgentBuilder::new(MockCompletionModel::new([MockTurn::text("hello")]))
-        .memory(service.memory())
-        .record_content_telemetry(telemetry::record_content_from(setting))
-        .build();
+    let agent = athena::agent::configure(
+        AgentBuilder::new(MockCompletionModel::new([MockTurn::text("hello")]))
+            .memory(service.memory()),
+    );
 
     service
         .send(&agent, &user, &session, "hi there")

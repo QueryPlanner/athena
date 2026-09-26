@@ -510,7 +510,7 @@ truncation stays in the tool code. Tracing uses rig's spans, not hooks.
 **rig already emits GenAI-semconv `tracing` spans:** `invoke_agent`, `chat`, and
 `execute_tool`, carrying `gen_ai.*` attributes. The sources are
 `rig-core/src/telemetry/mod.rs:441` and `rig-agent/src/agent/runner.rs:504,791`.
-Content is recorded only with `record_content_telemetry(true)`. The semantic
+Athena always calls `record_content_telemetry(true)`. The semantic
 conventions are still at "Development" status.
 
 Athena adds:
@@ -534,8 +534,7 @@ Athena adds:
 - Child spans `sandbox.exec` and `browser.action`.
 - W3C `traceparent` in and out on HTTP.
 - **Content capture.** *Revised 2026-09-26: owner wants all content exported in all
-  envs.* `ATHENA_RECORD_CONTENT` is the only switch, with the same meaning in staging
-  and prod; the env template sets it to `1`. Prompts, the system prompt, replies and
+  envs, with no switch.* Prompts, the system prompt, replies and
   tool arguments/results go on rig's spans and are exported to OpenObserve and the
   JSONL files. The earlier prod stripping (`src/telemetry/content.rs`) is gone.
   - Log statements never include prompt text.
