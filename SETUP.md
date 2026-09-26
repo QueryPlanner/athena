@@ -133,6 +133,12 @@ in OpenObserve. An ingest-only OpenObserve user per environment would be
 tighter; setup-host.sh does not create one (not verified that OpenObserve's
 open-source edition supports it).
 
+Everything is exported, always, with no switch: full prompts, the system
+prompt, replies and tool arguments and results are recorded on spans in
+staging and prod, and exported to OpenObserve and the JSONL files (kept 30
+days). To keep content out of telemetry, remove the sinks
+(`OTEL_EXPORTER_OTLP_*`, `ATHENA_TELEMETRY_DIR`) from the env file.
+
 On failure: it stops before changing anything else and says why (port
 conflict, no tailnet IP, not root, checksum mismatch). Fix and re-run.
 

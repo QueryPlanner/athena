@@ -18,7 +18,7 @@ SELECT
     attributes
 FROM read_json('{{TELEMETRY_DIR}}/traces-*.jsonl',
                format = 'newline_delimited',
-               -- A staging span with content capture on can be large.
+               -- A span with content capture on can be large.
                maximum_object_size = 104857600,
                columns = {
                    'trace_id': 'VARCHAR',

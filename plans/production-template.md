@@ -503,14 +503,14 @@ truncation stays in the tool code. Tracing uses rig's spans, not hooks.
 > (`/var/lib/athena/<env>/telemetry`) for DuckDB. The two sinks are
 > independent: OpenObserve stays optional and may be removed later (no
 > endpoint, no OTLP export), and the files work without it. The collector's
-> prod content stripping moved into Athena (`src/telemetry/content.rs`); its
-> regex secret redaction was not carried over. Where the text below still
+> prod content stripping moved into Athena, then was removed (see "Content
+> capture" below); its regex secret redaction was not carried over. Where the text below still
 > says "collector", read it as history.
 
 **rig already emits GenAI-semconv `tracing` spans:** `invoke_agent`, `chat`, and
 `execute_tool`, carrying `gen_ai.*` attributes. The sources are
 `rig-core/src/telemetry/mod.rs:441` and `rig-agent/src/agent/runner.rs:504,791`.
-Content is recorded only with `record_content_telemetry(true)`. The semantic
+Athena always calls `record_content_telemetry(true)`. The semantic
 conventions are still at "Development" status.
 
 Athena adds:
@@ -533,12 +533,10 @@ Athena adds:
   - a hashed user id.
 - Child spans `sandbox.exec` and `browser.action`.
 - W3C `traceparent` in and out on HTTP.
-- **Content capture.** Off in prod. Staging may turn it on, since only the owner uses the
-  staging bot.
-  - Setup B: for `ATHENA_ENV=prod`, Athena itself strips `gen_ai.input/output.messages`,
-    `gen_ai.system_instructions`, tool arguments/results, `gen_ai.prompt` and
-    `gen_ai.completion` from every span and span event before any exporter,
-    ignores `ATHENA_RECORD_CONTENT`, and drops log events carrying those fields.
+- **Content capture.** *Revised 2026-09-26: owner wants all content exported in all
+  envs, with no switch.* Prompts, the system prompt, replies and
+  tool arguments/results go on rig's spans and are exported to OpenObserve and the
+  JSONL files. The earlier prod stripping (`src/telemetry/content.rs`) is gone.
   - Log statements never include prompt text.
 - `RUNS_STORE_RAW=0` in prod.
 
@@ -810,7 +808,7 @@ These are the checkpoints.
 | 12 | Browser tools | 11 |
 | 13 | `ToolPolicy` hook | 9 |
 | 14 | Telemetry: tracing + OTLP + `invoke_agent` span + traceparent | – |
-| 15 | ~~otelcol-contrib unit + config~~ replaced by setup B: Athena's JSONL exporter and prod content filter | 14 |
+| 15 | ~~otelcol-contrib unit + config~~ replaced by setup B: Athena's JSONL exporter (the prod content filter was later removed) | 14 |
 | 16 | `athena eval` v1: dataset, deterministic graders, `ReplayModel`, PR gate | – |
 | 17 | Live eval target + staging eval report via `deploy-gate eval` | 8, 16 |
 | 18 | DuckDB analytics scripts + canned queries | 15, 16 |
