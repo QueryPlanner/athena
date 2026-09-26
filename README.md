@@ -249,7 +249,7 @@ Caddy or Tailscale settings, and never overwrites a file holding secrets.
     src/telegram.rs    the Telegram transport: commands, sessions, the bot
     src/ops.rs         deployment: version, online backup, absolute ATHENA_DB
     src/telemetry.rs   tracing and OpenTelemetry; telemetry/ has the JSONL
-                       files exporter and the prod content filter
+                       files exporter
     src/eval/          `athena eval`: cases, cassettes, graders, judge, results
     src/bench.rs       `athena bench`: load check against a running server
     src/main.rs        wiring: real database, provider, stdin/stdout
@@ -623,8 +623,8 @@ fields, and nothing now checks that for it.
 | `ATHENA_TELEMETRY_RETENTION_DAYS` | `30` | days of files kept, today included |
 | `OTEL_SERVICE_NAME` | `athena` | resource `service.name` |
 | `ATHENA_VERSION` | `<crate version>-dev` | resource `service.version` |
-| `ATHENA_ENV` | unset | resource `deployment.environment.name`; `prod` strips content |
-| `ATHENA_RECORD_CONTENT` | off | `1` puts prompt and reply text on spans (not in prod) |
+| `ATHENA_ENV` | unset | resource `deployment.environment.name` |
+| `ATHENA_RECORD_CONTENT` | off (`1` in the VM's env files) | `1` puts prompt, system prompt, reply and tool content on spans, in every environment |
 | `RUST_LOG` | `warn,athena=info` | stderr filter only; export always takes `info` and up |
 
 What a turn exports:
@@ -649,16 +649,17 @@ What a turn exports:
 backend, but it is unsalted, and Telegram ids are numbers anyone can
 enumerate. Treat it as internal data, not as anonymous.
 
-Content capture is off by default. Log events never include prompt or reply
-text. With `ATHENA_RECORD_CONTENT=1`, Rig records the prompt on the turn span
-and model input, output, tool arguments and tool results on its own spans.
-Turn it on in staging only while no real users talk to it. With
-`ATHENA_ENV=prod` it is ignored, and as a backstop Athena removes
-`gen_ai.input.messages`, `gen_ai.output.messages`,
-`gen_ai.system_instructions`, `gen_ai.tool.call.arguments`,
-`gen_ai.tool.call.result`, `gen_ai.prompt` and `gen_ai.completion` from every
-span and span event before either sink sees it, and does not export a log
-event that has one of them as a field (`src/telemetry/content.rs`).
+Content capture is one switch, `ATHENA_RECORD_CONTENT`, with the same
+meaning in every environment, prod included. Unset, it is off; the env files
+setup-host.sh creates set it to `1`. With `1`, Rig records the prompt on the
+turn span and model input, output, the system prompt, tool arguments and tool
+results on its own spans (`gen_ai.prompt`, `gen_ai.input.messages`,
+`gen_ai.output.messages`, `gen_ai.system_instructions`,
+`gen_ai.tool.call.arguments`, `gen_ai.tool.call.result`), and both sinks
+export them as they are: OpenObserve and the JSONL files, kept for
+`ATHENA_TELEMETRY_RETENTION_DAYS` (30). That is whatever users typed, so treat
+both as holding user data. Set it to `0` and restart to stop. Athena's own
+log events never include prompt or reply text.
 
 ## Known limits
 

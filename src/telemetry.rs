@@ -15,12 +15,12 @@
 //! [`Sinks`], so tests capture spans in memory. [`init`] wires it to the
 //! environment and installs it globally, which a process can do only once.
 //!
-//! What is exported is listed in README "Observability". Prompt and reply
-//! text never goes into a log event; on spans only with
-//! `ATHENA_RECORD_CONTENT=1` (see [`record_content`]), and never for prod:
-//! there [`content::StripContent`] removes it before any sink sees it.
+//! What is exported is listed in README "Observability". Athena's own log
+//! events never include prompt or reply text. With `ATHENA_RECORD_CONTENT=1`
+//! (see [`record_content`]), in any environment, rig records prompts, the
+//! system prompt, replies and tool arguments and results on spans, and every
+//! sink exports them.
 
-pub mod content;
 pub mod jsonl;
 
 use crate::service::User;
@@ -41,7 +41,6 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use tracing_subscriber::filter::{FilterExt as _, filter_fn};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -138,12 +137,6 @@ impl Settings {
         })
     }
 
-    /// Whether content is removed from telemetry whatever else is set: in
-    /// prod, so a mistaken `ATHENA_RECORD_CONTENT=1` exports nothing typed.
-    pub fn strips_content(&self) -> bool {
-        self.environment.as_deref() == Some("prod")
-    }
-
     /// The OpenTelemetry resource every span and log record carries.
     pub fn resource(&self) -> Resource {
         let mut attributes = vec![KeyValue::new("service.version", self.version.clone())];
@@ -166,18 +159,17 @@ fn version_or_dev(configured: Option<String>) -> String {
     configured.unwrap_or_else(|| format!("{}-dev", env!("CARGO_PKG_VERSION")))
 }
 
-/// Whether `ATHENA_RECORD_CONTENT=1` asks for prompt and response content
-/// on spans. Off by default: that content is whatever users typed. Always
-/// off for prod (`ATHENA_ENV=prod`).
+/// Whether `ATHENA_RECORD_CONTENT` asks rig to record prompt, system
+/// prompt, reply and tool content on spans. The same switch in every
+/// environment; unset means off.
 pub fn record_content() -> bool {
-    record_content_from(
-        std::env::var("ATHENA_RECORD_CONTENT").ok().as_deref(),
-        std::env::var("ATHENA_ENV").ok().as_deref(),
-    )
+    record_content_from(std::env::var("ATHENA_RECORD_CONTENT").ok().as_deref())
 }
 
-fn record_content_from(setting: Option<&str>, environment: Option<&str>) -> bool {
-    environment != Some("prod") && matches!(setting, Some("1" | "true"))
+/// [`record_content`] for a given value of `ATHENA_RECORD_CONTENT`: `1` or
+/// `true` turns it on.
+pub fn record_content_from(setting: Option<&str>) -> bool {
+    matches!(setting, Some("1" | "true"))
 }
 
 /// A span exporter and a log exporter that go together.
@@ -213,27 +205,27 @@ pub fn otlp_exporters()
 /// Where spans and logs are exported to, each sink behind its own batch
 /// processor (and thread). None means OpenTelemetry is off.
 pub struct Sinks {
-    strip_content: bool,
     count: usize,
     tracer: TracerProviderBuilder,
     logger: LoggerProviderBuilder,
 }
 
-impl Sinks {
-    /// No sinks yet, with `settings`' content policy.
-    pub fn new(settings: &Settings) -> Self {
+impl Default for Sinks {
+    /// No sinks yet.
+    fn default() -> Self {
         Self {
-            strip_content: settings.strips_content(),
             count: 0,
             tracer: SdkTracerProvider::builder(),
             logger: SdkLoggerProvider::builder(),
         }
     }
+}
 
+impl Sinks {
     /// The sinks `settings` switch on for process `role`: OTLP, JSONL
     /// files, both or neither.
     pub fn from_settings(settings: &Settings, role: Role) -> Result<Self> {
-        let mut sinks = Self::new(settings);
+        let mut sinks = Self::default();
         if settings.endpoint.is_some() {
             sinks = sinks.with(otlp_exporters()?);
         }
@@ -246,18 +238,16 @@ impl Sinks {
         Ok(sinks)
     }
 
-    /// Add a sink. Its spans pass through [`content::StripContent`] first.
+    /// Add a sink.
     pub fn with<S, L>(self, exporters: Exporters<S, L>) -> Self
     where
         S: SpanExporter + 'static,
         L: LogExporter + 'static,
     {
-        let spans = content::StripContent::new(exporters.spans, self.strip_content);
         Self {
             count: self.count + 1,
-            tracer: self.tracer.with_batch_exporter(spans),
+            tracer: self.tracer.with_batch_exporter(exporters.spans),
             logger: self.logger.with_batch_exporter(exporters.logs),
-            ..self
         }
     }
 
@@ -312,16 +302,11 @@ pub fn layers<W>(settings: &Settings, sinks: Sinks, stderr: W) -> (Vec<BoxedLaye
 where
     W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
 {
-    // For prod, an event with a content field goes nowhere: not to stderr
-    // (the journal), and not to a sink, since a log record cannot be edited
-    // once made.
-    let strip = settings.strips_content();
-    let keep = move || filter_fn(move |metadata| !(strip && content::carries_content(metadata)));
     let log = tracing_subscriber::fmt::layer()
         .with_writer(stderr)
         .with_ansi(false)
         .with_target(false)
-        .with_filter(EnvFilter::new(&settings.log_filter).and(keep()))
+        .with_filter(EnvFilter::new(&settings.log_filter))
         .boxed();
     if sinks.is_empty() {
         let off = Telemetry {
@@ -338,7 +323,7 @@ where
         .with_filter(EnvFilter::new(EXPORT_FILTER))
         .boxed();
     let events = OpenTelemetryTracingBridge::new(&logger)
-        .with_filter(EnvFilter::new(EXPORT_FILTER).and(keep()))
+        .with_filter(EnvFilter::new(EXPORT_FILTER))
         .boxed();
     let on = Telemetry {
         tracer: Some(tracer),
@@ -555,20 +540,12 @@ mod tests {
     }
 
     #[test]
-    fn only_prod_strips_content() {
-        assert!(settings(&[("ATHENA_ENV", "prod")]).strips_content());
-        assert!(!settings(&[("ATHENA_ENV", "staging")]).strips_content());
-        assert!(!settings(&[]).strips_content());
-    }
-
-    #[test]
-    fn content_is_recorded_only_when_asked_for_and_never_for_prod() {
-        assert!(!record_content_from(None, None));
-        assert!(!record_content_from(Some("0"), None));
-        assert!(!record_content_from(Some("yes"), None));
-        assert!(record_content_from(Some("1"), None));
-        assert!(record_content_from(Some("true"), Some("staging")));
-        assert!(!record_content_from(Some("1"), Some("prod")));
+    fn content_is_recorded_only_when_asked_for() {
+        assert!(!record_content_from(None));
+        assert!(!record_content_from(Some("0")));
+        assert!(!record_content_from(Some("yes")));
+        assert!(record_content_from(Some("1")));
+        assert!(record_content_from(Some("true")));
         // The env-reading wrapper; tests never set ATHENA_RECORD_CONTENT.
         assert!(!record_content());
     }
@@ -637,18 +614,16 @@ mod tests {
     }
 
     /// Emit one event with a content field and one without, and return the
-    /// bodies of the log records exported and what stderr showed.
-    fn logged(environment: &str) -> (Vec<String>, String) {
-        let settings = settings(&[("ATHENA_ENV", environment)]);
+    /// bodies of the log records exported and what stderr showed, for prod.
+    fn logged_in_prod() -> (Vec<String>, String) {
+        let settings = settings(&[("ATHENA_ENV", "prod")]);
         let exporters = in_memory();
         let logs = exporters.logs.clone();
         let stderr = Stderr::default();
         let writer = stderr.clone();
-        let (layers, telemetry) = layers(
-            &settings,
-            Sinks::new(&settings).with(exporters),
-            move || writer.clone(),
-        );
+        let (layers, telemetry) = layers(&settings, Sinks::default().with(exporters), move || {
+            writer.clone()
+        });
         let subscriber = tracing_subscriber::registry().with(layers);
         tracing::subscriber::with_default(subscriber, || {
             tracing::warn!(gen_ai.prompt = "what the user typed", "with content");
@@ -669,27 +644,19 @@ mod tests {
     }
 
     #[test]
-    fn prod_neither_exports_nor_prints_a_log_event_with_a_content_field() {
-        let (exported, shown) = logged("prod");
-        assert_eq!(exported.len(), 1, "{exported:?}");
-        assert!(exported[0].contains("without content"), "{exported:?}");
-        assert!(shown.contains("without content"), "{shown}");
-        assert!(!shown.contains("with content"), "{shown}");
-        assert!(!shown.contains("what the user typed"), "{shown}");
-
-        let (exported, shown) = logged("staging");
+    fn prod_exports_and_prints_log_events_with_content_fields() {
+        let (exported, shown) = logged_in_prod();
         assert_eq!(exported.len(), 2, "{exported:?}");
+        assert!(exported[0].contains("with content"), "{exported:?}");
+        assert!(exported[1].contains("without content"), "{exported:?}");
         assert!(shown.contains("what the user typed"), "{shown}");
+        assert!(shown.contains("without content"), "{shown}");
     }
 
     #[test]
     fn a_failed_final_export_is_reported_not_raised() {
         let settings = settings(&[]);
-        let (_, telemetry) = layers(
-            &settings,
-            Sinks::new(&settings).with(in_memory()),
-            std::io::sink,
-        );
+        let (_, telemetry) = layers(&settings, Sinks::default().with(in_memory()), std::io::sink);
         assert!(telemetry.exporting());
         // Shut down behind its back: the second shutdown fails.
         telemetry.tracer.as_ref().unwrap().shutdown().unwrap();
@@ -707,7 +674,7 @@ mod tests {
     #[test]
     fn switched_off_telemetry_shuts_down_silently() {
         let settings = settings(&[]);
-        let (layers, telemetry) = layers(&settings, Sinks::new(&settings), std::io::sink);
+        let (layers, telemetry) = layers(&settings, Sinks::default(), std::io::sink);
         assert_eq!(layers.len(), 1);
         assert!(!telemetry.exporting());
         let mut out = Vec::new();
