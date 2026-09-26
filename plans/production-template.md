@@ -93,10 +93,12 @@ This mirrors `doughayden/agent-foundation`'s `ci-cd.yml`:
 - PR runs checks;
 - merge builds and deploys to stage, then smoke-tests;
 - **pushing a `v*` tag** confirms that the tagged commit already passed stage, and
-  promotes the **same artifact** to prod behind a `prod` environment with required
-  reviewers.
+  promotes the **same artifact** to prod.
 
-Required reviewers work on public repos on every GitHub plan.
+**Revised (owner, 2026-09-26): no approval step.** Pushing the tag is the release
+decision, and the `release-tags` ruleset lets only repo admins create `v*` tags.
+`init-github.sh --reviewer LOGIN` can still add a required reviewer; on private
+repos that needs GitHub Enterprise.
 
 A single `.github/workflows/ci-cd.yml` holds the job graph. Reusable workflows
 (`workflow_call`) hold the steps.
@@ -105,7 +107,7 @@ A single `.github/workflows/ci-cd.yml` holds the job graph. Reusable workflows
 |---|---|---|
 | `pull_request` | **CI Pipeline** | **Unit tests**: fmt, clippy `-D warnings`, `scripts/coverage.sh` (100% lines), `athena eval run --target replay` (cassettes, $0). **Integration tests**: `cargo build --release`, start the real binary with a temp DB and fake-telegram (+ fake-sandbox later). Exercise every path that doesn't call the model: `/health`, `/version`, sessions, usage, Host allowlist, graceful SIGTERM, `athena backup`, migration of a fixture DB. The model-calling paths are already covered in-process with rig's `MockCompletionModel`, so no fake model server is needed. |
 | push to `main` | **CD Pipeline #1** | **Release build**: `cargo build --release --locked` for `x86_64-unknown-linux-gnu` on `ubuntu-22.04` (older glibc, so the binary also runs on newer Debian/Ubuntu), then **publish to GHCR** with ORAS: `oras push ghcr.io/<owner>/athena:sha-<sha>` gives back an immutable digest. **Deploy to staging**: tailnet join (`tag:ci`), then `ssh deploy@athena-vm deploy staging sha256:<digest>`. Only the digest string crosses SSH; the VM **pulls** the binary itself. **Load tests (staging)**: `ssh … loadcheck staging` runs a small, spend-capped real-model profile on the VM (for example 3 concurrent sessions × 2 min with the cheap model) and checks p95 latency and error rate. **Smoke + eval report**: `ssh … smoke staging`, then `ssh … eval staging` (advisory until the judge is calibrated, section 9). |
-| push tag `v*` | **CD Pipeline #2** | **require-stage-success**: the tagged SHA's `main` run must show green deploy, load and smoke jobs, otherwise stop. **Deploy to prod**: runs under `environment: prod` with required reviewers (you), so it **waits for approval**. Then `oras tag …@<digest> v1.2.0` (same bytes, now also a release name) and `ssh … promote prod sha256:<digest>`. The VM re-points prod at the release staging validated, pulling it by digest if it isn't in the local cache. **Nothing is rebuilt.** Then a prod smoke test. |
+| push tag `v*` | **CD Pipeline #2** | **require-stage-success**: the tagged SHA's `main` run must show green deploy, load and smoke jobs, otherwise stop. **Deploy to prod**: runs under `environment: prod`, which only admits `v*` tags (no reviewer). Then `oras tag …@<digest> v1.2.0` (same bytes, now also a release name) and `ssh … promote prod sha256:<digest>`. The VM re-points prod at the release staging validated, pulling it by digest if it isn't in the local cache. **Nothing is rebuilt.** Then a prod smoke test. |
 
 `★ Releases live in GHCR; the VM keeps a small cache`
 - **ORAS** (CNCF, Apache-2.0) pushes a plain file (the Rust binary) to an OCI
@@ -151,7 +153,7 @@ and duration are variables, so a fork can tune the cost.
 | Setting | Configuration |
 |---|---|
 | Environment `staging` | deployment branches: `main` only |
-| Environment `prod` | deployment tags: `v*` only; **required reviewer** = owner; "prevent self-review" off, so a solo owner can approve |
+| Environment `prod` | deployment tags: `v*` only; no reviewer (the tag is the release decision) |
 | Ruleset | protects `v*` tags: only admins create them, no deletion or force-push |
 | Branch protection on `main` | PR required, CI green |
 
@@ -171,7 +173,7 @@ and duration are variables, so a fork can tune the cost.
 |---|---|
 | GitHub environments | `DEPLOY_SSH_KEY`, one per environment |
 | Repo variables | `TS_OAUTH_CLIENT_ID`, `TS_AUDIENCE`, `VM_HOST` |
-| VM only (`/etc/athena/<env>.env`, 0600, root) | OpenRouter keys (staging gets its own spend-capped key), the **existing** Telegram bot token (prod only), the sandbox API key once one is set |
+| VM only (`/etc/athena/<env>.env`, 0600, root) | OpenRouter keys (staging gets its own spend-capped key), each env's **own** Telegram bot token (optional), the sandbox API key once one is set |
 
 ## 3. Deployment: systemd, no Docker on the VM
 
@@ -195,10 +197,12 @@ Docker stays on the **sandbox laptop only**, because OpenSandbox needs it to cre
 sandboxes.
 
 **Units** (`deploy/systemd/`)
-- `athena-serve@.service` (staging and prod) and `athena-telegram@.service` (**prod
-  only**), with `%i` = `staging` or `prod`.
-  - **No second Telegram bot** (owner decision). Two processes polling one bot token
-    conflict (409), so staging runs HTTP only.
+- `athena-serve@.service` (staging and prod) and `athena-telegram@.service`, with
+  `%i` = `staging` or `prod`.
+  - **Revised (owner, 2026-09-26): staging has its own bot.** Each env needs its own
+    token, because two processes polling one token conflict (409).
+    `setup-host.sh` enables `athena-telegram@<env>` only when that env file has a
+    token.
   - The Telegram code path is tested in CI against the existing fake Telegram API
     (`tests/telegram/fake_api.rs`), and staging's smoke, load and eval checks go
     over HTTP.
@@ -529,8 +533,8 @@ Athena adds:
   - a hashed user id.
 - Child spans `sandbox.exec` and `browser.action`.
 - W3C `traceparent` in and out on HTTP.
-- **Content capture.** Off in prod. Staging turns it on only while the staging bot has
-  no real users.
+- **Content capture.** Off in prod. Staging may turn it on, since only the owner uses the
+  staging bot.
   - Setup B: for `ATHENA_ENV=prod`, Athena itself strips `gen_ai.input/output.messages`,
     `gen_ai.system_instructions`, tool arguments/results, `gen_ai.prompt` and
     `gen_ai.completion` from every span and span event before any exporter,
@@ -744,8 +748,8 @@ skills for coding agents, applied to Athena's own setup.
    a failed step is safe to re-run.
 5. **First deploy.** Merging to `main` (or `gh workflow run`) deploys staging. It then
    runs `doctor.sh`.
-6. ⏸ **First release.** The human pushes the `v0.1.0` tag and approves prod in
-   GitHub.
+6. ⏸ **First release.** The human pushes the `v0.1.0` tag. That is the release;
+   there is no approval step.
 
 **The human path** is the same list, run by hand:
 
@@ -780,7 +784,7 @@ These are the checkpoints.
 - env files present with mode 0600;
 - sandbox auth (reported as a warning while hardening is deferred);
 - that staging and prod `/version` match the expected SHAs;
-- the prod environment has a reviewer;
+- the prod environment admits only `v*` tags;
 - the `v*` tag ruleset exists;
 - free disk above 1 GB.
 
@@ -797,7 +801,7 @@ These are the checkpoints.
 | 7a | `preflight.sh` (read-only JSON report, brownfield detection, generated Tailscale policy) | – |
 | 7b | `deploy-gate` Rust binary: command whitelist, pull by digest, backup, switch, health check, rollback, pruning; fakes behind a trait; 100% covered | 1, 2 |
 | 7c | `setup-host.sh` (brownfield-safe, `--dry-run`, `--uninstall`; installs a pinned `deploy-gate` from GHCR) | 6, 7a, 7b |
-| 8 | `ci-cd.yml`: merge → build → staging → loadcheck → smoke; tag → require-stage-success → prod (approval) → smoke; + `init-github.sh --dry-run` | 5, 7c |
+| 8 | `ci-cd.yml`: merge → build → staging → loadcheck → smoke; tag → require-stage-success → prod → smoke; + `init-github.sh --dry-run` | 5, 7c |
 | 8b | `SETUP.md` agent runbook + `.claude/skills/athena-setup` + `AGENTS.md` + `doctor.sh` + README prompt | 7b, 8 |
 | **M2: capable, observable, gated** | | |
 | 9 | Sandbox client + `shell` / `read_file` / `write_file` tools + `sandboxes` table; remove host `read_file` (works with today's unauthenticated server; API key optional) | – |
@@ -819,7 +823,7 @@ These are the checkpoints.
 
 | # | Question | Answer | Effect on the plan |
 |---|---|---|---|
-| 1 | Repo visibility | **Public** | Environment required reviewers are free. Prod deploys wait for approval on a `v*` tag. Public-repo hardening in section 2. |
+| 1 | Repo visibility | **Public** | Prod deploys on a `v*` tag (revised: no approval step; only admins may tag). Public-repo hardening in section 2. |
 | 2 | Registry | **GHCR, via ORAS** (revised from "not hosted") | Releases are pushed as OCI artifacts. The VM pulls by digest and caches 3. The public package makes installs easy for anyone. The sandbox image is still built locally on the laptop. |
 | 3 | VM architecture | **x86_64** | Build `x86_64-unknown-linux-gnu` on `ubuntu-22.04` runners. |
 | 4 | Dependencies | **Approved** once the plan is approved | Add the obvious ones: `reqwest`, the tracing/opentelemetry crates, `tower-http`, a YAML parser. |
@@ -850,7 +854,7 @@ Consequences:
 Decided since v3:
 - No fake-model load tests. `loadcheck` on staging uses the real cheap model.
 - `blacki-agent-1` stays until Athena is good enough to replace it.
-- No alerts, and no additional Telegram bots. Staging is HTTP only.
+- No alerts. (Revised 2026-09-26: staging has its own Telegram bot.)
 - Sandbox hardening is deferred. Today's open OpenSandbox is used as is.
 
 **Laptop as the sandbox host**

@@ -70,7 +70,9 @@ fi
 expected_staging=""; expected_prod=""
 if [ "$GH" = 1 ] && [ -n "$REPO" ]; then
     expected_staging=$(gh api "repos/$REPO/commits/main" --jq .sha 2>/dev/null || true)
-    expected_prod=$(gh api "repos/$REPO/tags?per_page=100" --jq '[.[].name | select(startswith("v"))] | first // empty' 2>/dev/null || true)
+    # deploy-gate reports the release's git commit, so compare prod with the
+    # commit the newest v* tag points at (the tags API lists newest first).
+    expected_prod=$(gh api "repos/$REPO/tags?per_page=100" --jq '[.[] | select(.name | startswith("v")) | .commit.sha] | first // empty' 2>/dev/null || true)
 fi
 
 http_env() { # env port expected-prefix
@@ -113,10 +115,12 @@ fi
 read -r -d '' REMOTE <<'EOF' || true
 s() { if sudo -n true 2>/dev/null; then sudo -n "$@"; else return 99; fi; }
 echo "disk_free_mb=$(df -Pm /var/lib/athena 2>/dev/null | awk 'NR==2 {print $4}')"
-for u in athena-serve@staging athena-serve@prod athena-telegram@prod openobserve; do
+for u in athena-serve@staging athena-serve@prod athena-telegram@staging athena-telegram@prod openobserve; do
     echo "unit_$u=$(systemctl is-active "$u" 2>/dev/null || true)"
 done
-echo "telegram_staging_enabled=$(systemctl is-enabled athena-telegram@staging 2>/dev/null || true)"
+for e in staging prod; do
+    echo "telegram_${e}_enabled=$(systemctl is-enabled athena-telegram@$e 2>/dev/null || true)"
+done
 for e in staging prod; do
     echo "env_$e=$(stat -c '%a %U:%G' /etc/athena/$e.env 2>/dev/null || echo missing)"
     for k in OPENROUTER_API_KEY TELEGRAM_BOT_TOKEN OPEN_SANDBOX_URL OPEN_SANDBOX_API_KEY \
@@ -147,14 +151,18 @@ else
     elif [ "$disk" -ge 1024 ]; then check disk pass "${disk} MB free under /var/lib/athena"
     else check disk fail "${disk} MB free; deploy-gate refuses deploys under 1 GB"; fi
 
-    for u in athena-serve@staging athena-serve@prod athena-telegram@prod openobserve; do
+    for u in athena-serve@staging athena-serve@prod openobserve; do
         state=$(get "unit_$u")
         if [ "$state" = active ]; then check "unit $u" pass active
         else check "unit $u" fail "${state:-unknown}"; fi
     done
-    tg=$(get telegram_staging_enabled)
-    if [ "$tg" = enabled ]; then check "staging telegram" fail "athena-telegram@staging is enabled; one bot token cannot be polled twice"
-    else check "staging telegram" pass "not enabled"; fi
+    for env in staging prod; do
+        if [ "$(get "telegram_${env}_enabled")" = enabled ]; then
+            state=$(get "unit_athena-telegram@$env")
+            if [ "$state" = active ]; then check "telegram $env" pass active
+            else check "telegram $env" fail "enabled but ${state:-unknown}"; fi
+        else check "telegram $env" pass "no bot for $env"; fi
+    done
 
     if [ "$(get gate)" = yes ]; then check deploy-gate pass installed
     else check deploy-gate fail "/opt/athena/bin/deploy-gate missing: setup-host.sh --gate-digest"; fi
@@ -208,12 +216,12 @@ if [ "$GH" = 0 ] || [ -z "$REPO" ]; then
     check github skip "gh is missing or not authenticated"
 else
     # gh prints the error body on stdout, so only trust output on success.
-    reviewers=""
-    if env_json=$(gh api "repos/$REPO/environments/prod" 2>/dev/null); then
-        reviewers=$(jq -r '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[].reviewer.login] | join(",")' <<<"$env_json")
-    fi
-    if [ -n "$reviewers" ]; then check "prod reviewer" pass "$reviewers"
-    else check "prod reviewer" fail "environment prod missing or has no required reviewer: init-github.sh"; fi
+    # Prod deploys from v* tags only; the tag ruleset decides who may tag.
+    prod_tags=""
+    prod_tags=$(gh api "repos/$REPO/environments/prod/deployment-branch-policies" \
+        --jq '[.branch_policies[] | select(.type == "tag") | .name] | join(",")' 2>/dev/null || true)
+    if [ "$prod_tags" = "v*" ]; then check "prod environment" pass "deploys from v* tags only"
+    else check "prod environment" fail "environment prod missing or not limited to v* tags: init-github.sh"; fi
     if gh api "repos/$REPO/environments/staging" >/dev/null 2>&1; then check "staging environment" pass present
     else check "staging environment" fail "missing: init-github.sh"; fi
     ruleset=0

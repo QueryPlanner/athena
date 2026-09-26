@@ -1,5 +1,6 @@
-# Athena Telegram bot for one environment. Enabled for prod only: two
-# processes polling one bot token conflict (HTTP 409), and staging has no bot.
+# Athena Telegram bot for one environment. setup-host.sh enables it only when
+# /etc/athena/%i.env has a TELEGRAM_BOT_TOKEN. Each env needs its own bot:
+# two processes polling one token conflict (HTTP 409).
 # Installed by scripts/setup-host.sh; see plans/contracts.md ("systemd").
 [Unit]
 Description=Athena Telegram bot (%i)

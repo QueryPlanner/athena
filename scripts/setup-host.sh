@@ -525,13 +525,10 @@ ensure_env_files() {
     group=$(owner_or_root athena); group=${group##*:}
     for env in staging prod; do
         file=/etc/athena/$env.env
-        if [ "$env" = prod ]; then
-            port=$PORT_PROD
-            tg=$'\n# The existing bot\'s token from @BotFather (prod only).\nTELEGRAM_BOT_TOKEN='
-        else
-            port=$PORT_STAGING
-            tg=$'\n# No Telegram for staging: one bot token cannot be polled by two processes.'
-        fi
+        if [ "$env" = prod ]; then port=$PORT_PROD; else port=$PORT_STAGING; fi
+        # Each env needs its own bot: one token cannot be polled by two
+        # processes (Telegram answers 409). Empty means no bot for this env.
+        tg=$'\n# This env\'s own bot token from @BotFather; leave empty for no bot.\nTELEGRAM_BOT_TOKEN='
         hosts="$TAILNET_IP:$port,$HOST_ALIAS:$port"
         if [ -f "$file" ]; then
             fix_mode "$file" 0640 "root:$group"
@@ -638,17 +635,30 @@ enable_services() {
     run systemctl daemon-reload
     local target
     for target in athena@staging.target athena@prod.target athena-serve@staging.service \
-        athena-serve@prod.service athena-telegram@prod.service; do
+        athena-serve@prod.service; do
         if systemctl is-enabled --quiet "$target" 2>/dev/null; then same "enabled $target"; else
             run systemctl enable --quiet "$target"
             changed "enabled $target"
         fi
     done
-    # Staging never runs a bot.
-    if systemctl is-enabled --quiet athena-telegram@staging.service 2>/dev/null; then
-        run systemctl disable --quiet athena-telegram@staging.service
-        changed "disabled athena-telegram@staging (staging has no bot)"
-    fi
+    # A bot runs in an env only when its env file has a token; without one
+    # the unit would fail and restart forever. deploy-gate starts an enabled
+    # bot on each deploy.
+    local env unit
+    for env in staging prod; do
+        unit=athena-telegram@$env.service
+        if [ -r "/etc/athena/$env.env" ] && grep -Eq '^TELEGRAM_BOT_TOKEN=.+' "/etc/athena/$env.env"; then
+            if systemctl is-enabled --quiet "$unit" 2>/dev/null; then same "enabled $unit"; else
+                run systemctl enable --quiet "$unit"
+                changed "enabled $unit"
+            fi
+        elif systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+            run systemctl disable --quiet "$unit"
+            changed "disabled $unit (no TELEGRAM_BOT_TOKEN in /etc/athena/$env.env)"
+        else
+            todo "no Telegram bot for $env: put its own token in /etc/athena/$env.env, then re-run setup-host.sh"
+        fi
+    done
     [ -e /opt/athena/staging/current ] ||
         todo "first deploy: merge to main; CI runs 'deploy staging <digest>' and starts the units"
 

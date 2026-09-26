@@ -3,7 +3,9 @@
 #   pull_request   shellcheck + infra checks, unit, integration
 #   push main      build (release artifact to GHCR, sandbox image)
 #                  -> deploy-staging -> bench-staging -> smoke-staging, eval-staging
-#   push tag v*    require-stage-success -> deploy-prod (approval) -> smoke-prod
+#   push tag v*    require-stage-success -> deploy-prod -> smoke-prod
+#                  (no approval step: the tag is the release decision, and
+#                  the v* tag ruleset lets only repo admins create one)
 #
 # Public repo rules: every action pinned to a commit SHA, minimal permissions
 # per job, no pull_request_target. Fork PRs get no secrets and never reach
@@ -354,8 +356,9 @@ jobs:
           echo "repo=$repo" >>"$GITHUB_OUTPUT"
           echo "Promoting \`$repo@$digest\` (sha-$GITHUB_SHA) as \`$GITHUB_REF_NAME\`" >>"$GITHUB_STEP_SUMMARY"
 
-  # Waits for the required reviewer. The prod smoke test runs in this job:
-  # a second job on the prod environment would ask for approval again.
+  # The prod environment only admits v* tags (see scripts/init-github.sh).
+  # If a reviewer is ever added there, this job waits for them; the prod smoke
+  # test runs in this job so it would not ask twice.
   deploy-prod:
     needs: require-stage-success
     runs-on: ubuntu-24.04
