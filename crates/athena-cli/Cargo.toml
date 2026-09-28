@@ -2,5 +2,8 @@
 name = "athena-cli"
 version.workspace = true
 edition.workspace = true
+description = "Make a new Athena agent, and put it on the VM next to the others."
 
 [dependencies]
+
+[dev-dependencies]
