@@ -91,6 +91,7 @@ pub mod report;
 pub mod target;
 
 use crate::flags::Flags;
+use crate::spec::AgentSpec;
 use anyhow::{Context, Result, bail};
 use judge::Judge;
 use report::Row;
@@ -109,6 +110,7 @@ const DEFAULT_USER: &str = "eval";
 /// `athena eval ...`. `make_model` builds a real model by name, for `record`
 /// and `--judge`; nothing else calls it.
 pub async fn main<M, F>(
+    spec: &AgentSpec,
     args: &[String],
     agent_model: &str,
     make_model: F,
@@ -119,8 +121,10 @@ where
     F: Fn(&str) -> Result<M>,
 {
     match args.split_first() {
-        Some((cmd, rest)) if cmd == "run" => run(rest, agent_model, make_model, out).await,
-        Some((cmd, rest)) if cmd == "record" => record(rest, agent_model, make_model, out).await,
+        Some((cmd, rest)) if cmd == "run" => run(spec, rest, agent_model, make_model, out).await,
+        Some((cmd, rest)) if cmd == "record" => {
+            record(spec, rest, agent_model, make_model, out).await
+        }
         Some((cmd, rest)) if cmd == "compare" => compare(rest, out),
         _ => bail!("{USAGE}"),
     }
@@ -137,6 +141,7 @@ fn env_or(name: &str, default: &str) -> String {
 }
 
 async fn run<M, F>(
+    spec: &AgentSpec,
     args: &[String],
     agent_model: &str,
     make_model: F,
@@ -183,7 +188,7 @@ where
         let mut case_rows = Vec::new();
         for sample in 0..k {
             let obs = match &http {
-                None => target::replay(case, user).await?,
+                None => target::replay(spec, case, user).await?,
                 Some(api) => api.run(case).await,
             };
             let grade = grade::grade(case, &obs);
@@ -238,6 +243,7 @@ where
 }
 
 async fn record<M, F>(
+    spec: &AgentSpec,
     args: &[String],
     agent_model: &str,
     make_model: F,
@@ -262,7 +268,7 @@ where
     let model = make_model(agent_model)?;
     let mut failures = 0;
     for case in &cases {
-        let (cassette, obs) = target::record(case, model.clone(), agent_model, user).await?;
+        let (cassette, obs) = target::record(spec, case, model.clone(), agent_model, user).await?;
         let grade = grade::grade(case, &obs);
         if grade.pass {
             let path = case.cassette_path();

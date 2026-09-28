@@ -4,7 +4,6 @@
 
 mod common;
 
-use athena::agent;
 use common::*;
 use rig_agent::prelude::Message;
 use rig_core::test_utils::MockTurn;
@@ -12,7 +11,7 @@ use rig_core::test_utils::MockTurn;
 /// Rig 0.42 sends the preamble as a leading System message in the request
 /// history, not in `CompletionRequest::preamble`, and never stores it.
 fn is_preamble(m: &Message) -> bool {
-    matches!(m, Message::System { content } if content == agent::PREAMBLE)
+    matches!(m, Message::System { content } if content == athena::agent::PREAMBLE)
 }
 
 #[tokio::test]

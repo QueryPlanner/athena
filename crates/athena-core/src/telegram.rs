@@ -24,10 +24,10 @@
 //!   stalls every chat.
 //! - Message and reply text is never logged; user ids and errors are.
 
-use crate::agent;
 use crate::runner::Run;
 use crate::service::{self, Service, Session, User};
 use crate::shutdown;
+use crate::spec::{self, AgentSpec};
 use crate::store::{self, Store};
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
@@ -825,13 +825,18 @@ pub async fn serve<R: Run + 'static>(
 
 /// `athena telegram`, wired to the environment: the token, the database,
 /// OpenRouter. Every setting is checked before the database is opened.
-pub async fn main(model: &str) -> Result<()> {
+pub async fn main(agent_spec: &AgentSpec, model: &str) -> Result<()> {
     let stop = shutdown::listen()?;
     let config = Config::from_env()?;
-    let client = agent::client()?;
+    let client = spec::client()?;
     let store = Store::open(&store::path())?;
-    let service = Arc::new(Service::new(store.clone(), model, log_warning));
-    let agent = agent::build(&client, model, service.memory())?;
+    let service = Arc::new(Service::new(
+        agent_spec.name,
+        store.clone(),
+        model,
+        log_warning,
+    ));
+    let agent = agent_spec.build(&client, model, service.memory())?;
     let app = Arc::new(Telegram::new(service, store, agent, Arc::new(log_warning)));
     let bot = config.bot();
     let mut dispatcher = dispatcher(bot.clone(), app.clone());
@@ -1171,7 +1176,7 @@ mod tests {
 
     fn harness_with<R: Run + 'static>(make: impl FnOnce(&Service) -> R) -> Harness<R> {
         let store = Store::open_in_memory().unwrap();
-        let service = Service::new(store.clone(), "test/model", |_| {});
+        let service = Service::new("athena", store.clone(), "test/model", |_| {});
         let agent = make(&service);
         let logged = Logged::default();
         let sink = logged.clone();
@@ -1188,7 +1193,7 @@ mod tests {
 
     fn mock(service: &Service, turns: Vec<MockTurn>) -> Agent {
         let model = MockCompletionModel::new(turns);
-        agent::configure(AgentBuilder::new(model).memory(service.memory()))
+        crate::testing::spec().configure(AgentBuilder::new(model).memory(service.memory()))
     }
 
     fn harness(turns: Vec<MockTurn>) -> Harness<Agent> {

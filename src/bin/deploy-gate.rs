@@ -1,6 +1,6 @@
-//! Wiring only: the real VM, rooted at `/`. The logic is `athena::gate`.
+//! Wiring only: the real VM, rooted at `/`. The logic is `athena_core::gate`.
 
-use athena::gate::{self, Gate, RealSystem};
+use athena_core::gate::{self, Gate, RealSystem};
 
 fn main() {
     // A CI connection that drops mid-deploy sends SIGHUP. Dying then could

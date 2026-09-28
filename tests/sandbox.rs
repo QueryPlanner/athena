@@ -5,12 +5,11 @@ mod common;
 #[path = "sandbox/fake_server.rs"]
 mod fake_server;
 
-use athena::agent;
-use athena::policy::MAX_TOOL_CALLS;
-use athena::sandbox::tools::READ_LIMIT;
-use athena::sandbox::{Config, Error, Sandboxes};
-use athena::service::{Service, User};
-use athena::store::SandboxRow;
+use athena_core::policy::MAX_TOOL_CALLS;
+use athena_core::sandbox::tools::READ_LIMIT;
+use athena_core::sandbox::{Config, Error, Sandboxes};
+use athena_core::service::{Service, User};
+use athena_core::store::SandboxRow;
 use common::*;
 use fake_server::{FakeSandbox, printed};
 use reqwest::header::HeaderValue;
@@ -80,7 +79,7 @@ impl Harness {
     fn agent(&self, turns: Vec<MockTurn>) -> (rig_agent::agent::Agent, MockCompletionModel) {
         let model = MockCompletionModel::new(turns);
         let builder = AgentBuilder::new(model.clone()).memory(self.service.memory());
-        let agent = agent::configure_with(builder, Some(self.sandboxes.clone()));
+        let agent = athena::agent::spec().configure_with(builder, Some(self.sandboxes.clone()));
         (agent, model)
     }
 
@@ -757,7 +756,7 @@ async fn a_streamed_turn_reaches_the_same_sandbox() {
         ]);
         let builder = AgentBuilder::new(model.clone()).memory(service.memory());
         (
-            agent::configure_with(builder, Some(h.sandboxes.clone())),
+            athena::agent::spec().configure_with(builder, Some(h.sandboxes.clone())),
             model,
         )
     };
@@ -808,7 +807,7 @@ async fn tool_calls_past_the_runs_budget_are_skipped_with_a_reason() {
 async fn a_tool_call_with_oversized_arguments_is_skipped() {
     let h = harness().await;
     let s = h.session("s").await;
-    let huge = "x".repeat(athena::policy::MAX_ARGUMENT_BYTES);
+    let huge = "x".repeat(athena_core::policy::MAX_ARGUMENT_BYTES);
     let out = h
         .call(&s, "write_file", json!({"path": "/big", "content": huge}))
         .await;

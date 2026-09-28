@@ -6,8 +6,8 @@
 
 use super::case::EvalCase;
 use super::cassette::{Cassette, RecordingModel, ReplayModel};
-use crate::agent;
 use crate::service::Service;
+use crate::spec::AgentSpec;
 use crate::store::Store;
 use anyhow::{Context, Result};
 use reqwest::header::HeaderMap;
@@ -87,13 +87,19 @@ fn finish_reasons(calls_json: &str) -> Vec<String> {
 /// Run `case` through the production agent in front of `model`, with a fresh
 /// in-memory database, as the user `eval:<user>`.
 async fn in_process(
+    spec: &AgentSpec,
     case: &EvalCase,
     model: impl CompletionModel + 'static,
     model_name: &str,
     user: &str,
 ) -> Result<Observation> {
-    let service = Service::new(Store::open_in_memory()?, model_name, crate::cli::warn);
-    let agent = agent::configure(AgentBuilder::new(model).memory(service.memory()));
+    let service = Service::new(
+        spec.name,
+        Store::open_in_memory()?,
+        model_name,
+        crate::cli::warn,
+    );
+    let agent = spec.configure(AgentBuilder::new(model).memory(service.memory()));
     let user = service.user("eval", user).await?;
     let session = service.create_session(&user, &case.eval_case_id).await?;
     let mut obs = Observation {
@@ -127,7 +133,7 @@ async fn in_process(
 
 /// Replay `case` from its cassette. A missing or foreign cassette fails the
 /// sample, not the run.
-pub async fn replay(case: &EvalCase, user: &str) -> Result<Observation> {
+pub async fn replay(spec: &AgentSpec, case: &EvalCase, user: &str) -> Result<Observation> {
     let cassette = match Cassette::read(&case.cassette_path()) {
         Ok(c) if c.eval_case_id == case.eval_case_id => c,
         Ok(c) => {
@@ -140,20 +146,21 @@ pub async fn replay(case: &EvalCase, user: &str) -> Result<Observation> {
         Err(e) => return Ok(Observation::failed(format!("{e:#}"))),
     };
     let model = ReplayModel::new(&cassette);
-    let mut obs = in_process(case, model.clone(), &cassette.model, user).await?;
+    let mut obs = in_process(spec, case, model.clone(), &cassette.model, user).await?;
     obs.drift = model.drift();
     Ok(obs)
 }
 
 /// Run `case` against a real model, recording what it said.
 pub async fn record<M: CompletionModel + Clone + 'static>(
+    spec: &AgentSpec,
     case: &EvalCase,
     model: M,
     model_name: &str,
     user: &str,
 ) -> Result<(Cassette, Observation)> {
     let recorder = RecordingModel::new(model);
-    let obs = in_process(case, recorder.clone(), model_name, user).await?;
+    let obs = in_process(spec, case, recorder.clone(), model_name, user).await?;
     let cassette = Cassette {
         eval_case_id: case.eval_case_id.clone(),
         model: model_name.to_string(),
@@ -346,9 +353,15 @@ mod tests {
     async fn recording_then_replaying_reproduces_the_trajectory_without_drift() {
         let dir = temp_dir();
         let case = case(&dir, "add", &["add 21 and 21"]);
-        let (cassette, live) = record(&case, MockCompletionModel::new(add_turns()), "m", "u")
-            .await
-            .unwrap();
+        let (cassette, live) = record(
+            &crate::testing::spec(),
+            &case,
+            MockCompletionModel::new(add_turns()),
+            "m",
+            "u",
+        )
+        .await
+        .unwrap();
         assert_eq!(live.error, None);
         assert_eq!(live.replies, ["42"]);
         assert_eq!(cassette.interactions.len(), 2);
@@ -356,7 +369,7 @@ mod tests {
         assert_eq!(cassette.interactions[1].input, ["tool add: 42.0"]);
         cassette.write(&case.cassette_path()).unwrap();
 
-        let replayed = replay(&case, "u").await.unwrap();
+        let replayed = replay(&crate::testing::spec(), &case, "u").await.unwrap();
         assert_eq!((replayed.error, replayed.drift), (None, None));
         assert_eq!(replayed.replies, ["42"]);
         assert_eq!(
@@ -377,7 +390,9 @@ mod tests {
     #[tokio::test]
     async fn a_changed_case_drifts_and_a_missing_or_foreign_cassette_fails() {
         let dir = temp_dir();
-        let missing = replay(&case(&dir, "none", &["hi"]), "u").await.unwrap();
+        let missing = replay(&crate::testing::spec(), &case(&dir, "none", &["hi"]), "u")
+            .await
+            .unwrap();
         assert!(missing.error.unwrap().contains("athena eval record"));
 
         let text =
@@ -393,14 +408,18 @@ mod tests {
         // The case gained a second turn since it was recorded.
         let two = case(&dir, "two", &["first", "second"]);
         recorded.write(&two.cassette_path()).unwrap();
-        let drifted = replay(&two, "u").await.unwrap();
+        let drifted = replay(&crate::testing::spec(), &two, "u").await.unwrap();
         assert_eq!(drifted.replies, ["ok"]);
         assert!(drifted.error.unwrap().contains("trajectory drift"));
         assert!(drifted.drift.unwrap().contains("was not recorded"));
 
         let foreign = case(&dir, "foreign", &["first"]);
         recorded.write(&foreign.cassette_path()).unwrap();
-        let err = replay(&foreign, "u").await.unwrap().error.unwrap();
+        let err = replay(&crate::testing::spec(), &foreign, "u")
+            .await
+            .unwrap()
+            .error
+            .unwrap();
         assert!(err.contains("is the cassette of `two`"), "{err}");
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -408,12 +427,14 @@ mod tests {
     /// A real `athena serve` router on loopback, with a scripted model.
     async fn server(turns: Vec<MockTurn>) -> String {
         let service = Arc::new(Service::new(
+            "athena",
             Store::open_in_memory().unwrap(),
             "srv",
             crate::cli::warn,
         ));
         let model = MockCompletionModel::new(turns);
-        let agent = agent::configure(AgentBuilder::new(model).memory(service.memory()));
+        let agent =
+            crate::testing::spec().configure(AgentBuilder::new(model).memory(service.memory()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(crate::http::serve(

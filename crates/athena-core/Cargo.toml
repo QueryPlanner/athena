@@ -1,39 +1,30 @@
-[workspace]
-members = ["crates/athena-core", "crates/athena-cli"]
-resolver = "3"
-
-[workspace.package]
-version = "0.1.0"
-edition = "2024"
-
 [package]
-name = "athena"
+name = "athena-core"
 version.workspace = true
 edition.workspace = true
-# `cargo run` means the agent; deploy-gate runs only on the VM.
-default-run = "athena"
+description = "The runtime every Athena agent shares: runner, store, HTTP, CLI, eval, telemetry, sandbox tools and deploy-gate."
+
+[features]
+# `athena_core::testing`: a spec and fakes for tests of this crate and of agents.
+testing = []
 
 [dependencies]
 anyhow = "1.0.104"
-athena-core = { path = "crates/athena-core" }
-libc = "0.2.189"
-rig-agent = { version = "0.42.0", features = ["derive"] }
-# `#[rig_tool]` looks for rig-core in every dependency table; it must be a
-# normal dependency, or builds without dev-dependencies cannot find it.
-rig-core = "0.42.0"
-
-[dev-dependencies]
-athena-core = { path = "crates/athena-core", features = ["testing"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "matched-path", "tokio"] }
 dotenvy = "0.15.7"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+libc = "0.2.189"
 opentelemetry = { version = "0.33.0", default-features = false, features = ["trace", "logs"] }
 opentelemetry-appender-tracing = "0.33.0"
 opentelemetry-http = { version = "0.33.0", default-features = false }
 opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "logs"] }
+opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["trace", "logs"] }
 regex = "1.13.1"
 # The same version and features teloxide already builds, so no new code is compiled.
 # Used by the sandbox client, evals and bench.
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
+rig-agent = { version = "0.42.0", features = ["derive"] }
+rig-core = "0.42.0"
 rusqlite = { version = "0.40.2", features = ["backup", "bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -45,6 +36,8 @@ tracing-opentelemetry = { version = "0.34.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "registry", "std", "ansi"] }
 url = "2.5.8"
 uuid = { version = "1.26.1", features = ["v4"] }
+
+[dev-dependencies]
 # `multipart` lets the fake OpenSandbox in tests/ parse file uploads.
 axum = { version = "0.8.9", default-features = false, features = ["tokio", "http1", "json", "multipart", "query"] }
 http-body-util = "0.1.5"

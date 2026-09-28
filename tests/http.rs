@@ -5,9 +5,9 @@
 
 mod common;
 
-use athena::http::{self, Hosts, USER_HEADER};
-use athena::service::Service;
-use athena::store::SqliteMemory;
+use athena_core::http::{self, Hosts, USER_HEADER};
+use athena_core::service::Service;
+use athena_core::store::SqliteMemory;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
@@ -173,7 +173,7 @@ async fn the_version_needs_no_user_and_ignores_the_host() {
     let (status, body) = call(&router, request).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!({"version": athena::ops::version()}));
+    assert_eq!(body, json!({"version": athena_core::ops::version()}));
     assert_eq!(
         count(
             &tmp.raw(),

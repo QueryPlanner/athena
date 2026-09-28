@@ -23,7 +23,7 @@
 
 use crate::runner::{self, Run, RunStart, RunStream};
 use crate::store::{AppendError, SqliteMemory, Store, now_millis};
-use crate::{agent, telemetry};
+use crate::telemetry;
 use futures_util::StreamExt;
 use rig_agent::agent::{MultiTurnStreamItem, PromptResponse, StreamingError, StreamingResult};
 use rig_agent::completion::{CompletionError, PromptError};
@@ -104,6 +104,8 @@ type Warn = Arc<dyn Fn(&str) + Send + Sync>;
 /// Share one per process, behind an `Arc` if several tasks need it.
 pub struct Service {
     store: Store,
+    /// The agent's name, on every turn's span.
+    agent_name: &'static str,
     model: String,
     warn: Warn,
     /// How many spawned turns are running; see [`Service::idle`].
@@ -118,15 +120,18 @@ fn non_empty(what: &str, value: &str) -> Result<(), Error> {
 }
 
 impl Service {
-    /// `model` is recorded on every run. `warn` receives problems that do
-    /// not fail the call, such as a telemetry row that could not be saved.
+    /// `agent_name` names every turn's span (`AgentSpec::name`). `model` is
+    /// recorded on every run. `warn` receives problems that do not fail the
+    /// call, such as a telemetry row that could not be saved.
     pub fn new(
+        agent_name: &'static str,
         store: Store,
         model: impl Into<String>,
         warn: impl Fn(&str) + Send + Sync + 'static,
     ) -> Self {
         Self {
             store,
+            agent_name,
             model: model.into(),
             warn: Arc::new(warn),
             in_flight: Arc::new(watch::Sender::new(0)),
@@ -215,7 +220,7 @@ impl Service {
         text: &str,
     ) -> Result<Turn, Error> {
         let (session, lock) = self.claim(user, session_id, text).await?;
-        let span = turn_span(user, &session);
+        let span = turn_span(self.agent_name, user, &session);
         self.complete(&session, lock, agent.run(text, &session.id))
             .instrument(span)
             .await
@@ -236,7 +241,7 @@ impl Service {
         text: &str,
     ) -> Result<Turn, Error> {
         let (session, lock) = self.claim(user, session_id, text).await?;
-        let span = turn_span(user, &session);
+        let span = turn_span(self.agent_name, user, &session);
         let (service, text) = (self.clone(), text.to_string());
         self.spawn(
             async move {
@@ -270,7 +275,7 @@ impl Service {
         text: &str,
     ) -> Result<TurnStream, Error> {
         let (session, lock) = self.claim(user, session_id, text).await?;
-        let span = turn_span(user, &session);
+        let span = turn_span(self.agent_name, user, &session);
         let (events, receiver) = mpsc::unbounded_channel();
         let (service, text) = (self.clone(), text.to_string());
         // The handle is not needed: the task reports through `events`, and a
@@ -369,13 +374,13 @@ impl Service {
 /// instead of opening its own, so its `chat` and `execute_tool` spans nest
 /// under it. Created in the caller's context, so an HTTP request's span is
 /// its parent even when the turn then runs in its own task.
-fn turn_span(user: &User, session: &Session) -> tracing::Span {
+fn turn_span(agent_name: &str, user: &User, session: &Session) -> tracing::Span {
     tracing::info_span!(
         "invoke_agent",
-        otel.name = format!("invoke_agent {}", agent::NAME),
+        otel.name = format!("invoke_agent {agent_name}"),
         otel.status_code = tracing::field::Empty,
         gen_ai.operation.name = "invoke_agent",
-        gen_ai.agent.name = agent::NAME,
+        gen_ai.agent.name = agent_name,
         gen_ai.conversation.id = session.id.as_str(),
         // Rig records the prompt here when content telemetry is on.
         gen_ai.prompt = tracing::field::Empty,
@@ -530,7 +535,7 @@ fn settle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent;
+    use crate::testing;
     use futures_util::FutureExt;
     use rig_agent::agent::{Agent, AgentBuilder};
     use rig_core::memory::{ConversationMemory, MemoryError};
@@ -545,7 +550,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let warnings = Warnings::default();
         let sink = warnings.clone();
-        let service = Service::new(store.clone(), "test/model", move |w| {
+        let service = Service::new("athena", store.clone(), "test/model", move |w| {
             sink.lock().unwrap().push(w.to_string())
         });
         (service, store, warnings)
@@ -557,7 +562,7 @@ mod tests {
     ) -> (Agent, MockCompletionModel) {
         let model = MockCompletionModel::new(turns);
         (
-            agent::configure(AgentBuilder::new(model.clone()).memory(memory)),
+            testing::spec().configure(AgentBuilder::new(model.clone()).memory(memory)),
             model,
         )
     }
@@ -871,7 +876,7 @@ mod tests {
         let (service, store, _) = service();
         let (user, session) = with_session(&service).await;
         let model = MockCompletionModel::new([MockTurn::text("forgotten")]);
-        let agent = agent::configure(AgentBuilder::new(model));
+        let agent = testing::spec().configure(AgentBuilder::new(model));
 
         let err = service
             .send(&agent, &user, &session.id, "hi")
@@ -1083,9 +1088,7 @@ mod tests {
     ) -> (Arc<Agent>, MockCompletionModel) {
         let model = MockCompletionModel::from_stream_turns(turns);
         (
-            Arc::new(agent::configure(
-                AgentBuilder::new(model.clone()).memory(memory),
-            )),
+            Arc::new(testing::spec().configure(AgentBuilder::new(model.clone()).memory(memory))),
             model,
         )
     }

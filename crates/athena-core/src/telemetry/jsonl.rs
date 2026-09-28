@@ -756,7 +756,7 @@ mod tests {
                 .collect::<BTreeSet<_>>()
         };
         let want = keys(&span_line(&span("s", 0, Status::Unset), &Map::new()));
-        let testdata = Path::new(env!("CARGO_MANIFEST_DIR")).join("analytics/testdata");
+        let testdata = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../analytics/testdata");
         let mut checked = 0;
         for entry in fs::read_dir(testdata).unwrap() {
             let path = entry.unwrap().path();

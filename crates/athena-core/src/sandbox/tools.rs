@@ -12,6 +12,7 @@
 use super::shell::command_line;
 use super::{Error, Sandboxes};
 use crate::runner::Conversation;
+use crate::spec::SandboxTools;
 use rig_agent::agent::{AgentBuilder, WithBuilderTools};
 use rig_agent::tool::{Tool, ToolContext, ToolExecutionError};
 use serde::Deserialize;
@@ -31,22 +32,49 @@ const BROWSER_MAX_OUTPUT: &str = "12000";
 const SNAPSHOT_DEPTH: &str = "12";
 const SCREENSHOT_DIR: &str = "/tmp/athena-screenshots";
 
-/// Add every sandbox tool to an agent.
+/// Every sandbox and browser tool, by the name the model calls it.
+pub const NAMES: [&str; 10] = [
+    Shell::NAME,
+    RunCode::NAME,
+    ReadFile::NAME,
+    WriteFile::NAME,
+    BrowserOpen::NAME,
+    BrowserSnapshot::NAME,
+    BrowserClick::NAME,
+    BrowserFill::NAME,
+    BrowserRead::NAME,
+    BrowserScreenshot::NAME,
+];
+
+/// Add the sandbox tools `selected` names to an agent.
 pub fn register(
     builder: AgentBuilder<WithBuilderTools>,
     sandboxes: Arc<Sandboxes>,
+    selected: SandboxTools,
 ) -> AgentBuilder<WithBuilderTools> {
-    builder
-        .tool(Shell(sandboxes.clone()))
-        .tool(RunCode(sandboxes.clone()))
-        .tool(ReadFile(sandboxes.clone()))
-        .tool(WriteFile(sandboxes.clone()))
-        .tool(BrowserOpen(sandboxes.clone()))
-        .tool(BrowserSnapshot(sandboxes.clone()))
-        .tool(BrowserClick(sandboxes.clone()))
-        .tool(BrowserFill(sandboxes.clone()))
-        .tool(BrowserRead(sandboxes.clone()))
-        .tool(BrowserScreenshot(sandboxes))
+    let s = &sandboxes;
+    let b = add(builder, selected, Shell(s.clone()));
+    let b = add(b, selected, RunCode(s.clone()));
+    let b = add(b, selected, ReadFile(s.clone()));
+    let b = add(b, selected, WriteFile(s.clone()));
+    let b = add(b, selected, BrowserOpen(s.clone()));
+    let b = add(b, selected, BrowserSnapshot(s.clone()));
+    let b = add(b, selected, BrowserClick(s.clone()));
+    let b = add(b, selected, BrowserFill(s.clone()));
+    let b = add(b, selected, BrowserRead(s.clone()));
+    add(b, selected, BrowserScreenshot(s.clone()))
+}
+
+fn add<T: Tool + 'static>(
+    builder: AgentBuilder<WithBuilderTools>,
+    selected: SandboxTools,
+    tool: T,
+) -> AgentBuilder<WithBuilderTools> {
+    if selected.includes(T::NAME) {
+        builder.tool(tool)
+    } else {
+        builder
+    }
 }
 
 /// The session this run belongs to.

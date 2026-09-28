@@ -1,9 +1,8 @@
 //! Shared helpers for the integration tests. Each test binary uses a subset.
 #![allow(dead_code)]
 
-use athena::agent;
-use athena::service::{Service, Session, User};
-use athena::store::Store;
+use athena_core::service::{Service, Session, User};
+use athena_core::store::Store;
 use rig_agent::agent::{Agent, AgentBuilder};
 use rig_core::completion::Usage;
 use rig_core::test_utils::{MockCompletionModel, MockStreamEvent, MockTurn};
@@ -41,7 +40,7 @@ impl TempDb {
     pub fn service(&self) -> (Service, Warnings) {
         let warnings = Warnings::default();
         let sink = warnings.clone();
-        let service = Service::new(self.open(), "m", move |w| {
+        let service = Service::new("athena", self.open(), "m", move |w| {
             sink.lock().unwrap().push(w.to_string())
         });
         (service, warnings)
@@ -105,7 +104,7 @@ pub fn mock_agent(
 ) -> (Agent, MockCompletionModel) {
     let model = MockCompletionModel::new(turns);
     let builder = AgentBuilder::new(model.clone()).memory(service.memory());
-    (agent::configure(builder), model)
+    (athena::agent::spec().configure(builder), model)
 }
 
 /// `add 21 and 21` as a real model plays it: a tool call, then the answer.
@@ -206,7 +205,7 @@ pub fn mock_stream_agent(
 ) -> (Agent, MockCompletionModel) {
     let model = MockCompletionModel::from_stream_turns(turns);
     let builder = AgentBuilder::new(model.clone()).memory(memory);
-    (agent::configure(builder), model)
+    (athena::agent::spec().configure(builder), model)
 }
 
 /// One streamed model turn: `chunks` of text, then the provider's terminal
@@ -237,5 +236,5 @@ pub fn mock_agent_with_memory(
 ) -> (Agent, MockCompletionModel) {
     let model = MockCompletionModel::new(turns);
     let builder = AgentBuilder::new(model.clone()).memory(memory);
-    (agent::configure(builder), model)
+    (athena::agent::spec().configure(builder), model)
 }

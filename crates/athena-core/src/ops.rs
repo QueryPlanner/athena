@@ -11,12 +11,29 @@ use rusqlite::backup::{Backup, StepResult};
 use rusqlite::{Connection, OpenFlags};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// How long a backup waits for a writer that holds the database locked.
 pub const BACKUP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// This build's version: `ATHENA_VERSION`, else the crate version marked
+static BUILD_VERSION: OnceLock<&'static str> = OnceLock::new();
+
+/// Record the agent crate's version (`AgentSpec::version`). [`crate::app::main`]
+/// calls this once, first; the first call wins.
+pub fn set_build_version(version: &'static str) {
+    let _ = BUILD_VERSION.set(version);
+}
+
+/// The agent crate's version, else this crate's.
+pub fn build_version() -> &'static str {
+    BUILD_VERSION
+        .get()
+        .copied()
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
+/// This build's version: `ATHENA_VERSION`, else the build version marked
 /// `-dev`. Deploys set `ATHENA_VERSION` to the release they installed.
 pub fn version() -> String {
     version_or_dev(std::env::var("ATHENA_VERSION").ok())
@@ -25,7 +42,7 @@ pub fn version() -> String {
 fn version_or_dev(configured: Option<String>) -> String {
     configured
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| format!("{}-dev", env!("CARGO_PKG_VERSION")))
+        .unwrap_or_else(|| format!("{}-dev", build_version()))
 }
 
 /// Whether `args` asks for one of the commands [`run`] handles.

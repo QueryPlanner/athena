@@ -156,7 +156,7 @@ impl Settings {
 /// `ATHENA_VERSION` as written by deploy-gate, or this build's crate
 /// version marked as a development build.
 fn version_or_dev(configured: Option<String>) -> String {
-    configured.unwrap_or_else(|| format!("{}-dev", env!("CARGO_PKG_VERSION")))
+    configured.unwrap_or_else(|| format!("{}-dev", crate::ops::build_version()))
 }
 
 /// A span exporter and a log exporter that go together.
