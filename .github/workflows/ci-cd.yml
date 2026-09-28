@@ -235,9 +235,35 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Settings from this environment's variables
+        id: settings
+        # Non-secret settings only; deploy-gate accepts just these keys and
+        # checks each value. Unset or empty variables are left out, so with
+        # none set the command is what an older gate expects.
+        env:
+          OPEN_SANDBOX_URL: ${{ vars.OPEN_SANDBOX_URL }}
+          ATHENA_SANDBOX_IMAGE: ${{ vars.ATHENA_SANDBOX_IMAGE }}
+          ATHENA_SANDBOX_TIMEOUT_SECS: ${{ vars.ATHENA_SANDBOX_TIMEOUT_SECS }}
+          AGENT_MODEL: ${{ vars.AGENT_MODEL }}
+        run: |
+          set -euo pipefail
+          words=""
+          for key in OPEN_SANDBOX_URL ATHENA_SANDBOX_IMAGE ATHENA_SANDBOX_TIMEOUT_SECS AGENT_MODEL; do
+            value="${!key}"
+            if [ -z "$value" ]; then continue; fi
+            # The gate checks again; this keeps a newline from becoming a
+            # second command line.
+            if [[ ! "$value" =~ ^[A-Za-z0-9._:/@+-]{1,200}$ ]]; then
+              echo "::error::vars.$key holds characters deploy-gate refuses"
+              exit 1
+            fi
+            words="$words $key=$value"
+          done
+          echo "words=$words" >>"$GITHUB_OUTPUT"
+          echo "Settings sent with the deploy:${words:- none}" >>"$GITHUB_STEP_SUMMARY"
       - uses: ./.github/actions/gate
         with:
-          commands: deploy staging ${{ needs.build.outputs.digest }}
+          commands: deploy staging ${{ needs.build.outputs.digest }}${{ steps.settings.outputs.words }}
           host: ${{ vars.VM_HOST }}
           known-hosts: ${{ vars.VM_KNOWN_HOSTS }}
           ssh-key: ${{ secrets.DEPLOY_SSH_KEY }}
@@ -392,11 +418,37 @@ jobs:
           [[ "$GITHUB_REF_NAME" =~ ^v[A-Za-z0-9._-]{1,127}$ ]] || { echo "::error::'$GITHUB_REF_NAME' is not a valid OCI tag"; exit 1; }
           printf '%s' "$GH_TOKEN" | oras login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           oras tag "$REPO@$DIGEST" "$GITHUB_REF_NAME"
+      - name: Settings from this environment's variables
+        id: settings
+        # Non-secret settings only; deploy-gate accepts just these keys and
+        # checks each value. Unset or empty variables are left out, so with
+        # none set the command is what an older gate expects.
+        env:
+          OPEN_SANDBOX_URL: ${{ vars.OPEN_SANDBOX_URL }}
+          ATHENA_SANDBOX_IMAGE: ${{ vars.ATHENA_SANDBOX_IMAGE }}
+          ATHENA_SANDBOX_TIMEOUT_SECS: ${{ vars.ATHENA_SANDBOX_TIMEOUT_SECS }}
+          AGENT_MODEL: ${{ vars.AGENT_MODEL }}
+        run: |
+          set -euo pipefail
+          words=""
+          for key in OPEN_SANDBOX_URL ATHENA_SANDBOX_IMAGE ATHENA_SANDBOX_TIMEOUT_SECS AGENT_MODEL; do
+            value="${!key}"
+            if [ -z "$value" ]; then continue; fi
+            # The gate checks again; this keeps a newline from becoming a
+            # second command line.
+            if [[ ! "$value" =~ ^[A-Za-z0-9._:/@+-]{1,200}$ ]]; then
+              echo "::error::vars.$key holds characters deploy-gate refuses"
+              exit 1
+            fi
+            words="$words $key=$value"
+          done
+          echo "words=$words" >>"$GITHUB_OUTPUT"
+          echo "Settings sent with the deploy:${words:- none}" >>"$GITHUB_STEP_SUMMARY"
       - name: Promote to prod, then smoke-prod
         uses: ./.github/actions/gate
         with:
           commands: |
-            promote prod ${{ needs.require-stage-success.outputs.digest }}
+            promote prod ${{ needs.require-stage-success.outputs.digest }}${{ steps.settings.outputs.words }}
             smoke prod
           host: ${{ vars.VM_HOST }}
           known-hosts: ${{ vars.VM_KNOWN_HOSTS }}

@@ -276,7 +276,7 @@ mod tests {
 
     fn deployed() -> Vm {
         let vm = Vm::new();
-        vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
         vm.fake.clear();
         vm
     }

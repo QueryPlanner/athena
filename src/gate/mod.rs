@@ -20,6 +20,7 @@ mod envfile;
 mod http;
 mod layout;
 mod ops;
+mod settings;
 mod sys;
 #[cfg(test)]
 mod testing;
@@ -151,8 +152,8 @@ impl<'a> Gate<'a> {
 
     pub fn execute(&self, command: &Command) -> Result<Value> {
         match command {
-            Command::Deploy { digest } => self.deploy(Env::Staging, digest),
-            Command::Promote { digest } => self.deploy(Env::Prod, digest),
+            Command::Deploy { digest, settings } => self.deploy(Env::Staging, digest, settings),
+            Command::Promote { digest, settings } => self.deploy(Env::Prod, digest, settings),
             Command::Smoke(env) => self.smoke(*env),
             Command::Bench => self.bench(),
             Command::Eval => self.eval(),

@@ -99,6 +99,9 @@ pub struct Fake {
     pub version_output: RefCell<String>,
     /// `athena serve` running as one of these versions is never healthy.
     pub unhealthy_versions: RefCell<Vec<String>>,
+    /// Created as a directory at the first HTTP request, to make a later
+    /// write of the file next to it fail.
+    pub dir_on_http: RefCell<Option<PathBuf>>,
     backup_saw: RefCell<Option<PathBuf>>,
     run_rules: RefCell<Vec<Rule<Option<Output>>>>,
     http_rules: RefCell<Vec<Rule<Option<Response>>>>,
@@ -119,6 +122,7 @@ impl Fake {
             manifest: RefCell::default(),
             version_output: RefCell::new("athena 0.1.0-dev".into()),
             unhealthy_versions: RefCell::default(),
+            dir_on_http: RefCell::default(),
             backup_saw: RefCell::default(),
             run_rules: RefCell::default(),
             http_rules: RefCell::default(),
@@ -316,6 +320,9 @@ impl System for Fake {
         let line = format!("{} {}", request.method, request.path);
         self.events.borrow_mut().push(format!("http {line}"));
         self.requests.borrow_mut().push(request.clone());
+        if let Some(dir) = self.dir_on_http.borrow_mut().take() {
+            fs::create_dir(dir)?;
+        }
         if let Some(reply) = apply(&self.http_rules, &line) {
             return reply
                 .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionRefused, "refused"));
@@ -415,7 +422,8 @@ impl Vm {
 
     pub fn set_env_var(&self, env: Env, key: &str, value: &str) {
         let path = self.root().join(format!("etc/athena/{env}.env"));
-        envfile::set_var(&path, key, value).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        envfile::replace(&path, &envfile::with_var(&text, key, value)).unwrap();
     }
 
     pub fn create_db(&self, env: Env) {
