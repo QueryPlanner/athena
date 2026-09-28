@@ -236,14 +236,37 @@ impl Fake {
         self.backup_saw.borrow().clone()
     }
 
+    /// The env file of whichever agent and env listens on the request's
+    /// port: Athena's, or one under `etc/athena/agents/`.
+    fn served_env_file(&self, request: &Request) -> PathBuf {
+        let etc = self.root.join("etc/athena");
+        let mut files: Vec<PathBuf> = Env::ALL
+            .iter()
+            .map(|env| etc.join(format!("{env}.env")))
+            .collect();
+        if let Ok(agents) = fs::read_dir(etc.join("agents")) {
+            for agent in agents.flatten() {
+                files.extend(
+                    Env::ALL
+                        .iter()
+                        .map(|env| agent.path().join(format!("{env}.env"))),
+                );
+            }
+        }
+        let port = format!(":{}", request.addr.port());
+        files
+            .into_iter()
+            .find(|file| {
+                envfile::read(file)
+                    .ok()
+                    .and_then(|vars| envfile::get(&vars, "ATHENA_ADDR").map(|a| a.ends_with(&port)))
+                    .unwrap_or(false)
+            })
+            .unwrap_or_else(|| panic!("nothing listens on {port}"))
+    }
+
     fn served_version(&self, request: &Request) -> String {
-        let env = if request.addr.port() == 18080 {
-            Env::Prod
-        } else {
-            Env::Staging
-        };
-        let file = self.root.join(format!("etc/athena/{env}.env"));
-        let vars = envfile::read(&file).unwrap();
+        let vars = envfile::read(&self.served_env_file(request)).unwrap();
         envfile::get(&vars, "ATHENA_VERSION")
             .unwrap_or("unset")
             .to_string()
@@ -276,15 +299,11 @@ impl Fake {
             }
             ["--version"] => ok(format!("{}\n", self.version_output.borrow())),
             ["backup", dest] => {
-                let env = cmd
-                    .cwd
-                    .as_ref()
-                    .unwrap()
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned();
-                let link = self.root.join(format!("opt/athena/{env}/current"));
+                // The backup runs in `var/lib/athena[/agents/<a>]/<env>`,
+                // and `current` is at `opt/athena[/agents/<a>]/<env>/current`.
+                let cwd = cmd.cwd.as_ref().unwrap();
+                let data = cwd.strip_prefix(self.root.join("var/lib/athena")).unwrap();
+                let link = self.root.join("opt/athena").join(data).join("current");
                 self.backup_saw.replace(fs::read_link(link).ok());
                 fs::create_dir_all(Path::new(dest).parent().unwrap()).unwrap();
                 fs::write(dest, "backup").unwrap();
@@ -420,6 +439,35 @@ impl Vm {
 
     pub fn create_db(&self, env: Env) {
         self.write(&format!("var/lib/athena/{env}/agent.db"), "db");
+    }
+
+    /// Register agent `name` the way setup-host does: its `agent.env`, both
+    /// env files and both data directories.
+    pub fn add_agent(&self, name: &str, staging: u16, prod: u16) {
+        self.write(
+            &format!("etc/athena/agents/{name}/agent.env"),
+            &format!("ATHENA_REPO=ghcr.io/me/{name}\nPORT_STAGING={staging}\nPORT_PROD={prod}\n"),
+        );
+        for (env, port) in [(Env::Staging, staging), (Env::Prod, prod)] {
+            self.write(
+                &format!("etc/athena/agents/{name}/{env}.env"),
+                &format!("ATHENA_ADDR=127.0.0.1:{port}\nATHENA_ENV={env}\n"),
+            );
+            fs::create_dir_all(
+                self.root()
+                    .join(format!("var/lib/athena/agents/{name}/{env}")),
+            )
+            .unwrap();
+        }
+    }
+
+    /// Where agent `name` (not Athena) keeps `relative`.
+    pub fn agent_path(&self, top: &str, name: &str, relative: &str) -> PathBuf {
+        self.root()
+            .join(top)
+            .join("agents")
+            .join(name)
+            .join(relative)
     }
 
     /// The release name `current` points at.

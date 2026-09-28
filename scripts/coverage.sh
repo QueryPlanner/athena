@@ -11,7 +11,7 @@
 set -euo pipefail
 
 lcov="${1:-target/lcov.info}"
-cargo llvm-cov --all-targets --locked --lcov --output-path "$lcov"
+cargo llvm-cov --workspace --all-targets --locked --lcov --output-path "$lcov"
 
 missed=$(awk -F'[:,]' '/^SF:/ {file=$2} /^DA:/ && $3 == 0 {print file ":" $2}' "$lcov" | sort -u)
 total=$(grep -c '^DA:' "$lcov")

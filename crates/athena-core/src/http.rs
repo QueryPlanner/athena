@@ -422,8 +422,10 @@ async fn traced(request: axum::extract::Request, next: axum::middleware::Next) -
 
 // ---- handlers ----
 
-async fn health() -> Json<Value> {
-    Json(json!({"status": "ok"}))
+/// Also says which agent answers, so deploy-gate can tell when a port
+/// serves another agent than the one it deployed.
+async fn health(State(app): State<App>) -> Json<Value> {
+    Json(json!({"status": "ok", "agent": app.agent.name()}))
 }
 
 async fn version() -> Json<Value> {

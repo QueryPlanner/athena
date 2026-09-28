@@ -2,7 +2,8 @@
 //! `status`, and the admin-only `restore` and `install-gate`.
 
 use super::{
-    ATHENA_USER, Context, Digest, Env, Gate, Result, failed, remove_file_if_exists, sibling, time,
+    Agent, Context, Digest, Env, Gate, Layout, Result, envfile, failed, remove_file_if_exists,
+    sibling, time,
 };
 use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
@@ -224,8 +225,71 @@ impl Gate<'_> {
             "digest": digest.as_str(),
             "installed": target.display().to_string(),
             "version": version,
-            "user": ATHENA_USER,
+            "user": self.layout.user(),
         }))
+    }
+
+    /// Every agent on this VM: Athena if it is set up, then each agent with
+    /// an `agent.env`, by name. For each: its user, where each env listens
+    /// and what the gate last deployed there.
+    pub(super) fn list(&self) -> Result<Value> {
+        let mut agents = Vec::new();
+        let legacy = Layout::new(self.layout.root());
+        if Env::ALL.iter().any(|env| legacy.env_file(*env).is_file()) {
+            agents.push(Agent::legacy());
+        }
+        let dir = self.layout.agents_dir();
+        let mut names = match fs::read_dir(&dir) {
+            Ok(entries) => entries
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter_map(|name| Agent::parse(&name))
+                .filter(|agent| !agent.is_legacy())
+                .collect(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => vec![],
+            Err(e) => return Err(failed(format!("reading {}: {e}", dir.display()))),
+        };
+        names.sort_by(|a: &Agent, b: &Agent| a.as_str().cmp(b.as_str()));
+        for agent in names {
+            if Layout::for_agent(self.layout.root(), agent.clone())
+                .agent_env()
+                .is_file()
+            {
+                agents.push(agent);
+            }
+        }
+        let listed: Vec<Value> = agents
+            .into_iter()
+            .map(|agent| {
+                let gate = Gate {
+                    layout: Layout::for_agent(self.layout.root(), agent),
+                    sys: self.sys,
+                };
+                gate.describe()
+            })
+            .collect();
+        for agent in &listed {
+            self.say(agent.to_string());
+        }
+        Ok(json!({ "agents": listed }))
+    }
+
+    fn describe(&self) -> Value {
+        let mut envs = serde_json::Map::new();
+        for env in Env::ALL {
+            let vars = envfile::read(&self.layout.env_file(env)).unwrap_or_default();
+            envs.insert(
+                env.to_string(),
+                json!({
+                    "addr": envfile::get(&vars, "ATHENA_ADDR"),
+                    "state": self.read_state(env).ok(),
+                }),
+            );
+        }
+        json!({
+            "agent": self.layout.agent().as_str(),
+            "user": self.layout.user(),
+            "envs": envs,
+        })
     }
 }
 

@@ -1,25 +1,25 @@
-# Athena Telegram bot for one environment. setup-host.sh enables it only when
-# /etc/athena/%i.env has a TELEGRAM_BOT_TOKEN. Each env needs its own bot:
-# two processes polling one token conflict (HTTP 409).
+# Athena HTTP API for one environment. %i is `staging` or `prod`.
 # Installed by scripts/setup-host.sh; see plans/contracts.md ("systemd").
 [Unit]
-Description=Athena Telegram bot (%i)
+Description=@TITLE@ HTTP API (%i)
 Documentation=https://github.com/QueryPlanner/athena/blob/main/SETUP.md
+# ATHENA_ADDR is the tailnet IP, which exists only once tailscaled is up.
 Wants=network-online.target
-# serve runs the migrations; the bot opens the database after it.
-After=network-online.target tailscaled.service athena-serve@%i.service
-PartOf=athena@%i.target
+After=network-online.target tailscaled.service
+PartOf=@PREFIX@@%i.target
+# Binding fails until tailscale0 has its address; keep retrying.
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-User=athena
-Group=athena
-EnvironmentFile=/etc/athena/%i.env
-WorkingDirectory=/var/lib/athena/%i
-ExecStart=/opt/athena/%i/current/athena telegram
+User=@USER@
+Group=@USER@
+EnvironmentFile=@ETC@/%i.env
+WorkingDirectory=@VAR@/%i
+ExecStart=@OPT@/%i/current/athena serve
 Restart=on-failure
 RestartSec=5
+# SIGTERM drains the turns in flight before exiting.
 TimeoutStopSec=120
 
 # Hardening
@@ -27,7 +27,7 @@ MemoryMax=128M
 NoNewPrivileges=yes
 ProtectSystem=strict
 # agent.db, backups/ and telemetry/ (ATHENA_TELEMETRY_DIR) live here.
-ReadWritePaths=/var/lib/athena/%i
+ReadWritePaths=@VAR@/%i
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
@@ -43,4 +43,4 @@ SystemCallFilter=@system-service
 SystemCallArchitectures=native
 
 [Install]
-WantedBy=athena@%i.target
+WantedBy=@PREFIX@@%i.target

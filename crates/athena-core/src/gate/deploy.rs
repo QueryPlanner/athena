@@ -3,7 +3,7 @@
 
 use super::command::is_hex64;
 use super::{
-    ATHENA_USER, Cmd, Context, Digest, Env, Failure, Gate, Result, Settings, envfile, failed,
+    Cmd, Context, Digest, Env, Failure, Gate, Result, Settings, envfile, failed,
     remove_file_if_exists, time, write_atomic,
 };
 use serde_json::{Value, json};
@@ -148,12 +148,16 @@ impl Gate<'_> {
     }
 
     pub(super) fn gate_config(&self) -> Result<GateConfig> {
-        let path = self.layout.gate_env();
-        let vars = match fs::read_to_string(&path) {
-            Ok(text) => envfile::parse(&text),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
-            Err(e) => return Err(failed(format!("reading {}: {e}", path.display()))),
-        };
+        let mut vars = read_optional(&self.layout.gate_env())?;
+        // Any agent but Athena pulls from its own repository.
+        if !self.layout.agent().is_legacy() {
+            let path = self.layout.agent_env();
+            let agent = read_optional(&path)?;
+            let repo = envfile::get(&agent, "ATHENA_REPO")
+                .ok_or_else(|| failed(format!("{} needs ATHENA_REPO", path.display())))?;
+            vars.retain(|(k, _)| k != "ATHENA_REPO");
+            vars.push(("ATHENA_REPO".into(), repo.into()));
+        }
         GateConfig::from_vars(&vars)
     }
 
@@ -221,7 +225,7 @@ impl Gate<'_> {
     /// `<release>/<binary> --version`, run as the service user, must work.
     pub(super) fn check_binary(&self, release: &Path, binary: &str) -> Result<String> {
         let cmd = Cmd::new(release.join(binary), &["--version"])
-            .as_user(ATHENA_USER)
+            .as_user(&self.layout.user())
             .in_dir(self.layout.root());
         let out = self.exec_ok(&cmd)?;
         let line = out.stdout.trim().to_string();
@@ -289,10 +293,10 @@ impl Gate<'_> {
     fn switch(&self, env: Env, settings: &Settings, release: &Path, version: &str) -> Result<()> {
         self.point_current(env, release)?;
         envfile::set_var(&self.layout.env_file(env), "ATHENA_VERSION", version)?;
-        self.systemctl(&["start", &format!("athena-serve@{env}.service")])?;
+        self.systemctl(&["start", &self.layout.serve_unit(env)])?;
         self.wait_healthy(settings.addr, Some(version))?;
         if self.telegram_enabled(env)? {
-            self.systemctl(&["start", &format!("athena-telegram@{env}.service")])?;
+            self.systemctl(&["start", &self.layout.telegram_unit(env)])?;
         }
         Ok(())
     }
@@ -383,6 +387,15 @@ impl Gate<'_> {
 }
 
 /// ORAS reads its registry config from `$HOME`, which `Cmd` clears.
+/// An env file's variables, or none if it does not exist.
+fn read_optional(path: &Path) -> Result<envfile::Vars> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(envfile::parse(&text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+        Err(e) => Err(failed(format!("reading {}: {e}", path.display()))),
+    }
+}
+
 fn oras(config: &GateConfig, args: &[&str]) -> Cmd {
     Cmd::new(&config.oras, args).with_env(vec![("HOME".into(), "/root".into())])
 }

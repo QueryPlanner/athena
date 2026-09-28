@@ -25,8 +25,8 @@ mod sys;
 mod testing;
 mod time;
 
-pub use command::{Command, Digest, Env, Parsed, parse};
-pub use layout::Layout;
+pub use command::{AgentCommand, Command, Digest, Env, Parsed, parse};
+pub use layout::{Agent, Layout};
 pub use sys::{Cmd, Output, RealSystem, Request, Response, System};
 
 use serde_json::{Value, json};
@@ -38,9 +38,6 @@ use std::os::unix::fs::{OpenOptionsExt, chown};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// The system user the services run as. Binaries from a release are only
-/// ever executed as this user, never as root.
-pub const ATHENA_USER: &str = "athena";
 /// `deploy staging` refuses to start with less free space than this.
 pub const MIN_FREE_BYTES: u64 = 1 << 30;
 pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
@@ -91,7 +88,7 @@ pub fn main(args: &[String], ssh_command: Option<&str>, gate: &Gate, out: &mut d
             let _ = writeln!(out, "deploy-gate {}", env!("CARGO_PKG_VERSION"));
             return 0;
         }
-        Ok(Parsed::Run(command)) => command,
+        Ok(Parsed::Run(request)) => request,
         Err(reason) => {
             return finish(
                 gate,
@@ -102,7 +99,7 @@ pub fn main(args: &[String], ssh_command: Option<&str>, gate: &Gate, out: &mut d
             );
         }
     };
-    let name = command.name();
+    let name = command.command.name();
     match gate.execute(&command) {
         Ok(mut result) => {
             result["ok"] = json!(true);
@@ -149,7 +146,31 @@ impl<'a> Gate<'a> {
         }
     }
 
-    pub fn execute(&self, command: &Command) -> Result<Value> {
+    /// Run `request` for the agent it names. Every path, unit and user it
+    /// touches is that agent's.
+    pub fn execute(&self, request: &AgentCommand) -> Result<Value> {
+        let gate = Gate {
+            layout: Layout::for_agent(self.layout.root(), request.agent.clone()),
+            sys: self.sys,
+        };
+        gate.require_known()?;
+        gate.run(&request.command)
+    }
+
+    /// Athena always exists; any other agent only once setup-host has
+    /// written its `agent.env`, which only root can.
+    fn require_known(&self) -> Result<()> {
+        let agent = self.layout.agent();
+        if agent.is_legacy() || self.layout.agent_env().is_file() {
+            return Ok(());
+        }
+        Err(Failure::Rejected(format!(
+            "unknown agent {agent}: {} does not exist",
+            self.layout.agent_env().display()
+        )))
+    }
+
+    fn run(&self, command: &Command) -> Result<Value> {
         match command {
             Command::Deploy { digest } => self.deploy(Env::Staging, digest),
             Command::Promote { digest } => self.deploy(Env::Prod, digest),
@@ -159,6 +180,7 @@ impl<'a> Gate<'a> {
             Command::Status(env) => self.status(*env),
             Command::Restore { env, file } => self.restore(*env, file),
             Command::InstallGate { digest } => self.install_gate(digest),
+            Command::List => self.list(),
         }
     }
 
@@ -199,7 +221,7 @@ impl<'a> Gate<'a> {
     /// variables, in the env's data directory.
     fn athena_cmd(&self, env: Env, settings: &Settings, program: &Path, args: &[&str]) -> Cmd {
         Cmd::new(program, args)
-            .as_user(ATHENA_USER)
+            .as_user(&self.layout.user())
             .with_env(settings.vars.clone())
             .in_dir(self.layout.data(env))
     }
@@ -231,14 +253,17 @@ impl<'a> Gate<'a> {
     /// Held for the whole operation; the lock is released when the file
     /// closes, even if the process dies.
     fn lock(&self) -> Result<File> {
-        let path = self.layout.lock();
+        self.lock_at(&self.layout.lock())
+    }
+
+    fn lock_at(&self, path: &Path) -> Result<File> {
         let what = format!("locking {}", path.display());
-        fs::create_dir_all(self.layout.athena_data()).context(&what)?;
+        fs::create_dir_all(path.parent().unwrap_or(self.layout.root())).context(&what)?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(&path)
+            .open(path)
             .context(&what)?;
         // A child process that any thread spawns shares this open file
         // until its exec closes it, so a lock just released elsewhere can
@@ -282,7 +307,7 @@ impl<'a> Gate<'a> {
     }
 
     fn telegram_enabled(&self, env: Env) -> Result<bool> {
-        let unit = format!("athena-telegram@{env}.service");
+        let unit = self.layout.telegram_unit(env);
         let cmd = Cmd::new(sys::SYSTEMCTL, &["is-enabled", "--quiet", &unit]);
         Ok(self.exec(&cmd)?.success)
     }
@@ -290,17 +315,17 @@ impl<'a> Gate<'a> {
     /// Stop the target and both units by name: stopping a target alone
     /// leaves units it only `Wants=` running.
     fn stop_units(&self, env: Env) -> Result<()> {
-        let target = format!("athena@{env}.target");
-        let serve = format!("athena-serve@{env}.service");
-        let telegram = format!("athena-telegram@{env}.service");
+        let target = self.layout.target(env);
+        let serve = self.layout.serve_unit(env);
+        let telegram = self.layout.telegram_unit(env);
         self.systemctl(&["stop", &target, &serve, &telegram])
     }
 
     /// Start serve, then telegram if it is enabled for this env.
     fn start_units(&self, env: Env) -> Result<()> {
-        self.systemctl(&["start", &format!("athena-serve@{env}.service")])?;
+        self.systemctl(&["start", &self.layout.serve_unit(env)])?;
         if self.telegram_enabled(env)? {
-            self.systemctl(&["start", &format!("athena-telegram@{env}.service")])?;
+            self.systemctl(&["start", &self.layout.telegram_unit(env)])?;
         }
         Ok(())
     }
@@ -338,6 +363,16 @@ impl<'a> Gate<'a> {
         let health = self.get(addr, "/health")?;
         if health.status != 200 {
             return Err(format!("GET /health returned {}", health.status));
+        }
+        // Releases from before agents had names do not say; any that does
+        // must be this agent, not another one configured onto its port.
+        let agent = self.layout.agent().as_str();
+        if let Some(answered) = serde_json::from_str::<Value>(&health.body)
+            .ok()
+            .and_then(|b| b["agent"].as_str().map(str::to_string))
+            .filter(|answered| answered != agent)
+        {
+            return Err(format!("/health is agent {answered:?}, not {agent:?}"));
         }
         let version = self.get(addr, "/version")?;
         let reported = serde_json::from_str::<Value>(&version.body)
@@ -436,6 +471,181 @@ mod tests {
         assert_eq!(text.lines().count(), 1, "{text}");
         let value = serde_json::from_str(&text).unwrap_or(Value::String(text));
         (code, value)
+    }
+
+    fn notes(vm: &Vm, env: &str, line: &str) -> (i32, Value) {
+        run(vm, &["--agent", "notes", "--key-env", env], Some(line))
+    }
+
+    #[test]
+    fn an_agent_deploys_into_its_own_tree_as_its_own_user() {
+        let vm = Vm::new();
+        vm.add_agent("notes", 18082, 18083);
+        let (code, out) = notes(&vm, "staging", &format!("deploy staging sha256:{HEX_A}"));
+        assert_eq!((code, &out["ok"]), (0, &json!(true)), "{out}");
+
+        // Its own repository, release cache, current link, env file and state.
+        assert!(
+            vm.fake
+                .find_run(&format!("pull ghcr.io/me/notes@sha256:{HEX_A}"))
+                .is_some()
+        );
+        assert!(
+            vm.agent_path("opt/athena", "notes", &format!("releases/{HEX_A}/athena"))
+                .is_file()
+        );
+        let link = fs::read_link(vm.agent_path("opt/athena", "notes", "staging/current")).unwrap();
+        assert!(link.ends_with(HEX_A), "{}", link.display());
+        let vars = envfile::read(&vm.agent_path("etc/athena", "notes", "staging.env")).unwrap();
+        assert_eq!(envfile::get(&vars, "ATHENA_VERSION"), Some(REVISION));
+        let state = vm
+            .root()
+            .join("var/lib/athena/gate/notes/staging.state.json");
+        assert!(state.is_file());
+        // Its own units and user; nothing of Athena's.
+        assert_eq!(
+            vm.fake
+                .count("systemctl start athena-notes-serve@staging.service"),
+            1
+        );
+        assert_eq!(vm.fake.count("athena-serve@"), 0);
+        let version = vm.fake.find_run("athena --version").unwrap();
+        assert_eq!(version.user.as_deref(), Some("athena-notes"));
+        assert!(
+            vm.fake
+                .find_run("oras pull ghcr.io/queryplanner/athena")
+                .is_none()
+        );
+        let untouched = vm.current(Env::Staging).is_none();
+        assert!(untouched, "Athena's staging was touched");
+        assert!(!vm.root().join("var/lib/athena/.gate.lock").exists());
+    }
+
+    #[test]
+    fn an_agent_promotes_only_what_its_own_staging_runs() {
+        let vm = Vm::new();
+        vm.add_agent("notes", 18082, 18083);
+        // Athena's staging runs HEX_A; that is not notes' staging.
+        vm.write_state(Env::Staging, &format!("sha256:{HEX_A}"), REVISION);
+        let (code, out) = notes(&vm, "prod", &format!("promote prod sha256:{HEX_A}"));
+        assert_eq!(code, 2, "{out}");
+        assert!(
+            out["rejected"]
+                .as_str()
+                .unwrap()
+                .contains("deploy to staging first")
+        );
+
+        notes(&vm, "staging", &format!("deploy staging sha256:{HEX_A}"));
+        let (code, out) = notes(&vm, "prod", &format!("promote prod sha256:{HEX_A}"));
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(
+            vm.fake
+                .count("systemctl start athena-notes-serve@prod.service"),
+            1
+        );
+    }
+
+    #[test]
+    fn an_unknown_agent_is_refused_before_anything_happens() {
+        let vm = Vm::new();
+        let (code, out) = notes(&vm, "staging", "status staging");
+        assert_eq!(code, 2);
+        assert_has(
+            out["rejected"].as_str().unwrap(),
+            &["unknown agent notes", "agent.env"],
+        );
+        assert_eq!(vm.fake.effects(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_agent_without_a_repository_cannot_deploy() {
+        let vm = Vm::new();
+        vm.add_agent("notes", 18082, 18083);
+        vm.write("etc/athena/agents/notes/agent.env", "PORT_STAGING=18082\n");
+        let (code, out) = notes(&vm, "staging", &format!("deploy staging sha256:{HEX_A}"));
+        assert_eq!(code, 1);
+        assert_has(out["error"].as_str().unwrap(), &["needs ATHENA_REPO"]);
+    }
+
+    #[test]
+    fn a_port_answered_by_another_agent_is_not_healthy() {
+        let vm = Vm::new();
+        vm.add_agent("notes", 18082, 18083);
+        vm.fake.http_rule(
+            "GET /health",
+            Some(response(200, r#"{"status":"ok","agent":"athena"}"#)),
+            usize::MAX,
+        );
+        let (code, out) = notes(&vm, "staging", &format!("deploy staging sha256:{HEX_A}"));
+        assert_eq!(code, 1);
+        assert_has(
+            out["error"].as_str().unwrap(),
+            &["/health is agent \"athena\", not \"notes\""],
+        );
+    }
+
+    #[test]
+    fn a_port_answered_by_its_own_agent_is_healthy() {
+        let vm = Vm::new();
+        vm.add_agent("notes", 18082, 18083);
+        vm.fake.http_rule(
+            "GET /health",
+            Some(response(200, r#"{"status":"ok","agent":"notes"}"#)),
+            usize::MAX,
+        );
+        let (code, out) = notes(&vm, "staging", &format!("deploy staging sha256:{HEX_A}"));
+        assert_eq!(code, 0, "{out}");
+    }
+
+    #[test]
+    fn list_shows_every_agent_with_its_ports_and_state() {
+        let vm = Vm::new();
+        vm.add_agent("notes", 18082, 18083);
+        vm.add_agent("chat", 18084, 18085);
+        // Not an agent: no agent.env, a bad name, and Athena's own entry.
+        fs::create_dir_all(vm.root().join("etc/athena/agents/half")).unwrap();
+        fs::create_dir_all(vm.root().join("etc/athena/agents/Bad-Name")).unwrap();
+        vm.write("etc/athena/agents/athena/agent.env", "");
+        vm.write_state(Env::Prod, &format!("sha256:{HEX_A}"), "v1");
+        let (code, out) = run(&vm, &["list"], None);
+        assert_eq!(code, 0, "{out}");
+        let names: Vec<&str> = out["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["agent"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["athena", "chat", "notes"]);
+        let athena = &out["agents"][0];
+        assert_eq!(athena["user"], "athena");
+        assert_eq!(athena["envs"]["prod"]["addr"], "127.0.0.1:18080");
+        assert_eq!(athena["envs"]["prod"]["state"]["version"], "v1");
+        assert_eq!(athena["envs"]["staging"]["state"], Value::Null);
+        assert_eq!(
+            out["agents"][2]["envs"]["staging"]["addr"],
+            "127.0.0.1:18082"
+        );
+        assert_eq!(out["agents"][2]["user"], "athena-notes");
+    }
+
+    #[test]
+    fn list_works_before_anything_is_set_up() {
+        let vm = Vm::new();
+        for env in Env::ALL {
+            fs::remove_file(vm.root().join(format!("etc/athena/{env}.env"))).unwrap();
+        }
+        let (code, out) = run(&vm, &["list"], None);
+        assert_eq!((code, &out["agents"]), (0, &json!([])));
+    }
+
+    #[test]
+    fn list_fails_when_the_agents_directory_cannot_be_read() {
+        let vm = Vm::new();
+        vm.write("etc/athena/agents", "not a directory");
+        let (code, out) = run(&vm, &["list"], None);
+        assert_eq!(code, 1);
+        assert!(out["error"].as_str().unwrap().contains("reading"), "{out}");
     }
 
     #[test]

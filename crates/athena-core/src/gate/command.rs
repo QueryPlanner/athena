@@ -5,6 +5,7 @@
 //! split on whitespace (there is no shell) and must match one whitelisted
 //! command for the key that sent it, word for word.
 
+use super::layout::Agent;
 use std::fmt;
 
 /// A deployment environment. Each SSH key is bound to one.
@@ -68,14 +69,25 @@ pub fn is_hex64(s: &str) -> bool {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
-    Deploy { digest: Digest },
-    Promote { digest: Digest },
+    Deploy {
+        digest: Digest,
+    },
+    Promote {
+        digest: Digest,
+    },
     Smoke(Env),
     Bench,
     Eval,
     Status(Env),
-    Restore { env: Env, file: String },
-    InstallGate { digest: Digest },
+    Restore {
+        env: Env,
+        file: String,
+    },
+    InstallGate {
+        digest: Digest,
+    },
+    /// Every agent on this VM, with its ports and deployed state.
+    List,
 }
 
 impl Command {
@@ -89,22 +101,36 @@ impl Command {
             Command::Status(_) => "status",
             Command::Restore { .. } => "restore",
             Command::InstallGate { .. } => "install-gate",
+            Command::List => "list",
         }
     }
+
+    /// Whether this command is about the whole VM rather than one agent.
+    fn global(&self) -> bool {
+        matches!(self, Command::InstallGate { .. } | Command::List)
+    }
+}
+
+/// A command for one agent: the one its key or `--agent` names, else
+/// Athena.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AgentCommand {
+    pub agent: Agent,
+    pub command: Command,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Parsed {
     Version,
-    Run(Command),
+    Run(AgentCommand),
 }
 
 /// Longer than any allowed command; anything past it is refused unread.
 pub const MAX_COMMAND_LEN: usize = 256;
 
-const USAGE: &str = "usage: deploy-gate --key-env <staging|prod> (command in SSH_ORIGINAL_COMMAND), \
-                     deploy-gate restore <staging|prod> <backup-file>, \
-                     deploy-gate install-gate <digest>, or deploy-gate --version";
+const USAGE: &str = "usage: deploy-gate [--agent NAME] --key-env <staging|prod> (command in SSH_ORIGINAL_COMMAND), \
+                     deploy-gate [--agent NAME] restore <staging|prod> <backup-file>, \
+                     deploy-gate install-gate <digest>, deploy-gate list, or deploy-gate --version";
 
 /// Parse the process arguments and, for a key, `SSH_ORIGINAL_COMMAND`.
 ///
@@ -112,8 +138,17 @@ const USAGE: &str = "usage: deploy-gate --key-env <staging|prod> (command in SSH
 /// done when this returns.
 pub fn parse(args: &[String], ssh_command: Option<&str>) -> Result<Parsed, String> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    match args.as_slice() {
-        ["--version"] => Ok(Parsed::Version),
+    let (agent, rest) = match args.as_slice() {
+        ["--version"] => return Ok(Parsed::Version),
+        ["--agent", name, rest @ ..] => {
+            let agent =
+                Agent::parse(name).ok_or_else(|| format!("{name:?} is not an agent name"))?;
+            (Some(agent), rest)
+        }
+        ["--agent"] => return Err("--agent takes a name".into()),
+        rest => (None, rest),
+    };
+    let command = match rest {
         ["--key-env", key] => {
             let key = Env::parse(key).ok_or_else(|| format!("unknown key env {key:?}"))?;
             let line =
@@ -122,11 +157,26 @@ pub fn parse(args: &[String], ssh_command: Option<&str>) -> Result<Parsed, Strin
                 return Err(format!("command longer than {MAX_COMMAND_LEN} bytes"));
             }
             let words: Vec<&str> = line.split_whitespace().collect();
-            keyed(key, &words).map(Parsed::Run)
+            keyed(key, &words)?
         }
-        ["--key-env", ..] => Err("--key-env takes exactly one value and nothing else".into()),
-        words => admin(words).map(Parsed::Run),
-    }
+        ["--key-env", ..] => {
+            return Err("--key-env takes exactly one value and nothing else".into());
+        }
+        words => {
+            let command = admin(words)?;
+            if command.global() && agent.is_some() {
+                return Err(format!(
+                    "{} is for the whole VM; drop --agent",
+                    command.name()
+                ));
+            }
+            command
+        }
+    };
+    Ok(Parsed::Run(AgentCommand {
+        agent: agent.unwrap_or_else(Agent::legacy),
+        command,
+    }))
 }
 
 /// The commands a CI key may run. The key fixes the environment.
@@ -163,6 +213,7 @@ fn admin(words: &[&str]) -> Result<Command, String> {
         ["install-gate", digest] => Ok(Command::InstallGate {
             digest: parse_digest(digest)?,
         }),
+        ["list"] => Ok(Command::List),
         _ => Err(USAGE.into()),
     }
 }
@@ -207,7 +258,76 @@ mod tests {
     }
 
     fn run(command: Command) -> Result<Parsed, String> {
-        Ok(Parsed::Run(command))
+        Ok(Parsed::Run(AgentCommand {
+            agent: Agent::legacy(),
+            command,
+        }))
+    }
+
+    fn for_agent(agent: &str, command: Command) -> Result<Parsed, String> {
+        Ok(Parsed::Run(AgentCommand {
+            agent: Agent::parse(agent).unwrap(),
+            command,
+        }))
+    }
+
+    fn agent_key(agent: &str, env: &str, line: &str) -> Result<Parsed, String> {
+        let args: Vec<String> = ["--agent", agent, "--key-env", env]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        parse(&args, Some(line))
+    }
+
+    #[test]
+    fn a_key_without_an_agent_is_athenas() {
+        assert_eq!(
+            key("staging", "status staging"),
+            for_agent("athena", Command::Status(Env::Staging))
+        );
+    }
+
+    #[test]
+    fn an_agent_key_runs_the_same_whitelist_for_that_agent() {
+        assert_eq!(
+            agent_key("notes", "prod", "smoke prod"),
+            for_agent("notes", Command::Smoke(Env::Prod))
+        );
+        let err = agent_key("notes", "staging", "smoke prod").unwrap_err();
+        assert!(err.contains("not allowed for the staging key"), "{err}");
+        for bad in ["../x", "Notes", "a-b", ""] {
+            let err = agent_key(bad, "staging", "status staging").unwrap_err();
+            assert!(err.contains("is not an agent name"), "{bad}: {err}");
+        }
+        let err = admin_args(&["--agent"]).unwrap_err();
+        assert!(err.contains("--agent takes a name"), "{err}");
+    }
+
+    #[test]
+    fn admin_commands_name_an_agent_unless_they_are_for_the_vm() {
+        assert_eq!(
+            admin_args(&["--agent", "notes", "restore", "prod", "a.db"]),
+            for_agent(
+                "notes",
+                Command::Restore {
+                    env: Env::Prod,
+                    file: "a.db".into()
+                }
+            )
+        );
+        assert_eq!(admin_args(&["list"]), run(Command::List));
+        for args in [
+            vec!["--agent", "notes", "list"],
+            vec!["--agent", "notes", "install-gate", &digest()],
+        ] {
+            let err = admin_args(&args).unwrap_err();
+            assert!(err.contains("is for the whole VM"), "{args:?}: {err}");
+        }
+        assert!(
+            admin_args(&["--agent", "notes", "--version"])
+                .unwrap_err()
+                .starts_with("usage:")
+        );
     }
 
     #[test]
@@ -421,6 +541,7 @@ mod tests {
                 file: "a.db".into(),
             },
             Command::InstallGate { digest: d },
+            Command::List,
         ]
         .iter()
         .map(Command::name)
@@ -435,7 +556,8 @@ mod tests {
                 "eval",
                 "status",
                 "restore",
-                "install-gate"
+                "install-gate",
+                "list"
             ]
         );
         assert_eq!(format!("{} {}", Env::Staging, Env::Prod), "staging prod");

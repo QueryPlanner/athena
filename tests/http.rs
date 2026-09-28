@@ -149,7 +149,10 @@ async fn the_health_check_needs_no_user() {
 
     let (status, body) = call(&api(&service, agent), request("GET", "/health", None, None)).await;
 
-    assert_eq!((status, body), (StatusCode::OK, json!({"status": "ok"})));
+    assert_eq!(
+        (status, body),
+        (StatusCode::OK, json!({"status": "ok", "agent": "athena"}))
+    );
     assert_eq!(
         count(
             &tmp.raw(),
@@ -782,7 +785,10 @@ async fn the_server_answers_over_tcp_and_finishes_turns_in_flight_before_it_stop
 
     let health = read_all(send_raw(addr, "GET", "/health", "alice", "").await).await;
     assert!(health.starts_with("HTTP/1.1 200 OK"), "{health}");
-    assert!(health.ends_with(r#"{"status":"ok"}"#), "{health}");
+    assert!(
+        health.ends_with(r#"{"agent":"athena","status":"ok"}"#),
+        "{health}"
+    );
 
     let client = send_raw(
         addr,
