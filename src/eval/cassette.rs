@@ -76,9 +76,14 @@ pub fn input(request: &CompletionRequest) -> Vec<String> {
     }
 }
 
+/// How an image appears in a case's input: its bytes change every run
+/// (a screenshot of a live page), so a cassette cannot match on them.
+const IMAGE: &str = "[image]";
+
 fn user_part(part: &UserContent) -> String {
     match part {
         UserContent::Text(text) => format!("user: {}", text.text),
+        UserContent::Image(_) => format!("user: {IMAGE}"),
         UserContent::ToolResult(result) => {
             let content: Vec<String> = result.content.iter().map(tool_result_part).collect();
             format!("tool {}: {}", result.name, content.join("\n"))
@@ -91,7 +96,7 @@ fn tool_result_part(part: &ToolResultContent) -> String {
     match part {
         ToolResultContent::Text(text) => text.text.clone(),
         ToolResultContent::Json { value } => value.to_string(),
-        other => json(other),
+        ToolResultContent::Image(_) => IMAGE.into(),
     }
 }
 
@@ -313,15 +318,15 @@ mod tests {
                     ToolResultContent::Image(image()),
                 ]),
                 UserContent::Image(image()),
+                UserContent::document("pdf text", None),
             ],
         }];
         let parts = input(&request(history, &[]));
         assert_eq!(parts[0], "tool add: 42");
-        let json_then_image = "tool add: {\"n\":1}\n{";
-        assert!(parts[1].starts_with(json_then_image), "{}", parts[1]);
-        assert!(parts[1].contains("\"u\""), "{}", parts[1]);
+        assert_eq!(parts[1], "tool add: {\"n\":1}\n[image]");
         assert!(!parts.join("").contains("call_9"));
-        assert!(parts[2].contains("\"u\""), "{}", parts[2]);
+        assert_eq!(parts[2], "user: [image]");
+        assert!(parts[3].contains("pdf text"), "{}", parts[3]);
 
         let assistant = input(&request(vec![Message::assistant("x")], &[]));
         assert!(assistant[0].contains("\"x\""), "{assistant:?}");

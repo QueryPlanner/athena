@@ -5,14 +5,24 @@
 mod common;
 #[path = "telegram/fake_api.rs"]
 mod fake_api;
+// Only some of the fake sandbox is needed here.
+#[allow(dead_code)]
+#[path = "sandbox/fake_server.rs"]
+mod fake_server;
 
-use athena::runner::Run;
+use athena::agent;
+use athena::media;
+use athena::runner::{Request, Run};
+use athena::sandbox::Sandboxes;
 use athena::service::Service;
 use athena::telegram::{self, Log, Telegram};
 use common::*;
-use fake_api::{FakeApi, text_from};
+use fake_api::{FakeApi, media_from, photo_sizes, text_from};
+use fake_server::{FakeSandbox, SCREENSHOT};
+use rig_agent::agent::AgentBuilder;
 use rig_agent::agent::{Agent, PromptResponse};
 use rig_agent::completion::PromptError;
+use rig_core::test_utils::MockCompletionModel;
 use rig_core::test_utils::MockTurn;
 use serde_json::json;
 use std::process::{Child, Command, Stdio};
@@ -217,8 +227,12 @@ struct Parked {
 }
 
 impl Run for Parked {
-    async fn run(&self, prompt: &str, conversation: &str) -> Result<PromptResponse, PromptError> {
-        self.started.send(prompt.to_string()).unwrap();
+    async fn run(
+        &self,
+        prompt: &Request,
+        conversation: &str,
+    ) -> Result<PromptResponse, PromptError> {
+        self.started.send(prompt.text.clone()).unwrap();
         self.gate.acquire().await.unwrap().forget();
         self.inner.run(prompt, conversation).await
     }
@@ -555,4 +569,278 @@ fn the_binary_refuses_to_run_the_bot_without_an_absolute_database_path() {
     assert!(!out.status.success());
     assert!(stderr.contains("must be an absolute path"), "{stderr}");
     assert!(!dir.path().join("agent.db").exists());
+}
+
+// ---- photos and files ----
+
+/// The bot with the sandbox tools on `sandbox`, in front of a mock model
+/// scripted with `turns`, putting users' files in the same sandboxes.
+fn sandboxed(
+    tmp: &TempDb,
+    sandbox: &FakeSandbox,
+    turns: Vec<MockTurn>,
+) -> (Arc<Telegram<Agent>>, Logged, MockCompletionModel) {
+    let store = tmp.open();
+    let service = Service::new(store.clone(), "m", |_| {});
+    let sandboxes = Arc::new(Sandboxes::new(
+        fake_server::config(&sandbox.url),
+        store.clone(),
+    ));
+    let model = MockCompletionModel::new(turns);
+    let builder = AgentBuilder::new(media::Vision(model.clone())).memory(service.memory());
+    let agent = agent::configure_with(builder, Some(sandboxes.clone()));
+    let logged = Logged::default();
+    let sink = logged.clone();
+    let log: Log = Arc::new(move |m| sink.lock().unwrap().push(m.to_string()));
+    let app = Telegram::new(Arc::new(service), store, agent, log).sandboxes(Some(sandboxes));
+    (Arc::new(app), logged, model)
+}
+
+/// The user's message as the model got it in its `n`th request, as JSON.
+fn prompt(model: &MockCompletionModel, n: usize) -> serde_json::Value {
+    let request = &model.requests()[n];
+    serde_json::to_value(request.chat_history.last().unwrap()).unwrap()
+}
+
+/// The path a prompt's file note says the file is at.
+fn staged_path(note: &str) -> String {
+    let (_, rest) = note.split_once("in your sandbox at ").unwrap();
+    rest.split(". ").next().unwrap().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_photo_reaches_the_sandbox_and_the_model_and_the_models_files_come_back() {
+    const PHOTO: &[u8] = b"\xff\xd8\xff\xe0 a small jpeg";
+    let tmp = TempDb::new();
+    let api = FakeApi::start().await;
+    let sandbox = FakeSandbox::start().await;
+    sandbox.put_file("/w/chart.png", SCREENSHOT);
+    sandbox.put_file("/w/data.csv", b"a,b\n");
+    api.host_file("big", "photos/file_7.jpg", PHOTO);
+    let (app, logged, model) = sandboxed(
+        &tmp,
+        &sandbox,
+        vec![
+            MockTurn::tool_call(
+                "c1",
+                "send_photo",
+                json!({"path": "/w/chart.png", "caption": "your chart"}),
+            ),
+            MockTurn::tool_call("c2", "send_file", json!({"path": "/w/data.csv"})),
+            MockTurn::text("done"),
+        ],
+    );
+    let running = run(&api, app).await;
+
+    let sizes = photo_sizes("big", PHOTO.len() as u64);
+    api.push(media_from(11, ("photo", sizes), Some("chart this")));
+    api.wait_for("the file", |calls| {
+        calls.iter().any(|c| c.method == "sendDocument")
+    })
+    .await;
+    running.stop().await.unwrap();
+
+    // The largest size was fetched, saved in the sandbox and shown.
+    assert_eq!(api.calls_to("getFile")[0].body["file_id"], "big");
+    let prompt = prompt(&model, 0);
+    let note = prompt["content"][0]["text"].as_str().unwrap();
+    let attached = format!(
+        "chart this\n\n[The user attached `photo.jpg` (image/jpeg, {} bytes).",
+        PHOTO.len()
+    );
+    assert!(note.starts_with(&attached), "{note}");
+    assert!(note.ends_with("It is shown to you below.]"), "{note}");
+    let path = staged_path(note);
+    assert!(
+        path.starts_with("/tmp/athena-inbox/") && path.ends_with("-photo.jpg"),
+        "{path}"
+    );
+    assert_eq!(sandbox.file(&path).unwrap(), PHOTO);
+    assert_eq!(prompt["content"][1]["data"]["value"], media::base64(PHOTO));
+
+    // The reply, then the files, as uploads with their names.
+    let order: Vec<String> = api
+        .calls()
+        .into_iter()
+        .map(|c| c.method)
+        .filter(|m| m.starts_with("send") && m != "sendChatAction")
+        .collect();
+    assert_eq!(order, ["sendMessage", "sendPhoto", "sendDocument"]);
+    let photo = &api.calls_to("sendPhoto")[0];
+    assert_eq!(photo.chat_id(), 11);
+    assert_eq!(photo.body["caption"], "your chart");
+    assert_eq!(photo.body["photo"]["file_name"], "chart.png");
+    assert_eq!(photo.body["photo"]["bytes"], json!(SCREENSHOT));
+    let document = &api.calls_to("sendDocument")[0];
+    assert_eq!(document.body["document"]["file_name"], "data.csv");
+    assert_eq!(document.body["document"]["bytes"], json!(b"a,b\n"));
+    assert!(
+        document.body.get("caption").is_none(),
+        "{:?}",
+        document.body
+    );
+    assert!(
+        logged.lock().unwrap().is_empty(),
+        "{:?}",
+        logged.lock().unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn files_that_cannot_be_fetched_or_saved_are_described_to_the_model() {
+    let tmp = TempDb::new();
+    let api = FakeApi::start().await;
+    let sandbox = FakeSandbox::start().await;
+    api.host_file("doc", "documents/file_1.pdf", b"%PDF");
+    // Reported as small, but longer than a bot may download.
+    let oversized = vec![b'x'; telegram::DOWNLOAD_LIMIT + 1];
+    api.host_file("liar", "documents/file_2.bin", &oversized);
+    let (app, logged, model) = sandboxed(
+        &tmp,
+        &sandbox,
+        vec![
+            MockTurn::text("a"),
+            MockTurn::text("b"),
+            MockTurn::text("c"),
+        ],
+    );
+    let running = run(&api, app).await;
+    let document = |id: &str, name: Option<&str>| {
+        let mut doc = json!({"file_id": id, "file_unique_id": id, "file_size": 4});
+        if let Some(name) = name {
+            doc["file_name"] = json!(name);
+            doc["mime_type"] = json!("application/pdf");
+        }
+        doc
+    };
+
+    // The sandbox cannot make the inbox.
+    sandbox.fail_next("/command", 500, "sandbox down");
+    api.push(media_from(
+        12,
+        ("document", document("doc", Some("q3 report.pdf"))),
+        None,
+    ));
+    api.messages_to(12, 1).await;
+    // Telegram does not know the file.
+    api.push(media_from(12, ("document", document("gone", None)), None));
+    api.messages_to(12, 2).await;
+    api.push(media_from(12, ("document", document("liar", None)), None));
+    api.messages_to(12, 3).await;
+    running.stop().await.unwrap();
+
+    let saved = prompt(&model, 0)["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        saved.starts_with("[The user attached `q3 report.pdf` (application/pdf, 4 bytes). It is not in your sandbox: saving it failed: "),
+        "{saved}"
+    );
+    assert!(saved.contains("HTTP 500: sandbox down"), "{saved}");
+    for n in [1, 2] {
+        let fetched = prompt(&model, n)["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            fetched,
+            "[The user attached `file` (type unknown, 4 bytes). It is not in your sandbox: \
+             it could not be downloaded from Telegram.]"
+        );
+    }
+    let logged = logged.lock().unwrap().clone();
+    assert!(
+        logged[0].starts_with("saving a file in the sandbox failed: "),
+        "{logged:?}"
+    );
+    assert!(logged[1].contains("invalid file_id"), "{logged:?}");
+    assert!(
+        logged[2].ends_with("the file is over 20971520 bytes"),
+        "{logged:?}"
+    );
+    assert_eq!(logged.len(), 3, "{logged:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_captioned_video_is_neither_a_prompt_nor_a_command() {
+    let tmp = TempDb::new();
+    let api = FakeApi::start().await;
+    let (app, _) = app(&tmp, |s| mock_agent(s, []).0);
+    let running = run(&api, app).await;
+    let video = json!({
+        "file_id": "v", "file_unique_id": "v", "width": 640, "height": 360, "duration": 3
+    });
+    api.push(media_from(14, ("video", video), Some("/new x")));
+    let replies = api.messages_to(14, 1).await;
+    running.stop().await.unwrap();
+    assert_eq!(replies, [telegram::NOT_TEXT]);
+    assert_eq!(selected(&tmp, "14"), None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_photo_lost_on_the_way_is_not_sent_again() {
+    let tmp = TempDb::new();
+    let api = FakeApi::start().await;
+    let sandbox = FakeSandbox::start().await;
+    sandbox.put_file("/w/chart.png", SCREENSHOT);
+    let (app, logged, _) = sandboxed(
+        &tmp,
+        &sandbox,
+        vec![
+            MockTurn::tool_call("c1", "send_photo", json!({"path": "/w/chart.png"})),
+            MockTurn::text("sent"),
+        ],
+    );
+    // Not an error Telegram gave: an answer teloxide cannot read.
+    api.fail_next("sendPhoto", json!({"unexpected": true}));
+    let running = run(&api, app).await;
+    api.push(text_from(15, "send it"));
+    let replies = api.messages_to(15, 2).await;
+    running.stop().await.unwrap();
+
+    assert_eq!(replies, ["sent", "(I could not send you `chart.png`.)"]);
+    assert!(api.calls_to("sendDocument").is_empty());
+    let logged = logged.lock().unwrap().clone();
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert!(
+        logged[0].starts_with("sending a file failed: "),
+        "{logged:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_photo_telegram_refuses_is_sent_as_a_file() {
+    let tmp = TempDb::new();
+    let api = FakeApi::start().await;
+    let sandbox = FakeSandbox::start().await;
+    sandbox.put_file("/w/tall.png", SCREENSHOT);
+    let (app, logged, _) = sandboxed(
+        &tmp,
+        &sandbox,
+        vec![
+            MockTurn::tool_call("c1", "send_photo", json!({"path": "/w/tall.png"})),
+            MockTurn::text("sent"),
+        ],
+    );
+    api.fail_next(
+        "sendPhoto",
+        json!({"ok": false, "error_code": 400, "description": "Bad Request: PHOTO_INVALID_DIMENSIONS"}),
+    );
+    let running = run(&api, app).await;
+    api.push(text_from(13, "send it"));
+    api.wait_for("the file", |calls| {
+        calls.iter().any(|c| c.method == "sendDocument")
+    })
+    .await;
+    running.stop().await.unwrap();
+
+    let document = &api.calls_to("sendDocument")[0];
+    assert_eq!(document.body["document"]["file_name"], "tall.png");
+    let logged = logged.lock().unwrap().clone();
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert!(
+        logged[0].starts_with("sending a photo failed, sending it as a file: "),
+        "{logged:?}"
+    );
 }

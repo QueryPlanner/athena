@@ -11,9 +11,11 @@
 
 use super::shell::command_line;
 use super::{Error, Sandboxes};
+use crate::media::{self, Attachment, Kind, Outbox};
 use crate::runner::Conversation;
 use rig_agent::agent::{AgentBuilder, WithBuilderTools};
-use rig_agent::tool::{Tool, ToolContext, ToolExecutionError};
+use rig_agent::tool::{Tool, ToolContext, ToolExecutionError, ToolOutput};
+use rig_core::message::ToolResultContent;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -30,6 +32,14 @@ const BROWSER_MAX_OUTPUT: &str = "12000";
 /// Depth limit for accessibility snapshots.
 const SNAPSHOT_DEPTH: &str = "12";
 const SCREENSHOT_DIR: &str = "/tmp/athena-screenshots";
+/// The largest file `send_photo` sends: Telegram's limit for photos.
+pub const PHOTO_LIMIT: usize = 10 * 1024 * 1024;
+/// The largest file `send_file` sends: Telegram's limit for bot uploads.
+pub const DOCUMENT_LIMIT: usize = 50 * 1024 * 1024;
+/// Telegram's limit on a caption, in characters.
+pub const CAPTION_LIMIT: usize = 1024;
+/// The furthest `browser_scroll` moves in one call, in pixels.
+const MAX_SCROLL_PX: u32 = 10_000;
 
 /// Add every sandbox tool to an agent.
 pub fn register(
@@ -46,7 +56,12 @@ pub fn register(
         .tool(BrowserClick(sandboxes.clone()))
         .tool(BrowserFill(sandboxes.clone()))
         .tool(BrowserRead(sandboxes.clone()))
-        .tool(BrowserScreenshot(sandboxes))
+        .tool(BrowserScroll(sandboxes.clone()))
+        .tool(BrowserPress(sandboxes.clone()))
+        .tool(BrowserScreenshot(sandboxes.clone()))
+        .tool(ViewImage(sandboxes.clone()))
+        .tool(SendPhoto(sandboxes.clone()))
+        .tool(SendFile(sandboxes))
 }
 
 /// The session this run belongs to.
@@ -89,6 +104,36 @@ pub fn checked_ref(element: &str) -> Result<&str, Error> {
         _ => Err(Error::Invalid(format!(
             "`{element}` is not an element ref; use one like @e3 from browser_snapshot"
         ))),
+    }
+}
+
+/// A key or chord for `browser_press`: letters, digits and `+`, such as
+/// `Enter`, `PageDown` or `Control+a`.
+pub fn checked_key(key: &str) -> Result<&str, Error> {
+    let ok = (1..=32).contains(&key.len())
+        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+');
+    if ok {
+        Ok(key)
+    } else {
+        Err(Error::Invalid(format!(
+            "`{key}` is not a key; use a name like Enter, Tab, ArrowDown or Control+a"
+        )))
+    }
+}
+
+/// A direction and distance for `browser_scroll`.
+pub fn checked_scroll(direction: &str, px: Option<u32>) -> Result<(&str, Option<String>), Error> {
+    if !matches!(direction, "up" | "down" | "left" | "right") {
+        return Err(Error::Invalid(format!(
+            "`{direction}` is not a direction; use up, down, left or right"
+        )));
+    }
+    match px {
+        Some(px @ 1..=MAX_SCROLL_PX) => Ok((direction, Some(px.to_string()))),
+        Some(_) => Err(Error::Invalid(format!(
+            "pixels must be between 1 and {MAX_SCROLL_PX}"
+        ))),
+        None => Ok((direction, None)),
     }
 }
 
@@ -327,15 +372,12 @@ impl Tool for WriteFile {
         args: WriteFileArgs,
     ) -> Result<String, Self::Error> {
         let session = session(context)?;
+        let written = args.content.len();
         self.0
-            .write_file(&session, &args.path, &args.content)
+            .write_file(&session, &args.path, args.content.into_bytes())
             .await
             .map_err(failed)?;
-        Ok(format!(
-            "wrote {} bytes to {}",
-            args.content.len(),
-            args.path
-        ))
+        Ok(format!("wrote {written} bytes to {}", args.path))
     }
 }
 
@@ -506,36 +548,313 @@ impl Tool for BrowserRead {
     }
 }
 
-/// `browser_screenshot()`: saved in the sandbox; the path is returned.
+#[derive(Debug, Deserialize)]
+pub struct ScrollArgs {
+    pub direction: String,
+    #[serde(default)]
+    pub pixels: Option<u32>,
+}
+
+/// `browser_scroll(direction, pixels?)`.
+pub struct BrowserScroll(Arc<Sandboxes>);
+
+impl Tool for BrowserScroll {
+    const NAME: &'static str = "browser_scroll";
+    type Args = ScrollArgs;
+    type Output = String;
+    type Error = ToolExecutionError;
+
+    fn description(&self) -> String {
+        "Scroll the open page up, down, left or right, to reach content that is not on \
+         screen yet."
+            .into()
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
+                "pixels": {
+                    "type": "integer",
+                    "description": "How far, in pixels (default: about one screen)"
+                }
+            },
+            "required": ["direction"]
+        })
+    }
+
+    async fn call(
+        &self,
+        context: &mut ToolContext,
+        args: ScrollArgs,
+    ) -> Result<String, Self::Error> {
+        let (direction, px) = checked_scroll(&args.direction, args.pixels).map_err(failed)?;
+        let mut argv = vec!["scroll", direction];
+        argv.extend(px.as_deref());
+        browse(&self.0, context, &argv).await
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct KeyArgs {
+    pub key: String,
+}
+
+/// `browser_press(key)`.
+pub struct BrowserPress(Arc<Sandboxes>);
+
+impl Tool for BrowserPress {
+    const NAME: &'static str = "browser_press";
+    type Args = KeyArgs;
+    type Output = String;
+    type Error = ToolExecutionError;
+
+    fn description(&self) -> String {
+        "Press a key in the open page, such as Enter to submit a search after \
+         browser_fill, Escape to close a dialog, or Tab."
+            .into()
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Key or chord, e.g. Enter, ArrowDown, Control+a"}
+            },
+            "required": ["key"]
+        })
+    }
+
+    async fn call(&self, context: &mut ToolContext, args: KeyArgs) -> Result<String, Self::Error> {
+        let key = checked_key(&args.key).map_err(failed)?;
+        browse(&self.0, context, &["press", key]).await
+    }
+}
+
+/// `note`, then the image at `path` in the sandbox for the model to look
+/// at, or why it cannot be shown. A file that cannot be read is a reason
+/// too, so a failed screenshot still reports what agent-browser said.
+async fn shown(sandboxes: &Sandboxes, session: &str, path: &str, note: String) -> ToolOutput {
+    let read = sandboxes
+        .read_file(session, path, media::MAX_IMAGE_BYTES)
+        .await;
+    let image = match read {
+        Err(e) => Err(e.to_string()),
+        Ok((_, true)) => Err(format!(
+            "the file is over the {} bytes the model can be shown",
+            media::MAX_IMAGE_BYTES
+        )),
+        Ok((bytes, false)) => media::image(&bytes),
+    };
+    match image {
+        Ok(image) => ToolOutput::content(vec![
+            ToolResultContent::text(note),
+            ToolResultContent::Image(image),
+        ])
+        .expect("two blocks are not empty"),
+        Err(why) => ToolOutput::text(format!("{note}\n[not shown: {why}]")),
+    }
+}
+
+/// `browser_screenshot()`: an annotated screenshot the model sees.
 pub struct BrowserScreenshot(Arc<Sandboxes>);
 
 impl Tool for BrowserScreenshot {
     const NAME: &'static str = "browser_screenshot";
     type Args = NoArgs;
-    type Output = String;
+    type Output = ToolOutput;
     type Error = ToolExecutionError;
 
     fn description(&self) -> String {
-        "Save a screenshot of the open page to a file in the sandbox and return its path.".into()
+        "Take a screenshot of the open page and look at it. Interactive elements are \
+         labelled [N] on the image; label [N] is the element ref @eN, so pass @eN to \
+         browser_click or browser_fill. The screenshot is also saved in the sandbox; its \
+         path is returned, for send_photo."
+            .into()
     }
 
     fn parameters(&self) -> Value {
         no_args()
     }
 
-    async fn call(&self, context: &mut ToolContext, _: NoArgs) -> Result<String, Self::Error> {
+    async fn call(&self, context: &mut ToolContext, _: NoArgs) -> Result<ToolOutput, Self::Error> {
         let path = format!("{SCREENSHOT_DIR}/{}.png", uuid::Uuid::new_v4());
         let session = session(context)?;
         let command = format!(
             "mkdir -p {SCREENSHOT_DIR} && {}",
-            browser_command(&session, &["screenshot", &path]).map_err(failed)?
+            browser_command(&session, &["screenshot", "--annotate", &path]).map_err(failed)?
         );
         let output = self
             .0
             .command(&session, &command, BROWSER_TIMEOUT)
             .await
             .map_err(failed)?;
-        Ok(format!("screenshot: {path}\n{}", output.render()))
+        let note = format!("screenshot: {path}\n{}", output.render());
+        Ok(shown(&self.0, &session, &path, note).await)
+    }
+}
+
+/// `view_image(path)`: look at an image file in the sandbox.
+pub struct ViewImage(Arc<Sandboxes>);
+
+impl Tool for ViewImage {
+    const NAME: &'static str = "view_image";
+    type Args = PathArgs;
+    type Output = ToolOutput;
+    type Error = ToolExecutionError;
+
+    fn description(&self) -> String {
+        format!(
+            "Look at a PNG, JPEG, GIF or WebP image in this conversation's sandbox: a photo \
+             the user sent, a chart you made, a downloaded picture. At most {} bytes.",
+            media::MAX_IMAGE_BYTES
+        )
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {"path": {"type": "string", "description": "Path in the sandbox"}},
+            "required": ["path"]
+        })
+    }
+
+    async fn call(
+        &self,
+        context: &mut ToolContext,
+        args: PathArgs,
+    ) -> Result<ToolOutput, Self::Error> {
+        let session = session(context)?;
+        let note = format!("image: {}", args.path);
+        Ok(shown(&self.0, &session, &args.path, note).await)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SendArgs {
+    pub path: String,
+    #[serde(default)]
+    pub caption: Option<String>,
+}
+
+fn send_parameters() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path of the file in the sandbox"},
+            "caption": {
+                "type": "string",
+                "description": format!("Optional text shown with it, at most {CAPTION_LIMIT} characters")
+            }
+        },
+        "required": ["path"]
+    })
+}
+
+/// Queue the sandbox file at `args.path` for the user, as `kind`.
+async fn send(
+    sandboxes: &Sandboxes,
+    context: &ToolContext,
+    args: SendArgs,
+    kind: Kind,
+    limit: usize,
+) -> Result<String, ToolExecutionError> {
+    let invalid = |why: String| failed(Error::Invalid(why));
+    let Some(outbox) = context.get::<Outbox>().cloned() else {
+        return Err(invalid(
+            "this conversation cannot receive files; tell the user where the file is instead"
+                .into(),
+        ));
+    };
+    if let Some(caption) = &args.caption
+        && caption.chars().count() > CAPTION_LIMIT
+    {
+        return Err(invalid(format!(
+            "the caption is over {CAPTION_LIMIT} characters; put the rest in your reply"
+        )));
+    }
+    let session = session(context)?;
+    let (bytes, more) = sandboxes
+        .read_file(&session, &args.path, limit)
+        .await
+        .map_err(failed)?;
+    if more {
+        return Err(invalid(format!(
+            "{} is over the {limit} bytes that can be sent this way",
+            args.path
+        )));
+    }
+    if kind == Kind::Photo && media::image_type(&bytes).is_none() {
+        return Err(invalid(format!(
+            "{} is not a PNG, JPEG, GIF or WebP image; send it with send_file",
+            args.path
+        )));
+    }
+    let name = media::safe_name(&args.path);
+    let size = bytes.len();
+    outbox
+        .push(Attachment {
+            name: name.clone(),
+            bytes,
+            kind,
+            caption: args.caption,
+        })
+        .map_err(invalid)?;
+    Ok(format!(
+        "{name} ({size} bytes) will be sent to the user with your reply"
+    ))
+}
+
+/// `send_photo(path, caption?)`: show the user an image.
+pub struct SendPhoto(Arc<Sandboxes>);
+
+impl Tool for SendPhoto {
+    const NAME: &'static str = "send_photo";
+    type Args = SendArgs;
+    type Output = String;
+    type Error = ToolExecutionError;
+
+    fn description(&self) -> String {
+        format!(
+            "Send the user an image from the sandbox, shown in the chat as a photo: a \
+             screenshot, a chart, an edited picture. PNG, JPEG, GIF or WebP, at most {PHOTO_LIMIT} \
+             bytes. It arrives with your reply."
+        )
+    }
+
+    fn parameters(&self) -> Value {
+        send_parameters()
+    }
+
+    async fn call(&self, context: &mut ToolContext, args: SendArgs) -> Result<String, Self::Error> {
+        send(&self.0, context, args, Kind::Photo, PHOTO_LIMIT).await
+    }
+}
+
+/// `send_file(path, caption?)`: give the user a file to download.
+pub struct SendFile(Arc<Sandboxes>);
+
+impl Tool for SendFile {
+    const NAME: &'static str = "send_file";
+    type Args = SendArgs;
+    type Output = String;
+    type Error = ToolExecutionError;
+
+    fn description(&self) -> String {
+        format!(
+            "Send the user a file from the sandbox to download: a report, a spreadsheet, a \
+             script, an archive. At most {DOCUMENT_LIMIT} bytes. It arrives with your reply. \
+             Use send_photo for pictures they should see in the chat."
+        )
+    }
+
+    fn parameters(&self) -> Value {
+        send_parameters()
+    }
+
+    async fn call(&self, context: &mut ToolContext, args: SendArgs) -> Result<String, Self::Error> {
+        send(&self.0, context, args, Kind::Document, DOCUMENT_LIMIT).await
     }
 }
 
@@ -575,6 +894,44 @@ mod tests {
         ] {
             assert!(matches!(checked_ref(bad), Err(Error::Invalid(_))), "{bad}");
         }
+    }
+
+    #[test]
+    fn only_named_keys_are_pressed() {
+        for key in ["Enter", "Tab", "Control+a", "ArrowDown", "F5", "a"] {
+            assert_eq!(checked_key(key).unwrap(), key);
+        }
+        for bad in [
+            "",
+            "Enter;id",
+            "two words",
+            "$(id)",
+            "Ctrl-a",
+            &"k".repeat(33),
+        ] {
+            assert!(matches!(checked_key(bad), Err(Error::Invalid(_))), "{bad}");
+        }
+    }
+
+    #[test]
+    fn scrolling_takes_a_direction_and_a_bounded_distance() {
+        assert_eq!(checked_scroll("down", None).unwrap(), ("down", None));
+        assert_eq!(
+            checked_scroll("up", Some(MAX_SCROLL_PX)).unwrap(),
+            ("up", Some(MAX_SCROLL_PX.to_string()))
+        );
+        assert!(matches!(
+            checked_scroll("sideways", None),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            checked_scroll("left", Some(0)),
+            Err(Error::Invalid(_))
+        ));
+        assert!(matches!(
+            checked_scroll("right", Some(MAX_SCROLL_PX + 1)),
+            Err(Error::Invalid(_))
+        ));
     }
 
     #[test]

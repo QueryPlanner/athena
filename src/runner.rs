@@ -5,11 +5,13 @@
 //! `service::Service::send` and `send_stream` wrap the run with ownership,
 //! locking and telemetry.
 
+use crate::media::{File, Outbox};
 use crate::store::{RunRecord, now_millis};
 use rig_agent::agent::{Agent, PromptResponse, StreamingResult};
 use rig_agent::completion::PromptError;
 use rig_agent::prelude::{Prompt, StreamingPrompt};
 use rig_agent::tool::ToolContext;
+use rig_core::message::{Message, UserContent};
 use std::future::{Future, IntoFuture};
 
 /// The conversation (session id) a run belongs to. Every tool call in the
@@ -18,11 +20,90 @@ use std::future::{Future, IntoFuture};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conversation(pub String);
 
-/// The tool context for one run in `conversation`.
-pub fn tool_context(conversation: &str) -> ToolContext {
+/// The tool context for one run in `conversation`. With an `outbox`, the
+/// run's tools can send the user files through it.
+pub fn tool_context(conversation: &str, outbox: Option<&Outbox>) -> ToolContext {
     let mut context = ToolContext::new();
     context.insert(Conversation(conversation.to_string()));
+    if let Some(outbox) = outbox {
+        context.insert(outbox.clone());
+    }
     context
+}
+
+/// What one turn is asked: the user's text and the files they sent with
+/// it, and where the turn's tools may send files back.
+#[derive(Debug, Clone, Default)]
+pub struct Request {
+    pub text: String,
+    pub files: Vec<File>,
+    pub outbox: Option<Outbox>,
+}
+
+impl From<&str> for Request {
+    fn from(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            ..Self::default()
+        }
+    }
+}
+
+impl From<String> for Request {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            ..Self::default()
+        }
+    }
+}
+
+impl From<&String> for Request {
+    fn from(text: &String) -> Self {
+        Self::from(text.as_str())
+    }
+}
+
+impl Request {
+    /// Whether there is nothing to answer: no text and no files.
+    pub fn is_empty(&self) -> bool {
+        self.text.trim().is_empty() && self.files.is_empty()
+    }
+
+    /// The user message the model is given: the text, a note on each file
+    /// saying what it is and where the sandbox has it, and each file shown
+    /// as an image (see [`crate::media::shown`]), as an image.
+    pub fn message(&self) -> Message {
+        let mut text = self.text.clone();
+        let mut images = Vec::new();
+        for file in &self.files {
+            let mut note = vec![format!(
+                "The user attached `{}` ({}, {} bytes).",
+                file.name,
+                file.mime.as_deref().unwrap_or("type unknown"),
+                file.size,
+            )];
+            note.push(match &file.saved {
+                Ok(path) => format!("It is in your sandbox at {path}."),
+                Err(why) => format!("It is not in your sandbox: {why}."),
+            });
+            match &file.image {
+                Some(Ok(image)) => {
+                    images.push(UserContent::Image(image.clone()));
+                    note.push("It is shown to you below.".into());
+                }
+                Some(Err(why)) => note.push(format!("It is not shown to you: {why}.")),
+                None => {}
+            }
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&format!("[{}]", note.join(" ")));
+        }
+        let mut content = vec![UserContent::text(text)];
+        content.extend(images);
+        Message::User { content }
+    }
 }
 
 /// One agent run in a conversation, returning everything Rig reports rather
@@ -37,20 +118,24 @@ pub fn tool_context(conversation: &str) -> ToolContext {
 /// `Send + Sync` and a `Send` future, so a transport can share one agent
 /// across tasks and spawn turns on it.
 pub trait Run: Send + Sync {
-    /// Run `prompt` in `conversation`, the session id. The agent's memory
+    /// Run `request` in `conversation`, the session id. The agent's memory
     /// loads that conversation's history first and appends the turn after.
     fn run(
         &self,
-        prompt: &str,
+        request: &Request,
         conversation: &str,
     ) -> impl Future<Output = Result<PromptResponse, PromptError>> + Send;
 }
 
 impl Run for Agent {
-    async fn run(&self, prompt: &str, conversation: &str) -> Result<PromptResponse, PromptError> {
-        self.prompt(prompt)
+    async fn run(
+        &self,
+        request: &Request,
+        conversation: &str,
+    ) -> Result<PromptResponse, PromptError> {
+        self.prompt(request.message())
             .conversation(conversation)
-            .tool_context(tool_context(conversation))
+            .tool_context(tool_context(conversation, request.outbox.as_ref()))
             .extended_details()
             .await
     }
@@ -80,7 +165,7 @@ impl RunStream for Agent {
     ) -> impl Future<Output = StreamingResult> + Send {
         self.stream_prompt(prompt)
             .conversation(conversation)
-            .tool_context(tool_context(conversation))
+            .tool_context(tool_context(conversation, None))
             .into_future()
     }
 }
@@ -270,6 +355,103 @@ mod tests {
         assert_eq!(rec.status, "error");
         assert_eq!((rec.input_tokens, rec.model_calls), (100, 2));
         assert_eq!((rec.first_seq, rec.last_seq), (4, 3));
+    }
+
+    use crate::media;
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\nrest";
+
+    fn file(name: &str, mime: Option<&str>, bytes: &[u8], saved: Result<&str, &str>) -> File {
+        File {
+            name: name.into(),
+            mime: mime.map(str::to_string),
+            size: bytes.len() as u64,
+            image: media::shown(bytes, mime),
+            saved: saved.map(str::to_string).map_err(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_request_is_text_or_files() {
+        assert!(Request::from("  ").is_empty());
+        assert!(!Request::from(String::from("hi")).is_empty());
+        assert_eq!(Request::from(&String::from("hi")).text, "hi");
+        let files = Request {
+            files: vec![file("a.txt", None, b"a", Ok("/x/a.txt"))],
+            ..Request::default()
+        };
+        assert!(!files.is_empty());
+    }
+
+    #[test]
+    fn a_text_request_is_a_plain_user_message() {
+        assert_eq!(Request::from("hello").message(), Message::user("hello"));
+    }
+
+    #[test]
+    fn files_are_described_and_images_are_shown() {
+        let request = Request {
+            text: "what is this?".into(),
+            files: vec![
+                file("shot.png", Some("image/png"), PNG, Ok("/tmp/in/shot.png")),
+                file(
+                    "notes.pdf",
+                    Some("application/pdf"),
+                    b"%PDF",
+                    Err("no sandbox"),
+                ),
+                file(
+                    "bad.jpg",
+                    Some("image/jpeg"),
+                    b"not really",
+                    Ok("/tmp/in/bad.jpg"),
+                ),
+                file("blob", None, b"??", Ok("/tmp/in/blob")),
+            ],
+            outbox: None,
+        };
+        let text = "what is this?\n\n\
+            [The user attached `shot.png` (image/png, 12 bytes). It is in your sandbox at \
+            /tmp/in/shot.png. It is shown to you below.]\n\n\
+            [The user attached `notes.pdf` (application/pdf, 4 bytes). It is not in your \
+            sandbox: no sandbox.]\n\n\
+            [The user attached `bad.jpg` (image/jpeg, 10 bytes). It is in your sandbox at \
+            /tmp/in/bad.jpg. It is not shown to you: not a PNG, JPEG, GIF or WebP image.]\n\n\
+            [The user attached `blob` (type unknown, 2 bytes). It is in your sandbox at \
+            /tmp/in/blob.]";
+        let expected = Message::User {
+            content: vec![
+                UserContent::text(text),
+                UserContent::Image(media::image(PNG).unwrap()),
+            ],
+        };
+        assert_eq!(request.message(), expected);
+    }
+
+    #[test]
+    fn a_caption_less_file_is_only_its_note() {
+        let request = Request {
+            files: vec![file("a.txt", Some("text/plain"), b"a", Ok("/x/a.txt"))],
+            ..Request::default()
+        };
+        assert_eq!(
+            request.message(),
+            Message::user(
+                "[The user attached `a.txt` (text/plain, 1 bytes). It is in your sandbox at /x/a.txt.]"
+            )
+        );
+    }
+
+    #[test]
+    fn the_tool_context_carries_the_outbox_only_when_there_is_one() {
+        let without = tool_context("s", None);
+        assert_eq!(
+            without.get::<Conversation>(),
+            Some(&Conversation("s".into()))
+        );
+        assert!(without.get::<Outbox>().is_none());
+        let outbox = Outbox::default();
+        assert!(tool_context("s", Some(&outbox)).get::<Outbox>().is_some());
     }
 
     #[test]
