@@ -4,8 +4,8 @@
 
 mod common;
 
-use athena::cli;
-use athena::service::Service;
+use athena_core::cli;
+use athena_core::service::Service;
 use common::*;
 use rig_agent::agent::Agent;
 use rig_core::test_utils::MockTurn;
@@ -323,7 +323,7 @@ fn the_binary_creates_a_migrated_database_on_first_use() {
     );
     assert_eq!(
         user_version(&tmp.raw()),
-        athena::store::SCHEMA_VERSION as i64
+        athena_core::store::SCHEMA_VERSION as i64
     );
 }
 
@@ -383,7 +383,7 @@ fn the_binary_reads_settings_from_a_dotenv_file_in_its_directory() {
     // The database named only in .env was created and migrated.
     assert_eq!(
         user_version(&tmp.raw()),
-        athena::store::SCHEMA_VERSION as i64
+        athena_core::store::SCHEMA_VERSION as i64
     );
 }
 
@@ -398,7 +398,7 @@ fn a_variable_set_in_the_shell_wins_over_dotenv() {
 
     assert_eq!(
         user_version(&from_shell.raw()),
-        athena::store::SCHEMA_VERSION as i64
+        athena_core::store::SCHEMA_VERSION as i64
     );
     assert!(!std::path::Path::new(from_file.path()).exists());
 }
@@ -458,7 +458,10 @@ async fn the_binary_backs_up_a_database_in_use_including_its_wal() {
     );
     let copy = rusqlite::Connection::open(&dest).unwrap();
     let id = cli_session(&tmp, "s");
-    assert_eq!(user_version(&copy), athena::store::SCHEMA_VERSION as i64);
+    assert_eq!(
+        user_version(&copy),
+        athena_core::store::SCHEMA_VERSION as i64
+    );
     assert_eq!(raw_rows(&copy, &id), raw_rows(&tmp.raw(), &id));
     assert_eq!(raw_rows(&copy, &id).len(), 4);
     assert!(!dir.path().join("backups/staging/1.db.partial").exists());

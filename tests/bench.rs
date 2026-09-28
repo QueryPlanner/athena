@@ -1,9 +1,9 @@
 //! `athena bench` against a real `athena serve` router on loopback, in front
 //! of a scripted model. No network beyond loopback.
 
-use athena::bench;
-use athena::service::Service;
-use athena::store::Store;
+use athena_core::bench;
+use athena_core::service::Service;
+use athena_core::store::Store;
 use rig_agent::agent::AgentBuilder;
 use rig_core::completion::Usage;
 use rig_core::test_utils::{MockCompletionModel, MockTurn};
@@ -12,18 +12,18 @@ use std::time::Duration;
 
 async fn server(turns: impl IntoIterator<Item = MockTurn>) -> String {
     let service = Arc::new(Service::new(
+        "athena",
         Store::open_in_memory().unwrap(),
         "m",
-        athena::cli::warn,
+        athena_core::cli::warn,
     ));
-    let agent = athena::agent::configure(
-        AgentBuilder::new(MockCompletionModel::new(turns)).memory(service.memory()),
-    );
+    let agent = athena::agent::spec()
+        .configure(AgentBuilder::new(MockCompletionModel::new(turns)).memory(service.memory()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(athena::http::serve(
+    tokio::spawn(athena_core::http::serve(
         listener,
-        athena::http::Hosts::Loopback,
+        athena_core::http::Hosts::Loopback,
         service,
         Arc::new(agent),
         std::future::pending(),

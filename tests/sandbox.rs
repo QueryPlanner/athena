@@ -5,12 +5,11 @@ mod common;
 #[path = "sandbox/fake_server.rs"]
 mod fake_server;
 
-use athena::agent;
-use athena::policy::MAX_TOOL_CALLS;
-use athena::sandbox::tools::READ_LIMIT;
-use athena::sandbox::{Config, Error, Sandboxes};
-use athena::service::{Service, User};
-use athena::store::SandboxRow;
+use athena_core::policy::MAX_TOOL_CALLS;
+use athena_core::sandbox::tools::READ_LIMIT;
+use athena_core::sandbox::{Config, Error, Sandboxes};
+use athena_core::service::{Service, User};
+use athena_core::store::SandboxRow;
 use common::*;
 use fake_server::{FakeSandbox, printed};
 use reqwest::header::HeaderValue;
@@ -80,7 +79,7 @@ impl Harness {
     fn agent(&self, turns: Vec<MockTurn>) -> (rig_agent::agent::Agent, MockCompletionModel) {
         let model = MockCompletionModel::new(turns);
         let builder = AgentBuilder::new(model.clone()).memory(self.service.memory());
-        let agent = agent::configure_with(builder, Some(self.sandboxes.clone()));
+        let agent = athena::agent::spec().configure_with(builder, Some(self.sandboxes.clone()));
         (agent, model)
     }
 
@@ -738,6 +737,39 @@ async fn the_model_is_offered_every_sandbox_tool_only_with_a_server() {
     }
 }
 
+/// The tools an agent built from `spec` offers the model on its first turn.
+async fn offered(h: &Harness, spec: athena_core::AgentSpec) -> Vec<String> {
+    let s = h.session(spec.name).await;
+    let model = MockCompletionModel::new(vec![MockTurn::text("hi")]);
+    let builder = AgentBuilder::new(model.clone()).memory(h.service.memory());
+    let agent = spec.configure_with(builder, Some(h.sandboxes.clone()));
+    h.service.send(&agent, &h.user, &s, "hi").await.unwrap();
+    let mut tools: Vec<String> = model.requests()[0]
+        .tools
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    tools.sort();
+    tools
+}
+
+#[tokio::test]
+async fn an_agent_can_take_some_sandbox_tools_or_none() {
+    let h = harness().await;
+    let only = athena_core::AgentSpec {
+        name: "only",
+        sandbox_tools: athena_core::SandboxTools::Only(&["read_file", "shell"]),
+        ..athena::agent::spec()
+    };
+    assert_eq!(offered(&h, only).await, ["add", "read_file", "shell"]);
+    let none = athena_core::AgentSpec {
+        name: "none",
+        sandbox_tools: athena_core::SandboxTools::None,
+        ..athena::agent::spec()
+    };
+    assert_eq!(offered(&h, none).await, ["add"]);
+}
+
 #[tokio::test]
 async fn a_streamed_turn_reaches_the_same_sandbox() {
     let h = harness().await;
@@ -757,7 +789,7 @@ async fn a_streamed_turn_reaches_the_same_sandbox() {
         ]);
         let builder = AgentBuilder::new(model.clone()).memory(service.memory());
         (
-            agent::configure_with(builder, Some(h.sandboxes.clone())),
+            athena::agent::spec().configure_with(builder, Some(h.sandboxes.clone())),
             model,
         )
     };
@@ -808,7 +840,7 @@ async fn tool_calls_past_the_runs_budget_are_skipped_with_a_reason() {
 async fn a_tool_call_with_oversized_arguments_is_skipped() {
     let h = harness().await;
     let s = h.session("s").await;
-    let huge = "x".repeat(athena::policy::MAX_ARGUMENT_BYTES);
+    let huge = "x".repeat(athena_core::policy::MAX_ARGUMENT_BYTES);
     let out = h
         .call(&s, "write_file", json!({"path": "/big", "content": huge}))
         .await;

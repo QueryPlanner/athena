@@ -5,9 +5,9 @@
 
 mod common;
 
-use athena::http::{self, Hosts, USER_HEADER};
-use athena::service::Service;
-use athena::telemetry::{self, Exporters, Settings, Sinks, TRACE_ID_HEADER, Telemetry};
+use athena_core::http::{self, Hosts, USER_HEADER};
+use athena_core::service::Service;
+use athena_core::telemetry::{self, Exporters, Settings, Sinks, TRACE_ID_HEADER, Telemetry};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -323,7 +323,7 @@ async fn a_streamed_turn_nests_rigs_streaming_spans_under_athenas() {
     assert_eq!(nested.iter().filter(|n| **n == "chat_streaming").count(), 2);
 }
 
-async fn session_of(service: &Service, user: &athena::service::User) -> String {
+async fn session_of(service: &Service, user: &athena_core::service::User) -> String {
     service.open_session(user, "s").await.unwrap().id
 }
 
@@ -431,7 +431,7 @@ async fn configured_turn(environment: &str) -> Vec<SpanData> {
     let service = Arc::new(tmp.service().0);
     let user = cli_user(&service).await;
     let session = session_of(&service, &user).await;
-    let agent = athena::agent::configure(
+    let agent = athena::agent::spec().configure(
         AgentBuilder::new(MockCompletionModel::new([MockTurn::text("hello")]))
             .memory(service.memory()),
     );

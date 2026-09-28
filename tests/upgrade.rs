@@ -7,7 +7,7 @@
 
 mod common;
 
-use athena::store::{self, Store};
+use athena_core::store::{self, Store};
 use common::*;
 use rig_core::test_utils::MockTurn;
 use rusqlite::Connection;

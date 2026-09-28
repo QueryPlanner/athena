@@ -4,11 +4,14 @@
 #   ./scripts/analytics.sh --list
 #   ./scripts/analytics.sh cost_by_model_day                    # local files
 #   ./scripts/analytics.sh --vm appuser@athena-vm --env prod tool_latency
+#   ./scripts/analytics.sh --vm appuser@athena-vm --agent notes cost_by_model_day
 #
 # Queries are templates. Placeholders filled here:
-#   {{ATHENA_DB}}     SQLite database, opened READ_ONLY (default /var/lib/athena/<env>/agent.db)
-#   {{TELEMETRY_DIR}} directory of Athena's traces-*.jsonl files (default
-#                     /var/lib/athena/*/telemetry: both environments)
+#   {{ATHENA_DB}}     SQLite database, opened READ_ONLY (default <data>/<env>/agent.db)
+#   {{TELEMETRY_DIR}} directory of the agent's traces-*.jsonl files (default
+#                     <data>/*/telemetry: both environments)
+# where <data> is /var/lib/athena for Athena and /var/lib/athena/agents/<name>
+# for any other agent (--agent).
 #   {{EVAL_RESULTS}}  eval results JSONL glob (default results/*.jsonl)
 #   {{PRICES}}        analytics/prices.csv
 # A query marked "-- needs: spans.sql" gets analytics/queries/spans.sql first.
@@ -23,7 +26,8 @@ QUERIES=$REPO_ROOT/analytics/queries
 ENV_NAME=prod
 VM=""
 DB=""
-TELEMETRY_DIR="/var/lib/athena/*/telemetry"
+AGENT=athena
+TELEMETRY_DIR=""
 EVAL_RESULTS="results/*.jsonl"
 MODE=box
 QUERY=""
@@ -31,7 +35,7 @@ QUERY=""
 usage() {
     sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
     echo
-    echo "Options: --list  --env staging|prod  --vm USER@HOST  --db PATH  --telemetry-dir DIR"
+    echo "Options: --list  --agent NAME  --env staging|prod  --vm USER@HOST  --db PATH  --telemetry-dir DIR"
     echo "         --eval-results GLOB  --json"
 }
 
@@ -41,6 +45,7 @@ while [ $# -gt 0 ]; do
                     n=$(basename "$f" .sql); [ "$n" = spans ] && continue
                     printf '%-20s %s\n' "$n" "$(head -n1 "$f" | sed 's/^-- //')"
                 done; exit 0 ;;
+        --agent) AGENT="${2:?}"; shift ;;
         --env) ENV_NAME="${2:?}"; shift ;;
         --vm) VM="${2:?}"; shift ;;
         --db) DB="${2:?}"; shift ;;
@@ -60,7 +65,11 @@ if ! [[ "$QUERY" =~ ^[a-z0-9_]+$ && -f "$QUERIES/$QUERY.sql" ]]; then
     echo "analytics: no query '$QUERY'; see --list" >&2
     exit 2
 fi
-[ -n "$DB" ] || DB=/var/lib/athena/$ENV_NAME/agent.db
+[[ "$AGENT" =~ ^[a-z][a-z0-9]{0,23}$ ]] || { echo "analytics: bad agent name '$AGENT'" >&2; exit 2; }
+data=/var/lib/athena
+[ "$AGENT" = athena ] || data=/var/lib/athena/agents/$AGENT
+[ -n "$DB" ] || DB=$data/$ENV_NAME/agent.db
+[ -n "$TELEMETRY_DIR" ] || TELEMETRY_DIR="$data/*/telemetry"
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT

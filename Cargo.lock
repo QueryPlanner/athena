@@ -93,6 +93,44 @@ name = "athena"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "athena-core",
+ "axum",
+ "dotenvy",
+ "futures-util",
+ "http-body-util",
+ "libc",
+ "opentelemetry",
+ "opentelemetry-appender-tracing",
+ "opentelemetry-http",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "regex",
+ "reqwest 0.12.28",
+ "rig-agent",
+ "rig-core",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "teloxide",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "athena-cli"
+version = "0.1.0"
+
+[[package]]
+name = "athena-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "axum",
  "dotenvy",
  "futures-util",

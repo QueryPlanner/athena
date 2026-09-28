@@ -5,9 +5,9 @@
 
 mod common;
 
-use athena::http::{self, Hosts, USER_HEADER};
-use athena::service::Service;
-use athena::store::SqliteMemory;
+use athena_core::http::{self, Hosts, USER_HEADER};
+use athena_core::service::Service;
+use athena_core::store::SqliteMemory;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
@@ -149,7 +149,10 @@ async fn the_health_check_needs_no_user() {
 
     let (status, body) = call(&api(&service, agent), request("GET", "/health", None, None)).await;
 
-    assert_eq!((status, body), (StatusCode::OK, json!({"status": "ok"})));
+    assert_eq!(
+        (status, body),
+        (StatusCode::OK, json!({"status": "ok", "agent": "athena"}))
+    );
     assert_eq!(
         count(
             &tmp.raw(),
@@ -173,7 +176,7 @@ async fn the_version_needs_no_user_and_ignores_the_host() {
     let (status, body) = call(&router, request).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!({"version": athena::ops::version()}));
+    assert_eq!(body, json!({"version": athena_core::ops::version()}));
     assert_eq!(
         count(
             &tmp.raw(),
@@ -782,7 +785,10 @@ async fn the_server_answers_over_tcp_and_finishes_turns_in_flight_before_it_stop
 
     let health = read_all(send_raw(addr, "GET", "/health", "alice", "").await).await;
     assert!(health.starts_with("HTTP/1.1 200 OK"), "{health}");
-    assert!(health.ends_with(r#"{"status":"ok"}"#), "{health}");
+    assert!(
+        health.ends_with(r#"{"agent":"athena","status":"ok"}"#),
+        "{health}"
+    );
 
     let client = send_raw(
         addr,

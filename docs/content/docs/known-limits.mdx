@@ -21,6 +21,11 @@ description: What athena does not do yet. Read this before exposing it.
 - Provider errors are logged to stderr in full and can include account
   details from the provider's error body. Message text is never logged.
 
+- **Agents on one VM share the sandbox server and OpenObserve.** Each agent
+  has its own user, data and CI keys, but every agent that sets
+  `OPEN_SANDBOX_URL` uses the same OpenSandbox server and API key, and all of
+  them export to the one OpenObserve.
+
 ## Durability
 
 - A crash mid-turn loses that turn, and so does a second Ctrl-C while

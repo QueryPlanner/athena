@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# Prepare a VM to run Athena: users, directories, systemd units, the
-# deploy-gate forced command, and the observability stack.
+# Prepare a VM to run an Athena agent: users, directories, systemd units,
+# the deploy-gate forced command, and the observability stack.
+#
+# One VM runs many agents. --agent NAME (default athena) picks which one this
+# run sets up; the host-wide parts (deploy user, sudoers, deploy-gate,
+# OpenObserve) are shared. Athena keeps the layout it always had; any other
+# agent lives under agents/NAME/, runs as user athena-NAME and gets the next
+# free pair of ports unless --port-* says otherwise. See plans/multi-agent.md.
 #
 # Safe on a VM that already runs other things. It never touches Docker, ufw,
 # sshd, Caddy or the Tailscale configuration, and it never overwrites a file
@@ -11,6 +17,7 @@
 #       --ci-staging-pubkey ci-staging.pub --ci-prod-pubkey ci-prod.pub \
 #       --gate-digest sha256:<64 hex>
 #   ./scripts/setup-host.sh --vm appuser@100.124.202.79 [same flags]
+#   ./scripts/setup-host.sh --agent notes --vm appuser@100.124.202.79 --dry-run
 #   sudo ./scripts/setup-host.sh --uninstall [--purge]
 #
 # See SETUP.md for where this fits, and plans/contracts.md for the layout.
@@ -31,9 +38,15 @@ DUCKDB_URL="https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION
 
 # ---- defaults ----
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-ATHENA_REPO=ghcr.io/queryplanner/athena
+AGENT=athena
+# Athena's release repository, which also holds deploy-gate.
+GATE_REPO=ghcr.io/queryplanner/athena
+ATHENA_REPO=""
 PORT_PROD=18080
 PORT_STAGING=18081
+PORTS_SET=0
+# A new agent's first port; each agent takes two (staging, then prod).
+FIRST_AGENT_PORT=18082
 PORT_O2=5080
 HOST_ALIAS="athena-vm"
 O2_EMAIL=admin@athena.internal
@@ -55,6 +68,8 @@ usage() {
     cat <<'EOF'
 Usage: setup-host.sh [options]
 
+  --agent NAME               the agent to set up (default athena): lowercase letters
+                             and digits, starting with a letter, at most 24
   --dry-run                  print every change without making it (no root needed)
   --vm USER@HOST             copy this script and deploy/ to HOST and run it there
                              (with sudo, over ssh -t; the dry run runs without sudo)
@@ -62,16 +77,17 @@ Usage: setup-host.sh [options]
   --ci-staging-pubkey FILE   public key CI uses for staging (forced command)
   --ci-prod-pubkey FILE      public key CI uses for prod (forced command)
   --tailnet-ip IP            override `tailscale ip -4` (used by CI's dry run)
-  --port-prod N              prod serve port (default 18080)
-  --port-staging N           staging serve port (default 18081)
+  --port-prod N              prod serve port (Athena: 18080; others: the next free pair)
+  --port-staging N           staging serve port (Athena: 18081; others: the next free pair)
   --host-alias NAME          extra Host name accepted by Athena (default athena-vm)
   --o2-email EMAIL           OpenObserve root user (default admin@athena.internal)
-  --repo REF                 release repository (default ghcr.io/queryplanner/athena)
+  --repo REF                 the agent's release repository
+                             (default ghcr.io/queryplanner/NAME)
   --skip-observability       do not install OpenObserve (Athena still writes JSONL)
-  --uninstall                stop and remove Athena's units, binaries and rules;
-                             keeps /etc/athena and the databases
-  --purge                    with --uninstall: also delete /etc/athena,
-                             /var/lib/athena and what this script installed
+  --uninstall                stop and remove the agent's units, binaries and keys;
+                             keeps its env files and databases
+  --purge                    with --uninstall: also delete its env files, data
+                             and user (for Athena: everything this script installed)
   --yes                      do not ask for confirmation on --uninstall
   -h, --help                 this help
 EOF
@@ -81,14 +97,15 @@ die() { echo "setup-host: $*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --agent) AGENT="${2:?--agent needs a name}"; shift ;;
         --dry-run) DRY_RUN=1 ;;
         --vm) VM="${2:?--vm needs USER@HOST}"; shift ;;
         --gate-digest) GATE_DIGEST="${2:?}"; shift ;;
         --ci-staging-pubkey) STAGING_PUBKEY="${2:?}"; shift ;;
         --ci-prod-pubkey) PROD_PUBKEY="${2:?}"; shift ;;
         --tailnet-ip) TAILNET_IP="${2:?}"; shift ;;
-        --port-prod) PORT_PROD="${2:?}"; shift ;;
-        --port-staging) PORT_STAGING="${2:?}"; shift ;;
+        --port-prod) PORT_PROD="${2:?}"; PORTS_SET=1; shift ;;
+        --port-staging) PORT_STAGING="${2:?}"; PORTS_SET=1; shift ;;
         --host-alias) HOST_ALIAS="${2:?}"; shift ;;
         --o2-email) O2_EMAIL="${2:?}"; shift ;;
         --repo) ATHENA_REPO="${2:?}"; shift ;;
@@ -109,6 +126,35 @@ fi
 for p in "$PORT_PROD" "$PORT_STAGING"; do
     [[ "$p" =~ ^[0-9]+$ ]] || die "ports must be numbers, got '$p'"
 done
+[[ "$AGENT" =~ ^[a-z][a-z0-9]{0,23}$ ]] ||
+    die "--agent must be a lowercase letter then up to 23 lowercase letters or digits, got '$AGENT'"
+[ "$PORT_PROD" != "$PORT_STAGING" ] || die "staging and prod need different ports"
+
+# ---- the agent's names and places (plans/multi-agent.md, "VM layout") ----
+if [ "$AGENT" = athena ]; then
+    AGENT_USER=athena
+    TITLE=Athena
+    ETC=/etc/athena
+    OPT=/opt/athena
+    VAR=/var/lib/athena
+    GATE_STATE=/var/lib/athena/gate
+    KEY_COMMAND="sudo /opt/athena/bin/deploy-gate"
+    KEY_LABEL=ci
+    [ -n "$ATHENA_REPO" ] && GATE_REPO=$ATHENA_REPO
+    ATHENA_REPO=$GATE_REPO
+else
+    AGENT_USER=athena-$AGENT
+    TITLE="Athena agent $AGENT"
+    ETC=/etc/athena/agents/$AGENT
+    OPT=/opt/athena/agents/$AGENT
+    VAR=/var/lib/athena/agents/$AGENT
+    GATE_STATE=/var/lib/athena/gate/$AGENT
+    KEY_COMMAND="sudo /opt/athena/bin/deploy-gate --agent $AGENT"
+    KEY_LABEL=ci-$AGENT
+    [ -n "$ATHENA_REPO" ] || ATHENA_REPO=ghcr.io/queryplanner/$AGENT
+fi
+# The units' names start with this: athena-serve@prod, athena-notes-serve@prod.
+PREFIX=$AGENT_USER
 
 # ---- remote mode: ship this script plus deploy/ and run it on the VM ----
 if [ -n "$VM" ]; then
@@ -125,8 +171,10 @@ if [ -n "$VM" ]; then
     [ "$SKIP_OBSERVABILITY" = 1 ] && fwd+=(--skip-observability)
     [ -n "$GATE_DIGEST" ] && fwd+=(--gate-digest "$GATE_DIGEST")
     [ -n "$TAILNET_IP" ] && fwd+=(--tailnet-ip "$TAILNET_IP")
-    fwd+=(--port-prod "$PORT_PROD" --port-staging "$PORT_STAGING" --host-alias "$HOST_ALIAS"
-          --o2-email "$O2_EMAIL" --repo "$ATHENA_REPO")
+    # Ports only when given: a new agent's are chosen on the VM, which knows
+    # what is taken.
+    [ "$PORTS_SET" = 1 ] && fwd+=(--port-prod "$PORT_PROD" --port-staging "$PORT_STAGING")
+    fwd+=(--agent "$AGENT" --host-alias "$HOST_ALIAS" --o2-email "$O2_EMAIL" --repo "$ATHENA_REPO")
     if [ -n "$STAGING_PUBKEY" ]; then
         cp "$STAGING_PUBKEY" "$stage/keys/ci-staging.pub"; fwd+=(--ci-staging-pubkey keys/ci-staging.pub)
     fi
@@ -287,6 +335,67 @@ detect_tailnet_ip() {
     echo "  tailnet IP: $TAILNET_IP" >&2
 }
 
+# Every port another agent has: "<agent> <port>" per line. Athena's come from
+# its env files (18080/18081 when they cannot be read), every other agent's
+# from its agent.env.
+registered_ports() {
+    local env file port a
+    if [ "$AGENT" != athena ] && { [ -e /etc/athena/staging.env ] || [ -e /etc/athena/prod.env ]; }; then
+        for env in staging prod; do
+            file=/etc/athena/$env.env
+            port=$(sed -n 's/^ATHENA_ADDR=.*:\([0-9]*\)$/\1/p' "$file" 2>/dev/null || true)
+            if [ -z "$port" ]; then
+                if [ "$env" = prod ]; then port=18080; else port=18081; fi
+            fi
+            echo "athena $port"
+        done
+    fi
+    for file in /etc/athena/agents/*/agent.env; do
+        [ -f "$file" ] || continue
+        a=$(basename "$(dirname "$file")")
+        [ "$a" = "$AGENT" ] && continue
+        sed -n "s/^PORT_\(STAGING\|PROD\)=\([0-9]*\)$/$a \2/p" "$file"
+    done
+}
+
+port_listening() {
+    command -v ss >/dev/null 2>&1 || return 1
+    [ -n "$(ss -Hltn "sport = :$1" 2>/dev/null || true)" ]
+}
+
+# A new agent's ports: the ones its agent.env recorded, else the first pair
+# from FIRST_AGENT_PORT that no agent has and nothing listens on.
+choose_ports() {
+    step "ports for $AGENT"
+    local taken p
+    if [ "$PORTS_SET" = 0 ] && [ "$AGENT" != athena ]; then
+        if [ -r "$ETC/agent.env" ]; then
+            PORT_STAGING=$(sed -n 's/^PORT_STAGING=//p' "$ETC/agent.env")
+            PORT_PROD=$(sed -n 's/^PORT_PROD=//p' "$ETC/agent.env")
+            same "ports $PORT_STAGING (staging) and $PORT_PROD (prod), from $ETC/agent.env"
+        else
+            taken=$(registered_ports | awk '{print $2}')
+            p=$FIRST_AGENT_PORT
+            while grep -qx "$p" <<<"$taken" || grep -qx "$((p + 1))" <<<"$taken" ||
+                [ "$p" = "$PORT_O2" ] || [ "$((p + 1))" = "$PORT_O2" ] ||
+                port_listening "$p" || port_listening "$((p + 1))"; do
+                p=$((p + 2))
+            done
+            PORT_STAGING=$p
+            PORT_PROD=$((p + 1))
+            changed "chose ports $PORT_STAGING (staging) and $PORT_PROD (prod)"
+        fi
+    fi
+    local line
+    while read -r line; do
+        [ -n "$line" ] || continue
+        for p in "$PORT_STAGING" "$PORT_PROD"; do
+            [ "${line#* }" = "$p" ] && die "port $p belongs to agent ${line%% *}; pick others with --port-staging/--port-prod"
+        done
+    done < <(registered_ports)
+    echo "  $AGENT: staging $PORT_STAGING, prod $PORT_PROD" >&2
+}
+
 # Refuse when another program already listens on one of our ports.
 check_ports() {
     step "ports"
@@ -312,10 +421,10 @@ check_ports() {
 
 ensure_users() {
     step "users"
-    if id athena >/dev/null 2>&1; then same "user athena"; else
-        run useradd --system --user-group --home-dir /var/lib/athena --no-create-home \
-            --shell /usr/sbin/nologin athena
-        changed "user athena (runs the services)"
+    if id "$AGENT_USER" >/dev/null 2>&1; then same "user $AGENT_USER"; else
+        run useradd --system --user-group --home-dir "$VAR" --no-create-home \
+            --shell /usr/sbin/nologin "$AGENT_USER"
+        changed "user $AGENT_USER (runs the services of agent $AGENT)"
     fi
     if id deploy >/dev/null 2>&1; then same "user deploy"; else
         run useradd --system --user-group --create-home --home-dir /home/deploy \
@@ -333,19 +442,30 @@ ensure_users() {
 
 ensure_dirs() {
     step "directories"
-    local athena env
-    athena=$(owner_or_root athena)
+    local user env
+    user=$(owner_or_root "$AGENT_USER")
     ensure_dir /opt/athena 0755 root:root
     ensure_dir /opt/athena/bin 0755 root:root
-    ensure_dir /opt/athena/releases 0755 root:root
     ensure_dir /etc/athena 0755 root:root
     ensure_dir /var/lib/athena 0755 root:root
+    if [ "$AGENT" != athena ]; then
+        ensure_dir /opt/athena/agents 0755 root:root
+        ensure_dir "$OPT" 0755 root:root
+        ensure_dir /etc/athena/agents 0755 root:root
+        ensure_dir "$ETC" 0755 root:root
+        ensure_dir /var/lib/athena/agents 0755 root:root
+        ensure_dir "$VAR" 0755 root:root
+        # deploy-gate's own records; root-only, because promote trusts them.
+        ensure_dir /var/lib/athena/gate 0755 root:root
+        ensure_dir "$GATE_STATE" 0755 root:root
+    fi
+    ensure_dir "$OPT/releases" 0755 root:root
     for env in staging prod; do
-        ensure_dir "/opt/athena/$env" 0755 root:root
-        ensure_dir "/var/lib/athena/$env" 0750 "$athena"
-        ensure_dir "/var/lib/athena/$env/backups" 0750 "$athena"
-        # ATHENA_TELEMETRY_DIR: Athena's own JSONL spans and logs.
-        ensure_dir "/var/lib/athena/$env/telemetry" 0750 "$athena"
+        ensure_dir "$OPT/$env" 0755 root:root
+        ensure_dir "$VAR/$env" 0750 "$user"
+        ensure_dir "$VAR/$env/backups" 0750 "$user"
+        # ATHENA_TELEMETRY_DIR: the agent's own JSONL spans and logs.
+        ensure_dir "$VAR/$env/telemetry" 0750 "$user"
     done
 }
 
@@ -445,11 +565,20 @@ install_openobserve() {
     O2_RESTART=$restart
 }
 
+# The agent's own units, rendered from deploy/systemd/*.in. For Athena they
+# come out exactly as they were before there were other agents.
+render_unit() {
+    render "$REPO_ROOT/deploy/systemd/$1.in" PREFIX "$PREFIX" USER "$AGENT_USER" \
+        TITLE "$TITLE" ETC "$ETC" VAR "$VAR" OPT "$OPT"
+}
+
 install_units() {
     step "systemd units"
-    local unit
+    local unit name
     for unit in athena-serve@.service athena-telegram@.service athena@.target; do
-        install_file "$REPO_ROOT/deploy/systemd/$unit" "/etc/systemd/system/$unit" 0644 root:root || true
+        name=${unit/#athena/$PREFIX}
+        render_unit "$unit" >"$WORK/$name"
+        install_file "$WORK/$name" "/etc/systemd/system/$name" 0644 root:root || true
     done
 }
 
@@ -522,9 +651,9 @@ ensure_env_files() {
     step "environment files"
     local env port tg file hosts otlp
     local group
-    group=$(owner_or_root athena); group=${group##*:}
+    group=$(owner_or_root "$AGENT_USER"); group=${group##*:}
     for env in staging prod; do
-        file=/etc/athena/$env.env
+        file=$ETC/$env.env
         if [ "$env" = prod ]; then port=$PORT_PROD; else port=$PORT_STAGING; fi
         # Each env needs its own bot: one token cannot be polled by two
         # processes (Telegram answers 409). Empty means no bot for this env.
@@ -536,16 +665,17 @@ ensure_env_files() {
             if [ -r "$file" ] && ! grep -q "^ATHENA_ADDR=$TAILNET_IP:$port\$" "$file"; then
                 warn "$file: ATHENA_ADDR is not $TAILNET_IP:$port; check it with sudoedit"
             fi
-            migrate_env_file "$file" "$env"
+            [ "$AGENT" = athena ] && migrate_env_file "$file" "$env"
             continue
         fi
         # A plain assignment, so a failure in otlp_block stops the script.
         otlp=$(otlp_block)
         render "$REPO_ROOT/deploy/athena.env.template" ENV "$env" TAILNET_IP "$TAILNET_IP" \
             PORT "$port" ALLOWED_HOSTS "$hosts" TELEGRAM_BLOCK "$tg" \
-            OTLP_BLOCK "$otlp" >"$WORK/$env.env"
+            OTLP_BLOCK "$otlp" TITLE "$TITLE" ETC "$ETC" USER "$AGENT_USER" VAR "$VAR" \
+            AGENT "$AGENT" >"$WORK/$env.env"
         if [ "$DRY_RUN" = 1 ]; then
-            changed "would create $file (0640 root:athena):"
+            changed "would create $file (0640 root:$AGENT_USER):"
             sed 's/^/      /' "$WORK/$env.env" >&2
         else
             install -m 0640 -o root -g "$group" "$WORK/$env.env" "$file"
@@ -553,8 +683,18 @@ ensure_env_files() {
         fi
         todo "type the secrets into $file yourself: sudoedit $file"
     done
-    printf 'ATHENA_REPO=%s\nATHENA_KEEP_RELEASES=3\nORAS=/usr/local/bin/oras\n' "$ATHENA_REPO" >"$WORK/gate.env"
-    install_file "$WORK/gate.env" /etc/athena/gate.env 0644 root:root || true
+    # The gate's own settings name Athena's repository; another agent's run
+    # writes them only if they are missing.
+    if [ "$AGENT" = athena ] || ! [ -e /etc/athena/gate.env ]; then
+        printf 'ATHENA_REPO=%s\nATHENA_KEEP_RELEASES=3\nORAS=/usr/local/bin/oras\n' "$GATE_REPO" >"$WORK/gate.env"
+        install_file "$WORK/gate.env" /etc/athena/gate.env 0644 root:root || true
+    fi
+    # What makes this agent known to deploy-gate: its repository and ports.
+    if [ "$AGENT" != athena ]; then
+        printf 'ATHENA_REPO=%s\nPORT_STAGING=%s\nPORT_PROD=%s\n' \
+            "$ATHENA_REPO" "$PORT_STAGING" "$PORT_PROD" >"$WORK/agent.env"
+        install_file "$WORK/agent.env" "$ETC/agent.env" 0644 root:root || true
+    fi
 }
 
 install_sudoers() {
@@ -573,11 +713,45 @@ EOF
     install_file "$WORK/sudoers" /etc/sudoers.d/athena-deploy 0440 root:root || true
 }
 
-# One authorized_keys line per env. A key not given keeps its existing line.
+# Whether an authorized_keys line is this agent's key for ENV. Athena's lines
+# have no --agent; every other agent's name theirs.
+is_our_key() {
+    local line=$1 env=$2
+    if [ "$AGENT" = athena ]; then
+        [[ "$line" == *"deploy-gate --key-env $env\""* ]]
+    else
+        [[ "$line" == *"deploy-gate --agent $AGENT --key-env $env\""* ]]
+    fi
+}
+
+# This agent's existing line for ENV, from the lines read into $WORK/ours.
+our_line() {
+    local existing
+    while IFS= read -r existing; do
+        if is_our_key "$existing" "$1"; then printf '%s\n' "$existing"; return 0; fi
+    done <"$WORK/ours"
+}
+
+# One line per agent per env. This agent's lines are rebuilt: a key given
+# replaces its line, a key not given keeps it. Every other agent's lines are
+# kept as they are. A key already on another line is refused: sshd uses the
+# first line that matches, so a shared key would run the wrong command.
 ensure_authorized_keys() {
     step "deploy's authorized_keys"
-    local file=/home/deploy/.ssh/authorized_keys env key line
-    : >"$WORK/authorized_keys"
+    local file=/home/deploy/.ssh/authorized_keys env key line body existing
+    : >"$WORK/others"
+    : >"$WORK/ours"
+    if [ -r "$file" ]; then
+        while IFS= read -r existing || [ -n "$existing" ]; do
+            [ -n "$existing" ] || continue
+            if is_our_key "$existing" staging || is_our_key "$existing" prod; then
+                printf '%s\n' "$existing" >>"$WORK/ours"
+            else
+                printf '%s\n' "$existing" >>"$WORK/others"
+            fi
+        done <"$file"
+    fi
+    cp "$WORK/others" "$WORK/authorized_keys"
     for env in staging prod; do
         key=$STAGING_PUBKEY
         [ "$env" = prod ] && key=$PROD_PUBKEY
@@ -590,12 +764,16 @@ ensure_authorized_keys() {
             ssh-keygen -lf "$key" >/dev/null 2>&1 || die "ssh-keygen rejects $key"
             [[ "$line" == *PRIVATE* ]] && die "$key looks like a private key"
             line=$(awk '{print $1" "$2}' <<<"$line")
-            printf 'restrict,command="sudo /opt/athena/bin/deploy-gate --key-env %s" %s ci-%s\n' \
-                "$env" "$line" "$env" >>"$WORK/authorized_keys"
-        elif [ -r "$file" ] && grep -q -- "--key-env $env\"" "$file"; then
-            grep -- "--key-env $env\"" "$file" >>"$WORK/authorized_keys"
+            body=${line#* }
+            if grep -qF " $body " "$WORK/authorized_keys"; then
+                die "the $env key is already on another line of $file; each agent and env needs its own key"
+            fi
+            printf 'restrict,command="%s --key-env %s" %s %s-%s\n' \
+                "$KEY_COMMAND" "$env" "$line" "$KEY_LABEL" "$env" >>"$WORK/authorized_keys"
+        elif existing=$(our_line "$env") && [ -n "$existing" ]; then
+            printf '%s\n' "$existing" >>"$WORK/authorized_keys"
         else
-            todo "no CI key for $env yet: re-run with --ci-$env-pubkey FILE"
+            todo "no CI key for $AGENT $env yet: re-run with --ci-$env-pubkey FILE"
         fi
     done
     [ -s "$WORK/authorized_keys" ] || return 0
@@ -619,11 +797,12 @@ install_gate() {
         same "deploy-gate $GATE_DIGEST"; return 0
     fi
     if [ "$DRY_RUN" = 1 ]; then
-        changed "would pull $ATHENA_REPO@$GATE_DIGEST and install deploy-gate to /opt/athena/bin/"
+        changed "would pull $GATE_REPO@$GATE_DIGEST and install deploy-gate to /opt/athena/bin/"
         return 0
     fi
-    /usr/local/bin/oras pull "$ATHENA_REPO@$GATE_DIGEST" -o "$WORK/gate" >/dev/null ||
-        die "oras pull $ATHENA_REPO@$GATE_DIGEST failed (is the GHCR package public?)"
+    # deploy-gate always comes from Athena's releases, whichever agent this is.
+    /usr/local/bin/oras pull "$GATE_REPO@$GATE_DIGEST" -o "$WORK/gate" >/dev/null ||
+        die "oras pull $GATE_REPO@$GATE_DIGEST failed (is the GHCR package public?)"
     [ -f "$WORK/gate/deploy-gate" ] || die "artifact $GATE_DIGEST has no deploy-gate file"
     install -m 0755 -o root -g root "$WORK/gate/deploy-gate" /opt/athena/bin/deploy-gate
     stamp_set deploy-gate "$GATE_DIGEST"
@@ -634,8 +813,8 @@ enable_services() {
     step "enable services"
     run systemctl daemon-reload
     local target
-    for target in athena@staging.target athena@prod.target athena-serve@staging.service \
-        athena-serve@prod.service; do
+    for target in "$PREFIX@staging.target" "$PREFIX@prod.target" "$PREFIX-serve@staging.service" \
+        "$PREFIX-serve@prod.service"; do
         if systemctl is-enabled --quiet "$target" 2>/dev/null; then same "enabled $target"; else
             run systemctl enable --quiet "$target"
             changed "enabled $target"
@@ -646,21 +825,21 @@ enable_services() {
     # bot on each deploy.
     local env unit
     for env in staging prod; do
-        unit=athena-telegram@$env.service
-        if [ -r "/etc/athena/$env.env" ] && grep -Eq '^TELEGRAM_BOT_TOKEN=.+' "/etc/athena/$env.env"; then
+        unit=$PREFIX-telegram@$env.service
+        if [ -r "$ETC/$env.env" ] && grep -Eq '^TELEGRAM_BOT_TOKEN=.+' "$ETC/$env.env"; then
             if systemctl is-enabled --quiet "$unit" 2>/dev/null; then same "enabled $unit"; else
                 run systemctl enable --quiet "$unit"
                 changed "enabled $unit"
             fi
         elif systemctl is-enabled --quiet "$unit" 2>/dev/null; then
             run systemctl disable --quiet "$unit"
-            changed "disabled $unit (no TELEGRAM_BOT_TOKEN in /etc/athena/$env.env)"
+            changed "disabled $unit (no TELEGRAM_BOT_TOKEN in $ETC/$env.env)"
         else
-            todo "no Telegram bot for $env: put its own token in /etc/athena/$env.env, then re-run setup-host.sh"
+            todo "no Telegram bot for $AGENT $env: put its own token in $ETC/$env.env, then re-run setup-host.sh"
         fi
     done
-    [ -e /opt/athena/staging/current ] ||
-        todo "first deploy: merge to main; CI runs 'deploy staging <digest>' and starts the units"
+    [ -e "$OPT/staging/current" ] ||
+        todo "first deploy: merge to main in $AGENT's repository; CI runs 'deploy staging <digest>' and starts the units"
 
     [ "$SKIP_OBSERVABILITY" = 1 ] && return 0
     if [ "${O2_RESTART:-0}" = 1 ] || ! systemctl is-active --quiet openobserve 2>/dev/null; then
@@ -680,10 +859,73 @@ report_tailscale() {
     else
         todo "this node is tagged ($tags): target those tags in deploy/tailscale-policy.hujson"
     fi
+    [ "$AGENT" = athena ] ||
+        todo "allow tailnet access to $AGENT's ports $PORT_STAGING and $PORT_PROD in your Tailscale policy (setup never changes Tailscale)"
+}
+
+# Other agents than this one with an agent.env.
+other_agents() {
+    local file a
+    for file in /etc/athena/agents/*/agent.env; do
+        [ -f "$file" ] || continue
+        a=$(basename "$(dirname "$file")")
+        [ "$a" = "$AGENT" ] || echo "$a"
+    done
+}
+
+# Remove this agent's lines from deploy's authorized_keys; keep the others.
+remove_our_keys() {
+    local file=/home/deploy/.ssh/authorized_keys existing
+    [ -e "$file" ] || return 0
+    : >"$WORK/kept"
+    while IFS= read -r existing || [ -n "$existing" ]; do
+        is_our_key "$existing" staging || is_our_key "$existing" prod ||
+            printf '%s\n' "$existing" >>"$WORK/kept"
+    done <"$file"
+    if ! cmp -s "$WORK/kept" "$file"; then
+        run install -m 0600 -o deploy -g deploy "$WORK/kept" "$file"
+        changed "removed $AGENT's keys from deploy's authorized_keys"
+    fi
+}
+
+uninstall_agent() {
+    if [ "$PURGE" = 1 ]; then
+        confirm "This deletes agent $AGENT's databases, backups, env files and user for good."
+    else
+        confirm "This stops agent $AGENT and removes its units, releases and deploy keys (its data and env files are kept)."
+    fi
+    local unit
+    for unit in "$PREFIX@staging.target" "$PREFIX@prod.target" "$PREFIX-serve@staging.service" \
+        "$PREFIX-serve@prod.service" "$PREFIX-telegram@staging.service" "$PREFIX-telegram@prod.service"; do
+        run systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    done
+    for unit in "$PREFIX-serve@.service" "$PREFIX-telegram@.service" "$PREFIX@.target"; do
+        if [ -e "/etc/systemd/system/$unit" ]; then run rm -f "/etc/systemd/system/$unit"; changed "removed $unit"; fi
+    done
+    remove_our_keys
+    if [ -d "$OPT" ]; then run rm -rf "$OPT"; changed "removed $OPT"; fi
+    if [ "$PURGE" = 1 ]; then
+        local dir
+        for dir in "$ETC" "$VAR" "$GATE_STATE"; do
+            if [ -d "$dir" ]; then run rm -rf "$dir"; changed "removed $dir"; fi
+        done
+        if id "$AGENT_USER" >/dev/null 2>&1; then run userdel "$AGENT_USER"; changed "removed user $AGENT_USER"; fi
+    else
+        todo "kept $ETC and $VAR; --uninstall --purge deletes them"
+    fi
+    run systemctl daemon-reload
 }
 
 uninstall() {
     step "uninstall"
+    if [ "$AGENT" != athena ]; then
+        uninstall_agent
+        return 0
+    fi
+    local others
+    others=$(other_agents | tr '\n' ' ')
+    [ -z "$others" ] ||
+        die "other agents are set up here ($others); uninstall each with --agent NAME --uninstall first"
     if [ "$PURGE" = 1 ]; then
         confirm "This deletes Athena's databases, backups and /etc/athena secrets for good."
     else
@@ -750,6 +992,7 @@ main() {
         return 0
     fi
     detect_tailnet_ip
+    choose_ports
     check_ports
     ensure_users
     ensure_dirs

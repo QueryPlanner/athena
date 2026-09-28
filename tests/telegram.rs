@@ -6,9 +6,9 @@ mod common;
 #[path = "telegram/fake_api.rs"]
 mod fake_api;
 
-use athena::runner::Run;
-use athena::service::Service;
-use athena::telegram::{self, Log, Telegram};
+use athena_core::runner::Run;
+use athena_core::service::Service;
+use athena_core::telegram::{self, Log, Telegram};
 use common::*;
 use fake_api::{FakeApi, text_from};
 use rig_agent::agent::{Agent, PromptResponse};
@@ -44,7 +44,7 @@ fn app<R: Run + 'static>(
     make: impl FnOnce(&Service) -> R,
 ) -> (Arc<Telegram<R>>, Logged) {
     let store = tmp.open();
-    let service = Service::new(store.clone(), "m", |_| {});
+    let service = Service::new("athena", store.clone(), "m", |_| {});
     let agent = make(&service);
     let logged = Logged::default();
     let sink = logged.clone();

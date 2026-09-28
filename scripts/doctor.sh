@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Check a finished Athena setup end to end. Read-only.
+# Check a finished Athena setup end to end, for one agent. Read-only.
 #
 #   ./scripts/doctor.sh --vm appuser@100.124.202.79
+#   ./scripts/doctor.sh --agent notes --vm appuser@100.124.202.79
 #
 # Prints a human summary on stderr and one JSON object on stdout:
 #   {"ok": bool, "checks": [{"name", "status": pass|warn|fail|skip, "detail"}]}
@@ -12,24 +13,46 @@ set -euo pipefail
 VM=""
 REPO=""
 HOST=""
-PORT_PROD=18080
-PORT_STAGING=18081
+AGENT=athena
+PORT_PROD=""
+PORT_STAGING=""
 PORT_O2=5080
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --agent) AGENT="${2:?}"; shift ;;
         --vm) VM="${2:?}"; shift ;;
         --repo) REPO="${2:?}"; shift ;;
         --host) HOST="${2:?}"; shift ;;
         --port-prod) PORT_PROD="${2:?}"; shift ;;
         --port-staging) PORT_STAGING="${2:?}"; shift ;;
         -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
-            echo "Options: --vm USER@HOST  --repo OWNER/NAME  --host TAILNET-HOST  --port-prod N  --port-staging N"
+            echo "Options: --agent NAME  --vm USER@HOST  --repo OWNER/NAME  --host TAILNET-HOST  --port-prod N  --port-staging N"
             exit 0 ;;
         *) echo "doctor: unknown option: $1" >&2; exit 2 ;;
     esac
     shift
 done
+
+[[ "$AGENT" =~ ^[a-z][a-z0-9]{0,23}$ ]] || { echo "doctor: bad agent name '$AGENT'" >&2; exit 2; }
+# The agent's names and places, as setup-host.sh makes them.
+if [ "$AGENT" = athena ]; then
+    PREFIX=athena ETC=/etc/athena VAR=/var/lib/athena
+else
+    PREFIX=athena-$AGENT ETC=/etc/athena/agents/$AGENT VAR=/var/lib/athena/agents/$AGENT
+fi
+AGENT_USER=$PREFIX
+# Another agent's ports are in its agent.env on the VM.
+if [ "$AGENT" != athena ] && [ -z "$PORT_STAGING$PORT_PROD" ] && [ -n "$VM" ]; then
+    # shellcheck disable=SC2029  # expanded locally on purpose
+    registry=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "$VM" "cat $ETC/agent.env" 2>/dev/null || true)
+    PORT_STAGING=$(sed -n 's/^PORT_STAGING=//p' <<<"$registry")
+    PORT_PROD=$(sed -n 's/^PORT_PROD=//p' <<<"$registry")
+fi
+if [ "$AGENT" = athena ]; then
+    PORT_STAGING=${PORT_STAGING:-18081}
+    PORT_PROD=${PORT_PROD:-18080}
+fi
 
 has() { command -v "$1" >/dev/null 2>&1; }
 js() {
@@ -78,6 +101,7 @@ fi
 http_env() { # env port expected-prefix
     local env=$1 port=$2 want=$3 body version
     if [ -z "$HOST" ]; then check "$env-version" skip "no VM host"; return; fi
+    if [ -z "$port" ]; then check "$env-health" fail "no port for $AGENT $env: no $ETC/agent.env (setup-host.sh --agent $AGENT), or pass --port-$env"; return; fi
     if ! curl -fsS --max-time 5 "http://$HOST:$port/health" >/dev/null 2>&1; then
         check "$env-health" fail "http://$HOST:$port/health did not answer"
         return
@@ -113,36 +137,39 @@ fi
 # ---- the VM, over ssh ----
 # Prints KEY=VALUE lines. Uses sudo only if it needs no password.
 read -r -d '' REMOTE <<'EOF' || true
+PREFIX=$1 ETC=$2 VAR=$3 PORTS=$4
 s() { if sudo -n true 2>/dev/null; then sudo -n "$@"; else return 99; fi; }
 echo "disk_free_mb=$(df -Pm /var/lib/athena 2>/dev/null | awk 'NR==2 {print $4}')"
-for u in athena-serve@staging athena-serve@prod athena-telegram@staging athena-telegram@prod openobserve; do
-    echo "unit_$u=$(systemctl is-active "$u" 2>/dev/null || true)"
+for u in serve@staging serve@prod telegram@staging telegram@prod; do
+    echo "unit_$u=$(systemctl is-active "$PREFIX-$u" 2>/dev/null || true)"
+done
+echo "unit_openobserve=$(systemctl is-active openobserve 2>/dev/null || true)"
+for e in staging prod; do
+    echo "telegram_${e}_enabled=$(systemctl is-enabled "$PREFIX-telegram@$e" 2>/dev/null || true)"
 done
 for e in staging prod; do
-    echo "telegram_${e}_enabled=$(systemctl is-enabled athena-telegram@$e 2>/dev/null || true)"
-done
-for e in staging prod; do
-    echo "env_$e=$(stat -c '%a %U:%G' /etc/athena/$e.env 2>/dev/null || echo missing)"
+    echo "env_$e=$(stat -c '%a %U:%G' "$ETC/$e.env" 2>/dev/null || echo missing)"
     for k in OPENROUTER_API_KEY TELEGRAM_BOT_TOKEN OPEN_SANDBOX_URL OPEN_SANDBOX_API_KEY \
         ATHENA_TELEMETRY_DIR OTEL_EXPORTER_OTLP_ENDPOINT OTEL_EXPORTER_OTLP_HEADERS; do
-        v=$(s grep -c "^$k=..*" /etc/athena/$e.env 2>/dev/null); rc=$?
+        v=$(s grep -c "^$k=..*" "$ETC/$e.env" 2>/dev/null); rc=$?
         [ "$rc" = 99 ] && v=nosudo
         echo "secret_${e}_$k=${v:-0}"
     done
     # Still pointed at the retired collector?
-    v=$(s grep -c "^OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318$" /etc/athena/$e.env 2>/dev/null)
+    v=$(s grep -c "^OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318$" "$ETC/$e.env" 2>/dev/null)
     echo "legacy_otlp_$e=${v:-0}"
-    v=$(s sh -c "ls /var/lib/athena/$e/telemetry/traces-*.jsonl 2>/dev/null | wc -l"); rc=$?
+    v=$(s sh -c "ls $VAR/$e/telemetry/traces-*.jsonl 2>/dev/null | wc -l"); rc=$?
     [ "$rc" = 99 ] && v=nosudo
     echo "telemetry_$e=${v:-0}"
 done
 echo "gate=$( [ -x /opt/athena/bin/deploy-gate ] && echo yes || echo no)"
-echo "listen_public=$(ss -Hltn 2>/dev/null | awk '{print $4}' | grep -E '^(0\.0\.0\.0|\*|\[::\]):(18080|18081|5080)$' | paste -sd, -)"
+echo "listen_public=$(ss -Hltn 2>/dev/null | awk '{print $4}' | grep -E "^(0\.0\.0\.0|\*|\[::\]):($PORTS)\$" | paste -sd, -)"
 EOF
 
 if [ -z "$VM" ]; then
     check vm skip "pass --vm USER@HOST for disk, units, env files and listen checks"
-elif ! out=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "$VM" bash -s <<<"$REMOTE" 2>/dev/null); then
+elif ! out=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "$VM" bash -s -- "$PREFIX" "$ETC" "$VAR" \
+    "${PORT_STAGING:-0}|${PORT_PROD:-0}|$PORT_O2" <<<"$REMOTE" 2>/dev/null); then
     check vm fail "ssh $VM failed"
 else
     get() { sed -n "s/^$1=//p" <<<"$out" | head -n1; }
@@ -151,14 +178,15 @@ else
     elif [ "$disk" -ge 1024 ]; then check disk pass "${disk} MB free under /var/lib/athena"
     else check disk fail "${disk} MB free; deploy-gate refuses deploys under 1 GB"; fi
 
-    for u in athena-serve@staging athena-serve@prod openobserve; do
+    for u in serve@staging serve@prod openobserve; do
         state=$(get "unit_$u")
-        if [ "$state" = active ]; then check "unit $u" pass active
-        else check "unit $u" fail "${state:-unknown}"; fi
+        name=$PREFIX-$u; [ "$u" = openobserve ] && name=openobserve
+        if [ "$state" = active ]; then check "unit $name" pass active
+        else check "unit $name" fail "${state:-unknown}"; fi
     done
     for env in staging prod; do
         if [ "$(get "telegram_${env}_enabled")" = enabled ]; then
-            state=$(get "unit_athena-telegram@$env")
+            state=$(get "unit_telegram@$env")
             if [ "$state" = active ]; then check "telegram $env" pass active
             else check "telegram $env" fail "enabled but ${state:-unknown}"; fi
         else check "telegram $env" pass "no bot for $env"; fi
@@ -169,15 +197,16 @@ else
 
     for e in staging prod; do
         mode=$(get "env_$e")
-        if [ "$mode" = "640 root:athena" ]; then check "$e.env mode" pass "$mode"
-        else check "$e.env mode" fail "${mode:-missing} (want 640 root:athena)"; fi
+        if [ "$mode" = "640 root:$AGENT_USER" ]; then check "$e.env mode" pass "$mode"
+        else check "$e.env mode" fail "${mode:-missing} (want 640 root:$AGENT_USER)"; fi
         k=$(get "secret_${e}_OPENROUTER_API_KEY")
         case "$k" in
-            nosudo) check "$e secrets" skip "reading /etc/athena/$e.env needs sudo with a password; run doctor from a shell where sudo -n works" ;;
-            0) check "$e secrets" fail "OPENROUTER_API_KEY is empty: sudoedit /etc/athena/$e.env" ;;
+            nosudo) check "$e secrets" skip "reading $ETC/$e.env needs sudo with a password; run doctor from a shell where sudo -n works" ;;
+            0) check "$e secrets" fail "OPENROUTER_API_KEY is empty: sudoedit $ETC/$e.env" ;;
             *) check "$e secrets" pass "OPENROUTER_API_KEY present (value not read)" ;;
         esac
-        if [ "$e" = prod ] && [ "$k" != nosudo ]; then
+        # Athena's prod runs a bot; other agents have one only if they want it.
+        if [ "$AGENT" = athena ] && [ "$e" = prod ] && [ "$k" != nosudo ]; then
             if [ "$(get secret_prod_TELEGRAM_BOT_TOKEN)" != 0 ]; then check "prod telegram token" pass present
             else check "prod telegram token" fail "TELEGRAM_BOT_TOKEN is empty in prod.env"; fi
         fi
@@ -190,7 +219,7 @@ else
             if [ "$(get "secret_${e}_ATHENA_TELEMETRY_DIR")" = 0 ]; then
                 check "$e telemetry files" warn "ATHENA_TELEMETRY_DIR is not set: no JSONL for scripts/analytics.sh"
             elif [ "${files:-0}" = 0 ]; then
-                check "$e telemetry files" warn "no traces-*.jsonl in /var/lib/athena/$e/telemetry yet (written once a request is served)"
+                check "$e telemetry files" warn "no traces-*.jsonl in $VAR/$e/telemetry yet (written once a request is served)"
             else
                 check "$e telemetry files" pass "$files daily trace file(s)"
             fi
@@ -207,7 +236,7 @@ else
     done
 
     public=$(get listen_public)
-    if [ -z "$public" ]; then check "listen addresses" pass "no Athena port on 0.0.0.0"
+    if [ -z "$public" ]; then check "listen addresses" pass "no port of $AGENT's on 0.0.0.0"
     else check "listen addresses" fail "listening on all interfaces: $public"; fi
 fi
 

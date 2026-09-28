@@ -231,6 +231,28 @@ and the `release-tags` ruleset lets only repo admins create `v*` tags. (To
 require an approval anyway, run `init-github.sh --reviewer LOGIN`; that needs
 a public repo or GitHub Enterprise.)
 
+## Another agent on the same VM
+
+Athena keeps its layout; every other agent gets its own user, directories,
+units, ports and CI keys (`plans/multi-agent.md`). From the laptop:
+
+1. `athena-cli new NAME`, write the agent, push its repository.
+2. ⏸ **Make its GHCR package public** once its first build pushed it (human
+   only, as in step 8).
+3. Generate its two CI keys (as in step 2, e.g. `~/.config/athena/NAME-ci-staging`),
+   then `athena-cli vm add NAME --vm USER@HOST --ci-staging-pubkey … --ci-prod-pubkey … --dry-run`.
+   Show the dry run and wait for a "yes", then run it without `--dry-run`.
+   It picks the next free ports and prints them.
+4. ⏸ Type the agent's secrets into `/etc/athena/agents/NAME/<env>.env` with
+   `sudoedit` (human only), and allow its two ports in the Tailscale policy.
+5. In the agent's repository: `athena-cli github init --vm-host HOST
+   --staging-key … --prod-key …` (dry run first, as in step 7).
+6. Merge to its `main`, then `athena-cli vm doctor NAME --vm USER@HOST` and
+   `athena-cli vm list --vm USER@HOST`.
+
+`athena-cli vm remove NAME --vm USER@HOST [--purge]` takes it off again and
+leaves every other agent alone.
+
 ## Day two
 
 | Task | How |

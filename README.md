@@ -8,27 +8,33 @@ The same material as a browsable site is in [`docs/`](docs/README.md)
 
 ## Make a new agent
 
-Edit `src/agent.rs`. That is the only file that changes.
+Athena is one agent on a shared runtime, `athena-core`. What makes an agent
+itself is its `AgentSpec`, in `src/agent.rs`:
 
     #[rig_tool(description = "...")]        // add your tools
     fn my_tool(arg: String) -> Result<String, rig::tool::ToolExecutionError> { ... }
 
-    pub const PREAMBLE: &str = "...";       // set the system prompt
-    pub const DEFAULT_MODEL: &str = "...";  // set the model
-
-    pub fn configure_with(builder, sandboxes) -> Agent {
-        builder ... .tool(MyTool) ...       // register them
+    pub fn spec() -> AgentSpec {
+        AgentSpec {
+            sandbox_tools: SandboxTools::Only(&["shell", "read_file"]), // or All, or None
+            tools: |b| b.tool(MyTool),                                  // your own tools
+            ..AgentSpec::new(NAME, env!("CARGO_PKG_VERSION"), PREAMBLE, DEFAULT_MODEL)
+        }
     }
 
-`configure_with` is the agent's whole definition (`configure` is the same
-without sandbox tools). Production wraps it around the
-OpenRouter client; the tests wrap it around Rig's mock model, so they run the
-same preamble and tools you ship. Both give the builder the conversation
-memory first (`builder.memory(service.memory())`), so `configure` never has
-to know where conversations are stored.
+The runtime builds the Rig agent from it for every transport, the evals and
+the tests, which wrap it around Rig's mock model, so they run the same
+preamble and tools you ship. Users, sessions, storage, the turn loop, the
+HTTP API, telemetry and deploys stay in the runtime.
 
-Everything else — users, sessions, storage, the turn loop, the CLI — stays
-as is.
+To make a *separate* agent that runs next to Athena on the same VM:
+
+    cargo install --git https://github.com/QueryPlanner/athena athena-cli
+    athena-cli new notes          # a small repo: src/agent.rs, prompts/, CI, AGENTS.md
+    athena-cli vm add notes --vm USER@HOST --dry-run
+
+The new repo's `README.md` has the rest; `plans/multi-agent.md` has the
+design.
 
 ## Run
 
@@ -263,7 +269,7 @@ Caddy or Tailscale settings, and never overwrites a file holding secrets.
 
 ## Test
 
-    ./scripts/coverage.sh                     # all tests + 100% line coverage
+    ./scripts/coverage.sh                     # all tests + 100% line coverage, every crate
     ./scripts/e2e.sh                          # live, against OpenRouter
 
 [TESTING.md](TESTING.md) covers the three test layers, the rules for schema
@@ -667,6 +673,8 @@ log events never include prompt or reply text.
   refuses foreign `Host` headers, but every local process is still trusted. Authentication
   replaces `Caller` in `src/http.rs`; until then, put an authenticating
   proxy in front before listening anywhere else.
+- Agents on one VM share the OpenSandbox server (and its API key) and
+  OpenObserve. Each has its own user, data, units and CI keys.
 - Every distinct `X-Athena-User` value creates a `users` row, even for a
   read. There is no rate limit or cap beyond the 256-byte header limit.
 - A crash mid-turn loses that turn, and so does a second Ctrl-C while
