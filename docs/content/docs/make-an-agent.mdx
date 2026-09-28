@@ -1,34 +1,50 @@
 ---
 title: Make an agent
-description: Tools, system prompt and model all live in src/agent.rs.
----
-
-Edit `src/agent.rs`. That is the only file that changes.
+description: An agent is an AgentSpec in src/agent.rs; athena-cli makes a nAn agent is its `AgentSpec`, in `src/agent.rs`. Everything else is the
+shared runtime, `athena-core`.
 
 ```rust
 #[rig_tool(description = "...")]        // add your tools
 fn my_tool(arg: String) -> Result<String, rig::tool::ToolExecutionError> { ... }
 
-pub const PREAMBLE: &str = "...";       // set the system prompt
-pub const DEFAULT_MODEL: &str = "...";  // set the model
-
-pub fn configure(builder: AgentBuilder) -> Agent {
-    builder ... .tool(MyTool) ...       // register them
+pub fn spec() -> AgentSpec {
+    AgentSpec {
+        sandbox_tools: SandboxTools::Only(&["shell", "read_file"]), // or All, or None
+        tools: |b| b.tool(MyTool),                                  // your own tools
+        ..AgentSpec::new(NAME, env!("CARGO_PKG_VERSION"), PREAMBLE, DEFAULT_MODEL)
+    }
 }
 ```
 
-The template ships one host tool, `add`, plus sandbox and browser tools when
+Athena ships one host tool, `add`, plus the sandbox and browser tools when
 `OPEN_SANDBOX_URL` is set (see the README), and the default model
 `openai/gpt-5.6-luna`. `AGENT_MODEL` overrides the model at runtime.
+`AgentSpec` also sets `max_turns` and the tool-call `policy`.
 
-## Why `configure` is the whole definition
+## Why the spec is the whole definition
 
-Production wraps `configure` around the OpenRouter client. The tests wrap it
-around Rig's mock model, so they run the same preamble and tools you ship.
+Production builds the spec around the OpenRouter client. The tests build it
+around Rig's mock model (`spec.configure(builder)`), so they run the same
+preamble and tools you ship.
 
 Both give the builder the conversation memory first
-(`builder.memory(service.memory())`), so `configure` never has to know where
+(`builder.memory(service.memory())`), so the spec never has to know where
 conversations are stored.
+
+## A second agent on the same VM
+
+```bash
+cargo install --git https://github.com/QueryPlanner/athena athena-cli
+athena-cli new notes
+athena-cli vm add notes --vm USER@HOST --dry-run
+```
+
+`new` writes a small repository: `src/agent.rs`, `prompts/system.md`, tests,
+CI/CD, `AGENTS.md` and a skill, so a coding agent can change it. `vm add`
+gives it its own user, directories, ports and CI keys next to Athena's
+(`SETUP.md`, "Another agent on the same VM").
+
+are stored.
 
 <Callout type="warn">
   Tools you add with `#[rig_tool]` run on the machine that runs athena, and

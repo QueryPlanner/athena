@@ -4,6 +4,10 @@ This file is read by Codex, Gemini CLI, Claude Code and other agents.
 
 ## Setting up production
 
+Several agents can share one VM. `setup-host.sh --agent NAME` (or
+`athena-cli vm add NAME`) sets one up next to the others; the same rules below
+apply to every run of it.
+
 If you are asked to deploy or set up Athena on a VM, follow
 [`SETUP.md`](SETUP.md) exactly:
 
@@ -18,8 +22,10 @@ If you are asked to deploy or set up Athena on a VM, follow
 
 ## Changing code
 
-- Edit `src/agent.rs` to change the agent (README, "Make a new agent").
-- Before a PR: `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`,
+- Edit `src/agent.rs` to change the Athena agent (README, "Make a new agent").
+  The runtime every agent shares is `crates/athena-core`; the scaffolder for new
+  agents is `crates/athena-cli` (its template is `crates/athena-cli/templates/agent`).
+- Before a PR: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
   `./scripts/coverage.sh` (100% line coverage, no exclusions). See `TESTING.md`.
 - Shell scripts must pass `shellcheck scripts/*.sh`; workflows must pass `actionlint`.
 - Names, paths, ports and protocols shared between components are in

@@ -1,6 +1,6 @@
 # CI/CD for Athena. See plans/contracts.md ("CI/CD") and SETUP.md.
 #
-#   pull_request   shellcheck + infra checks, unit, integration
+#   pull_request   shellcheck + infra checks, unit, integration, scaffold
 #   push main      build (release artifact to GHCR, sandbox image)
 #                  -> deploy-staging -> bench-staging -> smoke-staging, eval-staging
 #   push tag v*    require-stage-success -> deploy-prod -> smoke-prod
@@ -69,6 +69,46 @@ jobs:
             echo "::error::setup-host accepted a malformed digest"; exit 1
           fi
           "$GITHUB_WORKSPACE/scripts/setup-host.sh" --dry-run --uninstall --purge
+      - name: setup-host.sh --agent (a second agent) --dry-run
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/scripts/setup-host.sh" --dry-run --agent notes --tailnet-ip 100.64.0.1 \
+            --ci-staging-pubkey staging.pub --ci-prod-pubkey prod.pub 2>agent.txt | tee agent-summary.txt
+          # Its own tree, user, units and the first free ports; nothing of Athena's.
+          grep -q 'chose ports 18082 (staging) and 18083 (prod)' agent-summary.txt
+          grep -q 'would create /etc/athena/agents/notes/prod.env (0640 root:athena-notes)' agent-summary.txt
+          grep -q 'would write /etc/systemd/system/athena-notes-serve@.service' agent-summary.txt
+          grep -q 'would write /etc/athena/agents/notes/agent.env' agent-summary.txt
+          grep -q 'ATHENA_DB=/var/lib/athena/agents/notes/prod/agent.db' agent.txt
+          grep -q 'OTEL_SERVICE_NAME=notes' agent.txt
+          if grep -Eq '/etc/athena/(staging|prod)\.env|athena-serve@' agent-summary.txt; then
+            echo "::error::setting up another agent would touch Athena's files"; exit 1
+          fi
+          if "$GITHUB_WORKSPACE/scripts/setup-host.sh" --dry-run --agent Bad-Name; then
+            echo "::error::setup-host accepted a bad agent name"; exit 1
+          fi
+      - name: Athena's units render exactly as before there were agents
+        run: |
+          set -euo pipefail
+          render() {
+            local content; content=$(cat "$1"); shift
+            while [ $# -gt 1 ]; do content=${content//@$1@/"$2"}; shift 2; done
+            printf '%s\n' "$content"
+          }
+          cd "$RUNNER_TEMP"
+          for unit in athena-serve@.service athena-telegram@.service athena@.target; do
+            render "$GITHUB_WORKSPACE/deploy/systemd/$unit.in" PREFIX athena USER athena TITLE Athena \
+              ETC /etc/athena VAR /var/lib/athena OPT /opt/athena >"$unit"
+          done
+          # sha256 of the unit files installed on the VM before agents existed.
+          # A change here restarts nothing by itself, but setup-host.sh would
+          # rewrite Athena's units: make that a deliberate edit of these sums.
+          sha256sum -c - <<'SUMS'
+          ea7df30d895ac8683bbd80b020a20224274a779e4d1234dc875fe70850f7252c  athena-serve@.service
+          3d574796ee8c1ca67e9570fd3ebf278ba3db8ed84840f32ad4f98daea48046b7  athena-telegram@.service
+          79b545d1d30edc093368a78e51941e8c837e0723d111b8ff939503b3378ca74a  athena@.target
+          SUMS
       - name: Analytics queries against fixtures
         env:
           DUCKDB_VERSION: 1.5.5
@@ -100,9 +140,9 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - name: Format
-        run: cargo fmt --check
+        run: cargo fmt --all --check
       - name: Lint
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests and 100% line coverage
         run: ./scripts/coverage.sh
       - name: Evals against recorded cassettes (no model calls)
@@ -126,6 +166,39 @@ jobs:
         run: cargo build --release --locked
       - name: Smoke-test the real binary
         run: ./scripts/smoke-binary.sh target/release/athena
+
+  # A new agent, as `athena-cli new` writes it, builds, lints and passes its
+  # own tests against this commit's athena-core.
+  scaffold:
+    if: github.event_name == 'pull_request'
+    needs: unit
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: athena-cli new scratch
+        run: |
+          set -euo pipefail
+          cargo run --locked --quiet -p athena-cli -- new scratch --no-git \
+            --dir "$RUNNER_TEMP/scratch" --core-path "$GITHUB_WORKSPACE/crates/athena-core"
+      - name: The new agent's own checks
+        working-directory: ${{ runner.temp }}/scratch
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          set -euo pipefail
+          cargo fmt --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
+          cargo run --locked --quiet -- --version
 
   # --------------------------------------------------------- CD: main ----
   build:

@@ -12,8 +12,8 @@ anything that touches the agent loop, storage or a transport.
 ## Before opening a PR
 
 ```
-cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ./scripts/coverage.sh
 ```
 

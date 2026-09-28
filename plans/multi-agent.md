@@ -1,6 +1,6 @@
 # Many agents on one VM, and `athena-cli` to make them
 
-Status: in progress (one PR, by the owner's choice).
+Status: built (one PR, by the owner's choice).
 
 ## Goal
 
@@ -77,8 +77,9 @@ Every other agent:
   `restrict,command="sudo /opt/athena/bin/deploy-gate --agent <a> --key-env <env>" … ci-<a>-<env>`.
   No `--agent` means `athena`. Any other agent must have an `agent.env`. So a
   key reaches one agent and one env. CI's commands do not change.
-- One lock per agent; `install-gate` takes every lock's parent, the old global
-  `/var/lib/athena/.gate.lock`, which Athena's deploys also take.
+- One lock per agent. `install-gate` runs as Athena and takes Athena's lock,
+  `/var/lib/athena/.gate.lock`; the binary is replaced by a rename, so another
+  agent's gate already running keeps its old copy.
 - `/health` returns the agent name; when present, the gate checks it matches.
 - Admin commands: `restore [--agent <a>] <env> <file>`, `install-gate
   <digest>`, `list` (every agent with its ports and state).
@@ -96,7 +97,8 @@ Every other agent:
   is refused), and enabling its units. Without `--port-*`, a new agent gets the
   next free pair from 18082 up, skipping every registered agent's ports,
   Athena's, and anything listening.
-- `doctor.sh`, `preflight.sh`, `analytics.sh`: take `--agent`.
+- `doctor.sh`, `analytics.sh`: take `--agent`. `preflight.sh` inspects the host
+  before any agent exists and is unchanged.
 - `init-github.sh`: already takes `--repo`; unchanged.
 
 ## 5. `athena-cli`

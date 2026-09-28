@@ -6,12 +6,31 @@ in the same PR and telling the integrator. The design rationale is in
 
 ## Binaries
 
-Both binaries live in one crate.
+A Cargo workspace (`plans/multi-agent.md`):
 
-| Binary | Source | Notes |
-|---|---|---|
-| `athena` | `src/main.rs` | existing |
-| `deploy-gate` | `src/bin/deploy-gate.rs` + `src/gate/` (lib module `athena::gate`) | the only program CI can run on the VM |
+| Binary | Package | Source | Notes |
+|---|---|---|---|
+| `athena` | `athena` (root) | `src/main.rs` + `src/agent.rs` | the Athena agent: `athena_core::app::main(agent::spec())` |
+| `deploy-gate` | `athena` (root) | `src/bin/deploy-gate.rs` + `athena_core::gate` | the only program CI can run on the VM; one install serves every agent |
+| `athena-cli` | `athena-cli` | `crates/athena-cli` | runs on the laptop: `new`, `vm add/remove/doctor/list`, `github init` |
+
+`athena-core` (`crates/athena-core`) is the runtime every agent links. Every
+agent's release artifact holds a binary named `athena`, whatever the agent is
+called.
+
+## Agent runtime contract
+
+deploy-gate runs these in a release, whichever agent and whichever
+`athena-core` revision it was built from. Changing one is a breaking change for
+every agent pinned to an older core:
+
+- `athena --version` exits 0;
+- `athena backup <dest>`, `athena bench --url <base>`, `athena eval run
+  --target <url> --cases <dir>`;
+- `athena serve` answers `GET /health` with 200 and `{"status":"ok","agent":"<name>"}`
+  (`agent` may be missing in releases from before agents had names; when it
+  is present the gate checks it) and `GET /version` with `{"version": ...}`;
+- `current/evals/` is read if it exists.
 
 ## `athena` CLI additions
 
@@ -47,12 +66,13 @@ Rules for `serve` and `telegram`:
 | `OTEL_EXPORTER_OTLP_HEADERS` | all | `Authorization=Basic%20<base64 of OpenObserve root email:password>`, written by `setup-host.sh` into the env file only |
 | `ATHENA_TELEMETRY_DIR` | all | e.g. `/var/lib/athena/<env>/telemetry`: daily `traces-<role>-YYYYMMDD.jsonl` and `logs-<role>-YYYYMMDD.jsonl`, `<role>` being the process (`serve`, `telegram`, `cli`), so every file has one writer. **Unset means no files.** With neither this nor the endpoint, telemetry is off and logs go to stderr only. |
 | `ATHENA_TELEMETRY_RETENTION_DAYS` | all | default `30`; files of older days are deleted |
-| `OTEL_SERVICE_NAME` | all | default `athena` |
+| `OTEL_SERVICE_NAME` | all | default `athena`; `setup-host.sh` writes the agent's name |
 
 ## HTTP
 
 `GET /version` returns `{"version": "<ATHENA_VERSION or pkg-dev>"}`. Like `/health`,
-it needs no user header. Every other endpoint is unchanged.
+it needs no user header. `GET /health` returns `{"status": "ok", "agent": "<name>"}`.
+Every other endpoint is unchanged.
 
 ## Release artifact (GHCR via ORAS)
 
@@ -80,6 +100,9 @@ The sandbox image is a separate Docker image:
 
 ## VM layout
 
+Athena keeps the layout below. Every other agent `<a>` has the same files
+under its own tree (see "Other agents").
+
 | Path | Owner / mode | Contents |
 |---|---|---|
 | `/opt/athena/bin/deploy-gate` | root, 0755 | installed by `setup-host.sh` from a pinned artifact digest |
@@ -92,6 +115,22 @@ The sandbox image is a separate Docker image:
 | `/var/lib/athena/gate/<env>.state.json` | root, 0644 (dir root 0755) | written by deploy-gate, outside the athena-writable `<env>/` dir because `promote` trusts it: `{"digest":..., "version":..., "deployed_at":...}` |
 | `/var/lib/athena/<env>/telemetry/{traces,logs}-<role>-YYYYMMDD.jsonl` | athena, dir 0750, files 0640 | Athena's own export (`ATHENA_TELEMETRY_DIR`), one file per signal per process role (`serve`, `telegram`, `cli`) per UTC day, pruned after `ATHENA_TELEMETRY_RETENTION_DAYS` |
 | `/var/lib/openobserve/` | openobserve | OpenObserve data |
+
+**Other agents** (`<a>` matches `^[a-z][a-z0-9]{0,23}$` and is not `athena`)
+
+| Path | Owner / mode | Contents |
+|---|---|---|
+| `/etc/athena/agents/<a>/agent.env` | root, 0644 | `ATHENA_REPO`, `PORT_STAGING`, `PORT_PROD`. The agent exists for the gate only if this does |
+| `/etc/athena/agents/<a>/<env>.env` | root:athena-<a>, 0640 | as Athena's |
+| `/opt/athena/agents/<a>/releases/<digest-hex>/athena` | root | its release cache |
+| `/opt/athena/agents/<a>/<env>/current` | root | symlink |
+| `/var/lib/athena/agents/<a>/<env>/{agent.db,backups,telemetry}` | athena-<a> | its data |
+| `/var/lib/athena/gate/<a>/<env>.state.json`, `/var/lib/athena/gate/<a>/.lock` | root | its gate state and lock |
+
+User `athena-<a>`; units `athena-<a>-serve@<env>.service`,
+`athena-<a>-telegram@<env>.service`, `athena-<a>@<env>.target`, rendered
+from `deploy/systemd/*.in`. Ports: the first free pair from 18082
+(staging, then prod) unless `setup-host.sh --port-*` says otherwise.
 
 **Users**
 - `athena` (system user) runs the services.
@@ -107,9 +146,14 @@ The sandbox image is a separate Docker image:
 |---|---|
 | prod serve | 18080 |
 | staging serve | 18081 |
+| other agents | from 18082, two each, recorded in `agent.env` |
 | OpenObserve UI/API and OTLP/HTTP ingest | 5080 (one address: `ZO_HTTP_ADDR` takes a single IP) |
 
 ## systemd
+
+The unit files are templates (`deploy/systemd/*.in`: `@PREFIX@`, `@USER@`,
+`@TITLE@`, `@ETC@`, `@VAR@`, `@OPT@`). Rendered for Athena they are
+byte-identical to the files below; CI checks their sha256.
 
 - `athena-serve@.service`, where `%i` is `staging` or `prod`:
   - `User=athena`, `EnvironmentFile=/etc/athena/%i.env`;
@@ -129,12 +173,19 @@ The sandbox image is a separate Docker image:
 
 ## `deploy-gate` protocol
 
-**Invocation.** `authorized_keys` for `deploy` holds one key per env:
+**Invocation.** `authorized_keys` for `deploy` holds one key per agent per
+env. Athena's have no `--agent`; any other agent's name it. A key appears on
+one line only (`setup-host.sh` refuses a reused key):
 
 ```
 restrict,command="sudo /opt/athena/bin/deploy-gate --key-env staging" ssh-ed25519 AAAA... ci-staging
 restrict,command="sudo /opt/athena/bin/deploy-gate --key-env prod" ssh-ed25519 AAAA... ci-prod
+restrict,command="sudo /opt/athena/bin/deploy-gate --agent notes --key-env staging" ssh-ed25519 AAAA... ci-notes-staging
 ```
+
+`--agent <a>` scopes every path, unit, user, lock and the release repository
+(`agent.env`'s `ATHENA_REPO`) to that agent. An agent other than Athena without
+an `agent.env` is rejected (exit 2) before any side effect.
 
 The command comes from `SSH_ORIGINAL_COMMAND`, split on whitespace (no shell). It
 must be exactly one of:
@@ -143,7 +194,7 @@ must be exactly one of:
 |---|---|
 | staging | `deploy staging <digest>`, `smoke staging`, `bench staging`, `eval staging`, `status staging` |
 | prod | `promote prod <digest>`, `smoke prod`, `status prod` |
-| admin (run locally as root, no `--key-env`) | `restore <env> <backup-file>`, `install-gate <digest>` |
+| admin (run locally as root, no `--key-env`) | `[--agent <a>] restore <env> <backup-file>`, `install-gate <digest>`, `list` |
 
 **Validation.** `<digest>` must match `^sha256:[0-9a-f]{64}$`. Anything else exits 2
 with `rejected: ...` on stderr before any side effect.
@@ -180,6 +231,7 @@ On a failed health check it puts the previous `current` back, restarts, and exit
 | `bench staging` | runs `<current>/athena bench --url http://<addr> …` with default thresholds |
 | `eval staging` | runs `<current>/athena eval run --target http://<addr> --cases /opt/athena/staging/current/evals` if present. Advisory: prints results and always exits 0 unless the run itself errors. |
 | `status <env>` | prints `state.json` |
+| `list` | every agent (Athena if its env files exist, then each with an `agent.env`, by name): user, each env's `ATHENA_ADDR` and `state.json` |
 
 **Output.** Human-readable lines on stderr, and one final JSON line on stdout.
 
@@ -195,9 +247,12 @@ On a failed health check it puts the previous `current` back, restarts, and exit
 | `VM_KNOWN_HOSTS` | variable | the VM's host key line |
 
 **Jobs**
-- **pull_request:** `unit` (fmt, clippy, coverage.sh, `athena eval run --target
-  replay`), then `integration` (release build plus a tests-style smoke run of the real
-  binary; no model calls).
+- **pull_request:** `unit` (fmt, clippy, coverage.sh over the whole workspace,
+  `athena eval run --target replay`), then `integration` (release build plus a
+  tests-style smoke run of the real binary; no model calls) and `scaffold`
+  (`athena-cli new scratch` against this commit's core, then the new agent's
+  fmt, clippy and tests). `infra-checks` also dry-runs `setup-host.sh --agent
+  notes` and checks Athena's rendered units against their sha256.
 - **push to main:** `build` (release build, `oras push` tag `sha-<sha>`, sandbox image
   build and push), then `deploy-staging` (environment `staging`), then
   `bench-staging`, then `smoke-staging` + `eval-staging` (advisory).
