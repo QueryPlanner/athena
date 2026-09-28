@@ -180,10 +180,17 @@ everything else works as before.
 
 **The image** is `deploy/sandbox-image/Dockerfile`: Debian 13 slim, Chromium,
 a pinned and checksummed agent-browser release, Python with a Jupyter server,
-git and curl. Build it on (or for) the sandbox host:
+and everyday tools: ffmpeg and yt-dlp; git, curl, wget, jq, ripgrep, fd,
+file, tree, zip, unzip and xz; dig, ssh and rsync; and the Python libraries
+requests, pandas, pillow and beautifulsoup4 (pinned in the Dockerfile).
+Build it on (or for) the sandbox host, then check every tool runs:
 
     docker build -t athena-sandbox:dev deploy/sandbox-image
+    scripts/sandbox-image-check.sh athena-sandbox:dev
     ATHENA_SANDBOX_IMAGE=athena-sandbox:dev
+
+CI runs the same check on every PR, and on `main` before pushing the image.
+A tool added to the Dockerfile belongs in the check's list too.
 
 To upgrade agent-browser, change `AGENT_BROWSER_VERSION` and both
 `AGENT_BROWSER_SHA256_*` digests together.

@@ -2,8 +2,9 @@
 #
 # OpenSandbox injects its own execd into every sandbox, so this image only
 # carries the tools: Chromium and a pinned agent-browser for the browser
-# tools, Python with a Jupyter server for run_code, and the usual CLI
-# tools for shell. Build (x86_64 or arm64, matching the sandbox host):
+# tools, Python with a Jupyter server for run_code, and everyday CLI
+# tools and Python libraries for shell (scripts/sandbox-image-check.sh
+# lists them). Build (x86_64 or arm64, matching the sandbox host):
 #
 #   docker build -t athena-sandbox:dev deploy/sandbox-image
 #
@@ -31,7 +32,20 @@ RUN set -eux; \
       python3 \
       python3-pip \
       python3-venv \
-      tini; \
+      tini \
+      ffmpeg \
+      fd-find \
+      file \
+      jq \
+      ripgrep \
+      tree \
+      unzip \
+      xz-utils \
+      zip \
+      dnsutils \
+      openssh-client \
+      rsync \
+      wget; \
     rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
@@ -53,6 +67,19 @@ RUN set -eux; \
     python3 -m venv /opt/jupyter; \
     /opt/jupyter/bin/pip install --no-cache-dir jupyter-server==2.21.1 ipykernel==7.3.0
 ENV PATH=/opt/jupyter/bin:$PATH
+
+# Everyday Python tools and libraries, in the same venv so both the shell
+# and run_code see them. Pinned: a rebuild should not pick up new versions.
+# yt-dlp breaks as sites change; bump it deliberately.
+RUN /opt/jupyter/bin/pip install --no-cache-dir \
+      yt-dlp==2026.8.19 \
+      requests==2.34.2 \
+      pandas==3.0.6 \
+      pillow==12.3.0 \
+      beautifulsoup4==4.15.0
+
+# Debian ships fd as fdfind; give it its usual name.
+RUN ln -s /usr/bin/fdfind /usr/local/bin/fd
 
 # agent-browser uses the system Chromium. Sandboxes run as root, which
 # Chromium only allows with --no-sandbox; the OpenSandbox container is the
