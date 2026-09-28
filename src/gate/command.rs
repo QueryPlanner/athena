@@ -5,6 +5,7 @@
 //! split on whitespace (there is no shell) and must match one whitelisted
 //! command for the key that sent it, word for word.
 
+use super::settings::{self, Setting};
 use std::fmt;
 
 /// A deployment environment. Each SSH key is bound to one.
@@ -68,14 +69,25 @@ pub fn is_hex64(s: &str) -> bool {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
-    Deploy { digest: Digest },
-    Promote { digest: Digest },
+    Deploy {
+        digest: Digest,
+        settings: Vec<Setting>,
+    },
+    Promote {
+        digest: Digest,
+        settings: Vec<Setting>,
+    },
     Smoke(Env),
     Bench,
     Eval,
     Status(Env),
-    Restore { env: Env, file: String },
-    InstallGate { digest: Digest },
+    Restore {
+        env: Env,
+        file: String,
+    },
+    InstallGate {
+        digest: Digest,
+    },
 }
 
 impl Command {
@@ -99,8 +111,9 @@ pub enum Parsed {
     Run(Command),
 }
 
-/// Longer than any allowed command; anything past it is refused unread.
-pub const MAX_COMMAND_LEN: usize = 256;
+/// Longer than any allowed command, settings included; anything past it
+/// is refused unread.
+pub const MAX_COMMAND_LEN: usize = 1024;
 
 const USAGE: &str = "usage: deploy-gate --key-env <staging|prod> (command in SSH_ORIGINAL_COMMAND), \
                      deploy-gate restore <staging|prod> <backup-file>, \
@@ -133,15 +146,17 @@ pub fn parse(args: &[String], ssh_command: Option<&str>) -> Result<Parsed, Strin
 fn keyed(key: Env, words: &[&str]) -> Result<Command, String> {
     use Env::{Prod, Staging};
     let command = match (key, words) {
-        (Staging, ["deploy", "staging", digest]) => Command::Deploy {
+        (Staging, ["deploy", "staging", digest, rest @ ..]) => Command::Deploy {
             digest: parse_digest(digest)?,
+            settings: settings::parse(rest)?,
         },
         (Staging, ["smoke", "staging"]) => Command::Smoke(Staging),
         (Staging, ["bench", "staging"]) => Command::Bench,
         (Staging, ["eval", "staging"]) => Command::Eval,
         (Staging, ["status", "staging"]) => Command::Status(Staging),
-        (Prod, ["promote", "prod", digest]) => Command::Promote {
+        (Prod, ["promote", "prod", digest, rest @ ..]) => Command::Promote {
             digest: parse_digest(digest)?,
+            settings: settings::parse(rest)?,
         },
         (Prod, ["smoke", "prod"]) => Command::Smoke(Prod),
         (Prod, ["status", "prod"]) => Command::Status(Prod),
@@ -216,7 +231,10 @@ mod tests {
         let staging = [
             (
                 format!("deploy staging {}", digest()),
-                Command::Deploy { digest: d.clone() },
+                Command::Deploy {
+                    digest: d.clone(),
+                    settings: vec![],
+                },
             ),
             ("smoke staging".into(), Command::Smoke(Env::Staging)),
             ("bench staging".into(), Command::Bench),
@@ -229,7 +247,10 @@ mod tests {
         let prod = [
             (
                 format!("promote prod {}", digest()),
-                Command::Promote { digest: d },
+                Command::Promote {
+                    digest: d,
+                    settings: vec![],
+                },
             ),
             ("smoke prod".into(), Command::Smoke(Env::Prod)),
             ("status prod".into(), Command::Status(Env::Prod)),
@@ -407,11 +428,69 @@ mod tests {
     }
 
     #[test]
+    fn deploy_and_promote_carry_checked_settings() {
+        let d = Digest::parse(&digest()).unwrap();
+        let url = "OPEN_SANDBOX_URL=http://100.118.54.67:9090";
+        let setting = Setting {
+            key: "OPEN_SANDBOX_URL",
+            value: "http://100.118.54.67:9090".into(),
+        };
+        assert_eq!(
+            key("staging", &format!("deploy staging {} {url}", digest())),
+            run(Command::Deploy {
+                digest: d.clone(),
+                settings: vec![setting.clone()],
+            })
+        );
+        assert_eq!(
+            key("prod", &format!("promote prod {} {url}", digest())),
+            run(Command::Promote {
+                digest: d,
+                settings: vec![setting],
+            })
+        );
+        let err = key(
+            "staging",
+            &format!("deploy staging {} LD_PRELOAD=/x", digest()),
+        )
+        .unwrap_err();
+        assert!(err.contains("is not a setting CI may change"), "{err}");
+        // A bad digest is reported before any setting is looked at.
+        let err = key("prod", "promote prod nope LD_PRELOAD=/x").unwrap_err();
+        assert!(err.contains("is not a digest"), "{err}");
+        // Only deploy and promote take settings.
+        let err = key("staging", "status staging AGENT_MODEL=x").unwrap_err();
+        assert!(err.contains("not allowed for the staging key"), "{err}");
+    }
+
+    #[test]
+    fn the_longest_valid_deploy_line_fits() {
+        let value = |prefix: &str, fill: usize| format!("{prefix}{}", "a".repeat(fill));
+        let max = settings::MAX_VALUE_LEN;
+        let line = format!(
+            "promote prod {} OPEN_SANDBOX_URL={} ATHENA_SANDBOX_IMAGE={} ATHENA_SANDBOX_TIMEOUT_SECS={} AGENT_MODEL={}",
+            digest(),
+            value("http://", max - "http://".len()),
+            value("", max),
+            "9".repeat(19),
+            value("", max),
+        );
+        assert!(line.len() <= MAX_COMMAND_LEN, "{} bytes", line.len());
+        assert!(key("prod", &line).is_ok());
+    }
+
+    #[test]
     fn commands_have_names_and_envs_display_as_words() {
         let d = Digest::parse(&digest()).unwrap();
         let names: Vec<&str> = [
-            Command::Deploy { digest: d.clone() },
-            Command::Promote { digest: d.clone() },
+            Command::Deploy {
+                digest: d.clone(),
+                settings: vec![],
+            },
+            Command::Promote {
+                digest: d.clone(),
+                settings: vec![],
+            },
             Command::Smoke(Env::Prod),
             Command::Bench,
             Command::Eval,

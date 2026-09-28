@@ -30,8 +30,8 @@ accepts it only if it matches one of these, word for word:
 
 | Key | Commands |
 |---|---|
-| staging | `deploy staging <digest>`, `smoke staging`, `bench staging`, `eval staging`, `status staging` |
-| prod | `promote prod <digest>`, `smoke prod`, `status prod` |
+| staging | `deploy staging <digest> [KEY=VALUE ...]`, `smoke staging`, `bench staging`, `eval staging`, `status staging` |
+| prod | `promote prod <digest> [KEY=VALUE ...]`, `smoke prod`, `status prod` |
 
 `<digest>` must be `sha256:` followed by 64 lowercase hex digits. Anything
 else, including extra words, shell syntax or the other environment's
@@ -83,7 +83,10 @@ Progress lines go to stderr. The last thing on stdout is one JSON line:
    fails, the old release is started again and nothing else changes.
 8. Points `/opt/athena/staging/current` at the new release (a new symlink,
    renamed over the old one).
-9. Sets `ATHENA_VERSION` in the env file, keeping the file's mode and owner.
+9. Sets the deploy's settings (the optional `KEY=VALUE` words, see
+   "Settings" in `plans/contracts.md`) and `ATHENA_VERSION` in the env file
+   in one rename, keeping the file's mode and owner and every other line.
+   Each changed setting is logged as `setting KEY: old -> new`.
 10. Starts `athena-serve@staging`, then polls `/health` and `/version` once a
     second for up to 60 s. `/version` must report the new version.
 11. Starts `athena-telegram@staging` if `systemctl is-enabled` says it is
@@ -93,12 +96,13 @@ Progress lines go to stderr. The last thing on stdout is one JSON line:
     the `ATHENA_KEEP_RELEASES` most recently used releases. A release that
     staging or prod points at is never removed.
 
-If step 8, 9, 10 or 11 fails, the gate stops the units, points `current`
-back at the previous release, restores its `ATHENA_VERSION`, starts it,
+If step 8, 9, 10 or 11 fails, the gate puts the env file back exactly as it
+was, stops the units, points `current` back at the previous release,
+restores its `ATHENA_VERSION`, starts it,
 waits for it to be healthy, and exits 1. If the new release had already
 migrated the database, the old binary may refuse it: restore the backup
 from step 7. On a first deploy there is nothing to roll back to, so the
-units are left stopped.
+env file is restored and the units are left stopped.
 
 `promote prod <digest>` does the same for prod, and first refuses (exit 2)
 unless `<digest>` is the digest in staging's `state.json`. The release is

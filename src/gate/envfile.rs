@@ -75,21 +75,19 @@ fn assigns(line: &str, key: &str) -> bool {
         .is_some_and(|rest| rest.trim_start().starts_with('='))
 }
 
-/// Set `key` in the file at `path`, keeping its mode and owner (the env
-/// files are `root:athena 0640` and hold secrets). Returns the old value.
-pub fn set_var(path: &Path, key: &str, value: &str) -> Result<Option<String>> {
-    let what = || format!("updating {}", path.display());
-    let text = fs::read_to_string(path).context(what())?;
-    let meta = fs::metadata(path).context(what())?;
-    let old = get(&parse(&text), key).map(str::to_string);
+/// `text` with every pair set, in order, as [`with_var`] sets one.
+pub fn with_vars(text: &str, pairs: &[(&str, &str)]) -> String {
+    pairs.iter().fold(text.to_string(), |text, (key, value)| {
+        with_var(&text, key, value)
+    })
+}
+
+/// Replace the file at `path` with `text` in one rename, keeping its mode
+/// and owner.
+pub fn replace(path: &Path, text: &str) -> Result<()> {
+    let meta = fs::metadata(path).context(format!("updating {}", path.display()))?;
     let owner = Some((meta.uid(), meta.gid()));
-    write_atomic(
-        path,
-        with_var(&text, key, value).as_bytes(),
-        meta.mode() & 0o7777,
-        owner,
-    )?;
-    Ok(old)
+    write_atomic(path, text.as_bytes(), meta.mode() & 0o7777, owner)
 }
 
 #[cfg(test)]
@@ -139,33 +137,33 @@ mod tests {
     }
 
     #[test]
-    fn set_var_keeps_the_files_mode_and_returns_the_old_value() {
-        let tmp = TempRoot::new();
-        let path = tmp.path().join("staging.env");
-        fs::write(&path, "SECRET=s\nATHENA_VERSION=old\n").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+    fn with_vars_sets_each_pair_in_order() {
+        assert_eq!(
+            with_vars("A=1\nB=2\n", &[("B", "3"), ("C", "4"), ("C", "5")]),
+            "A=1\nB=3\nC=5\n"
+        );
+        assert_eq!(with_vars("A=1\n", &[]), "A=1\n");
+    }
 
-        assert_eq!(
-            set_var(&path, "ATHENA_VERSION", "new").unwrap(),
-            Some("old".into())
-        );
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            "SECRET=s\nATHENA_VERSION=new\n"
-        );
+    #[test]
+    fn replace_keeps_the_mode_and_needs_the_file_to_exist() {
+        let tmp = TempRoot::new();
+        let path = tmp.path().join("prod.env");
+        fs::write(&path, "A=1\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        replace(&path, "B=2\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "B=2\n");
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o640);
-        assert_eq!(
-            read(&path).unwrap(),
-            pairs(&[("SECRET", "s"), ("ATHENA_VERSION", "new")])
-        );
+        let missing = tmp.path().join("missing.env");
+        let err = replace(&missing, "x").unwrap_err().to_string();
+        let named = err.contains("updating") && err.contains("missing.env");
+        assert!(named, "{err}");
     }
 
     #[test]
     fn a_missing_file_is_an_error_naming_it() {
         let tmp = TempRoot::new();
         let path = tmp.path().join("missing.env");
-        let err = set_var(&path, "A", "1").unwrap_err().to_string();
-        assert!(err.contains("missing.env"), "{err}");
         assert!(read(&path).unwrap_err().to_string().contains("reading"));
     }
 
@@ -175,7 +173,7 @@ mod tests {
         let path = tmp.path().join("prod.env");
         fs::write(&path, "A=1\n").unwrap();
         fs::create_dir(tmp.path().join("prod.env.tmp")).unwrap();
-        let err = set_var(&path, "A", "2").unwrap_err().to_string();
+        let err = replace(&path, "A=2\n").unwrap_err().to_string();
         assert!(err.starts_with("writing"), "{err}");
         assert_eq!(fs::read_to_string(&path).unwrap(), "A=1\n");
     }

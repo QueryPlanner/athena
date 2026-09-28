@@ -1,7 +1,8 @@
-//! `deploy staging <digest>` and `promote prod <digest>`, and the release
-//! cache they share with `install-gate`.
+//! `deploy staging <digest> [KEY=VALUE ...]` and `promote prod <digest>
+//! [KEY=VALUE ...]`, and the release cache they share with `install-gate`.
 
 use super::command::is_hex64;
+use super::settings::Setting;
 use super::{
     ATHENA_USER, Cmd, Context, Digest, Env, Failure, Gate, Result, Settings, envfile, failed,
     remove_file_if_exists, time, write_atomic,
@@ -87,13 +88,19 @@ fn short_digest(hex: &str) -> String {
 }
 
 impl Gate<'_> {
-    pub(super) fn deploy(&self, env: Env, digest: &Digest) -> Result<Value> {
+    /// `changes` are written into the env file with the release, and the
+    /// file is put back as it was if the deploy rolls back.
+    pub(super) fn deploy(&self, env: Env, digest: &Digest, changes: &[Setting]) -> Result<Value> {
         if env == Env::Prod {
             self.require_staged(digest)?;
         }
         let _lock = self.lock()?;
         // Everything that can fail without changing anything goes first.
         let settings = self.settings(env)?;
+        let env_file = self.layout.env_file(env);
+        let before =
+            fs::read_to_string(&env_file).context(format!("reading {}", env_file.display()))?;
+        let report = self.report_changes(&settings, changes);
         let config = self.gate_config()?;
         self.check_disk()?;
         let release = self.ensure_release(&config, digest)?;
@@ -107,9 +114,9 @@ impl Gate<'_> {
         let backup = self
             .backup(env, &settings, previous.as_deref())
             .map_err(|e| self.restart_after(env, e))?;
-        let switched = self.switch(env, &settings, &release, &version);
+        let switched = self.switch(env, &settings, &release, &version, changes);
         if let Err(cause) = switched {
-            return Err(self.roll_back(env, &settings, previous.as_deref(), cause));
+            return Err(self.roll_back(env, &settings, previous.as_deref(), &before, cause));
         }
 
         let state = json!({
@@ -130,7 +137,29 @@ impl Gate<'_> {
             "previous": previous.as_deref().and_then(release_name),
             "backup": backup.map(|p| p.display().to_string()),
             "pruned": pruned,
+            "settings": report,
         }))
+    }
+
+    /// Each change as `{key, old, new}`, logged too: the values are not
+    /// secret, and a change made through a GitHub variable has no commit
+    /// to show it.
+    fn report_changes(&self, settings: &Settings, changes: &[Setting]) -> Value {
+        let report: Vec<Value> = changes
+            .iter()
+            .map(|change| {
+                let old = envfile::get(&settings.vars, change.key);
+                if old != Some(change.value.as_str()) {
+                    let shown = old.unwrap_or("(unset)");
+                    self.say(format!(
+                        "setting {}: {shown} -> {}",
+                        change.key, change.value
+                    ));
+                }
+                json!({"key": change.key, "old": old, "new": change.value})
+            })
+            .collect();
+        Value::Array(report)
     }
 
     /// Only what staging runs may reach prod.
@@ -284,11 +313,24 @@ impl Gate<'_> {
         Ok(())
     }
 
-    /// Point `current` at `release`, record the version, start the units
-    /// and wait until they are healthy.
-    fn switch(&self, env: Env, settings: &Settings, release: &Path, version: &str) -> Result<()> {
+    /// Point `current` at `release`, write `changes` and the version into
+    /// the env file in one rename, start the units and wait until they are
+    /// healthy.
+    fn switch(
+        &self,
+        env: Env,
+        settings: &Settings,
+        release: &Path,
+        version: &str,
+        changes: &[Setting],
+    ) -> Result<()> {
         self.point_current(env, release)?;
-        envfile::set_var(&self.layout.env_file(env), "ATHENA_VERSION", version)?;
+        let path = self.layout.env_file(env);
+        let text = fs::read_to_string(&path).context(format!("updating {}", path.display()))?;
+        let mut pairs: Vec<(&str, &str)> =
+            changes.iter().map(|c| (c.key, c.value.as_str())).collect();
+        pairs.push(("ATHENA_VERSION", version));
+        envfile::replace(&path, &envfile::with_vars(&text, &pairs))?;
         self.systemctl(&["start", &format!("athena-serve@{env}.service")])?;
         self.wait_healthy(settings.addr, Some(version))?;
         if self.telegram_enabled(env)? {
@@ -316,9 +358,19 @@ impl Gate<'_> {
         env: Env,
         settings: &Settings,
         previous: Option<&Path>,
+        before: &str,
         cause: Failure,
     ) -> Failure {
         self.say(format!("deploy failed: {cause}"));
+        // The env file first: `switch` below records the old version in it.
+        let path = self.layout.env_file(env);
+        if let Err(e) = envfile::replace(&path, before) {
+            let _ = self.stop_units(env);
+            return failed(format!(
+                "{cause}; restoring {} failed too, so {env} is stopped: {e}",
+                path.display()
+            ));
+        }
         let Some(previous) = previous else {
             let stopped = self
                 .stop_units(env)
@@ -334,7 +386,7 @@ impl Gate<'_> {
         let version = self.release_version(previous);
         let result = self
             .stop_units(env)
-            .and_then(|()| self.switch(env, settings, previous, &version));
+            .and_then(|()| self.switch(env, settings, previous, &version, &[]));
         match result {
             Ok(()) => failed(format!(
                 "{cause}; rolled back to {name}. If the new release migrated the \
@@ -494,7 +546,7 @@ mod tests {
     #[test]
     fn a_first_deploy_pulls_switches_starts_and_records_state() {
         let vm = Vm::new();
-        let out = vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        let out = vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
 
         let release = vm.root().join("opt/athena/releases").join(HEX_A);
         assert_eq!(
@@ -522,7 +574,7 @@ mod tests {
             out,
             json!({
                 "env": "staging", "digest": format!("sha256:{HEX_A}"), "version": REVISION,
-                "previous": null, "backup": null, "pruned": [],
+                "previous": null, "backup": null, "pruned": [], "settings": [],
             })
         );
         let oras = format!("run /usr/local/bin/oras pull {DEFAULT_REPO}@sha256:{HEX_A} -o");
@@ -544,12 +596,12 @@ mod tests {
     #[test]
     fn a_redeploy_backs_up_with_the_old_release_before_switching() {
         let vm = Vm::new();
-        vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
         vm.create_db(Env::Staging);
         vm.fake.clear();
         vm.fake.now.set(NOW + 60);
 
-        let out = vm.gate().deploy(Env::Staging, &digest(HEX_B)).unwrap();
+        let out = vm.gate().deploy(Env::Staging, &digest(HEX_B), &[]).unwrap();
 
         let old = vm.root().join("opt/athena/releases").join(HEX_A);
         let dest = vm
@@ -577,7 +629,7 @@ mod tests {
     #[test]
     fn only_the_newest_ten_backups_are_kept_and_other_files_are_left() {
         let vm = Vm::new();
-        vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
         vm.create_db(Env::Staging);
         let dir = vm.root().join("var/lib/athena/staging/backups");
         fs::create_dir_all(&dir).unwrap();
@@ -586,7 +638,7 @@ mod tests {
         }
         fs::write(dir.join("manual.db"), "keep").unwrap();
 
-        vm.gate().deploy(Env::Staging, &digest(HEX_B)).unwrap();
+        vm.gate().deploy(Env::Staging, &digest(HEX_B), &[]).unwrap();
 
         let mut names: Vec<String> = fs::read_dir(&dir)
             .unwrap()
@@ -602,8 +654,8 @@ mod tests {
     #[test]
     fn no_database_means_no_backup() {
         let vm = Vm::new();
-        vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
-        let out = vm.gate().deploy(Env::Staging, &digest(HEX_B)).unwrap();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
+        let out = vm.gate().deploy(Env::Staging, &digest(HEX_B), &[]).unwrap();
         assert_eq!(out["backup"], Value::Null);
         assert!(vm.fake.find_run(" backup ").is_none());
         assert!(vm.fake.said("no database yet: no backup"));
@@ -612,12 +664,15 @@ mod tests {
     #[test]
     fn a_failed_backup_restarts_the_old_release_and_changes_nothing() {
         let vm = Vm::new();
-        vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
         vm.create_db(Env::Staging);
         vm.fake.fail_run(" backup ", "disk I/O error");
         vm.fake.clear();
 
-        let err = vm.gate().deploy(Env::Staging, &digest(HEX_B)).unwrap_err();
+        let err = vm
+            .gate()
+            .deploy(Env::Staging, &digest(HEX_B), &[])
+            .unwrap_err();
 
         assert!(err.to_string().contains("disk I/O error"), "{err}");
         assert_eq!(vm.current(Env::Staging).as_deref(), Some(HEX_A));
@@ -637,13 +692,13 @@ mod tests {
     #[test]
     fn a_failed_restart_after_a_failed_backup_says_both() {
         let vm = Vm::new();
-        vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
         vm.create_db(Env::Staging);
         vm.fake.fail_run(" backup ", "disk I/O error");
         vm.fake.fail_run("systemctl start", "unit failed");
         let err = vm
             .gate()
-            .deploy(Env::Staging, &digest(HEX_B))
+            .deploy(Env::Staging, &digest(HEX_B), &[])
             .unwrap_err()
             .to_string();
         assert_has(&err, &["disk I/O error", "failed too: ", "unit failed"]);
@@ -652,7 +707,7 @@ mod tests {
     #[test]
     fn a_failed_health_check_rolls_back_to_the_previous_release() {
         let vm = Vm::new();
-        vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
         let before = vm.state(Env::Staging);
         // The new release never becomes healthy.
         vm.fake
@@ -663,7 +718,7 @@ mod tests {
 
         let err = vm
             .gate()
-            .deploy(Env::Staging, &digest(HEX_B))
+            .deploy(Env::Staging, &digest(HEX_B), &[])
             .unwrap_err()
             .to_string();
 
@@ -685,7 +740,7 @@ mod tests {
     fn a_service_that_becomes_healthy_within_the_minute_is_accepted() {
         let vm = Vm::new();
         vm.fake.fail_http("GET /health", 3);
-        vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
         assert_eq!(vm.fake.now.get(), NOW + 3);
     }
 
@@ -695,7 +750,7 @@ mod tests {
         vm.fake.fail_http("GET /health", 1000);
         let err = vm
             .gate()
-            .deploy(Env::Staging, &digest(HEX_A))
+            .deploy(Env::Staging, &digest(HEX_A), &[])
             .unwrap_err()
             .to_string();
         assert_has(&err, &["no previous release"]);
@@ -716,7 +771,7 @@ mod tests {
             .fail_run_n("systemctl stop", 1, usize::MAX, "stop timed out");
         let err = vm
             .gate()
-            .deploy(Env::Staging, &digest(HEX_A))
+            .deploy(Env::Staging, &digest(HEX_A), &[])
             .unwrap_err()
             .to_string();
         assert_has(&err, &["staging is stopped; stopping: ", "stop timed out"]);
@@ -725,11 +780,11 @@ mod tests {
     #[test]
     fn a_failed_rollback_is_reported_with_the_cause() {
         let vm = Vm::new();
-        vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
         vm.fake.fail_http("GET /health", 1000);
         let err = vm
             .gate()
-            .deploy(Env::Staging, &digest(HEX_B))
+            .deploy(Env::Staging, &digest(HEX_B), &[])
             .unwrap_err()
             .to_string();
         assert_has(&err, &["not healthy", "rolling back to", "failed too"]);
@@ -739,7 +794,7 @@ mod tests {
     fn telegram_starts_after_serve_is_healthy_when_enabled() {
         let vm = Vm::new();
         vm.fake.telegram_enabled.set(true);
-        vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
         let version = vm.fake.position("GET /version").unwrap();
         let telegram = vm
             .fake
@@ -751,13 +806,13 @@ mod tests {
     #[test]
     fn a_telegram_unit_that_fails_to_start_rolls_back() {
         let vm = Vm::new();
-        vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
         vm.fake.telegram_enabled.set(true);
         vm.fake
             .fail_run_n("systemctl start athena-telegram", 0, 1, "bad token");
         let err = vm
             .gate()
-            .deploy(Env::Staging, &digest(HEX_B))
+            .deploy(Env::Staging, &digest(HEX_B), &[])
             .unwrap_err()
             .to_string();
         assert_has(&err, &["bad token", "rolled back to"]);
@@ -770,13 +825,13 @@ mod tests {
         vm.fake.free.set(MIN_FREE - 1);
         let err = vm
             .gate()
-            .deploy(Env::Staging, &digest(HEX_A))
+            .deploy(Env::Staging, &digest(HEX_A), &[])
             .unwrap_err()
             .to_string();
         assert_has(&err, &["1023 MiB free", "need 1 GiB"]);
         assert_eq!(vm.fake.effects(), Vec::<String>::new());
         vm.fake.free.set(MIN_FREE);
-        assert!(vm.gate().deploy(Env::Staging, &digest(HEX_A)).is_ok());
+        assert!(vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).is_ok());
     }
 
     #[test]
@@ -785,7 +840,7 @@ mod tests {
         vm.fake.free_fails.set(true);
         let err = vm
             .gate()
-            .deploy(Env::Staging, &digest(HEX_A))
+            .deploy(Env::Staging, &digest(HEX_A), &[])
             .unwrap_err()
             .to_string();
         assert!(err.starts_with("checking free space on"), "{err}");
@@ -797,13 +852,13 @@ mod tests {
         let held = vm.gate().lock().unwrap();
         let err = vm
             .gate()
-            .deploy(Env::Staging, &digest(HEX_A))
+            .deploy(Env::Staging, &digest(HEX_A), &[])
             .unwrap_err()
             .to_string();
         assert!(err.contains("another deploy-gate is running"), "{err}");
         assert_eq!(vm.fake.effects(), Vec::<String>::new());
         drop(held);
-        assert!(vm.gate().deploy(Env::Staging, &digest(HEX_A)).is_ok());
+        assert!(vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).is_ok());
     }
 
     #[test]
@@ -812,7 +867,7 @@ mod tests {
         fs::create_dir_all(vm.root().join("var/lib/athena/.gate.lock/x")).unwrap();
         let err = vm
             .gate()
-            .deploy(Env::Staging, &digest(HEX_A))
+            .deploy(Env::Staging, &digest(HEX_A), &[])
             .unwrap_err()
             .to_string();
         assert!(err.starts_with("locking"), "{err}");
@@ -824,7 +879,7 @@ mod tests {
         vm.fake.fail_run("oras pull", "manifest unknown");
         let err = vm
             .gate()
-            .deploy(Env::Staging, &digest(HEX_A))
+            .deploy(Env::Staging, &digest(HEX_A), &[])
             .unwrap_err()
             .to_string();
         assert!(err.contains("manifest unknown"), "{err}");
@@ -838,7 +893,7 @@ mod tests {
         vm.fake.spawn_fails("oras pull");
         let err = vm
             .gate()
-            .deploy(Env::Staging, &digest(HEX_A))
+            .deploy(Env::Staging, &digest(HEX_A), &[])
             .unwrap_err()
             .to_string();
         assert_eq!(err, "running /usr/local/bin/oras: no such program");
@@ -850,7 +905,7 @@ mod tests {
         vm.fake.pull_files.replace(vec!["deploy-gate"]);
         let err = vm
             .gate()
-            .deploy(Env::Staging, &digest(HEX_A))
+            .deploy(Env::Staging, &digest(HEX_A), &[])
             .unwrap_err()
             .to_string();
         assert!(err.contains("has no `athena` file"), "{err}");
@@ -864,7 +919,7 @@ mod tests {
         fs::create_dir_all(releases.join(format!("{HEX_A}.tmp"))).unwrap();
         fs::write(releases.join(format!("{HEX_A}.tmp/junk")), "").unwrap();
         fs::create_dir_all(releases.join(HEX_A)).unwrap(); // no athena inside
-        vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
         assert!(!releases.join(HEX_A).join("junk").exists());
         assert!(releases.join(HEX_A).join("athena").is_file());
         assert!(!releases.join(format!("{HEX_A}.tmp")).exists());
@@ -876,7 +931,7 @@ mod tests {
         vm.fake.fail_run("athena --version", "Exec format error");
         let err = vm
             .gate()
-            .deploy(Env::Staging, &digest(HEX_A))
+            .deploy(Env::Staging, &digest(HEX_A), &[])
             .unwrap_err()
             .to_string();
         assert!(err.contains("Exec format error"), "{err}");
@@ -886,7 +941,7 @@ mod tests {
         vm.fake.version_output.replace("something else".into());
         let err = vm
             .gate()
-            .deploy(Env::Staging, &digest(HEX_A))
+            .deploy(Env::Staging, &digest(HEX_A), &[])
             .unwrap_err()
             .to_string();
         assert!(err.contains("printed \"something else\""), "{err}");
@@ -896,12 +951,12 @@ mod tests {
     fn without_a_usable_revision_the_version_is_the_short_digest() {
         let vm = Vm::new();
         vm.fake.fail_run("manifest fetch", "denied");
-        let out = vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        let out = vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
         assert_eq!(out["version"], format!("sha256:{}", &HEX_A[..12]));
 
         let vm = Vm::new();
         vm.fake.manifest.replace(Some("{}".into()));
-        let out = vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        let out = vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
         assert_eq!(out["version"], format!("sha256:{}", &HEX_A[..12]));
         assert!(vm.fake.said("no usable org.opencontainers.image.revision"));
     }
@@ -909,9 +964,9 @@ mod tests {
     #[test]
     fn a_cached_release_is_not_pulled_again() {
         let vm = Vm::new();
-        vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
         vm.fake.clear();
-        vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
         assert_eq!(vm.fake.count("oras"), 0);
         assert!(vm.fake.said("is cached in"));
     }
@@ -922,7 +977,7 @@ mod tests {
         fs::remove_file(vm.root().join("etc/athena/staging.env")).unwrap();
         let err = vm
             .gate()
-            .deploy(Env::Staging, &digest(HEX_A))
+            .deploy(Env::Staging, &digest(HEX_A), &[])
             .unwrap_err()
             .to_string();
         assert!(err.contains("staging.env"), "{err}");
@@ -935,7 +990,7 @@ mod tests {
         .unwrap();
         let err = vm
             .gate()
-            .deploy(Env::Staging, &digest(HEX_A))
+            .deploy(Env::Staging, &digest(HEX_A), &[])
             .unwrap_err()
             .to_string();
         assert!(err.contains("needs ATHENA_ADDR=<ip>:<port>"), "{err}");
@@ -952,7 +1007,7 @@ mod tests {
         ] {
             let vm = Vm::new();
             vm.set_env_var(Env::Staging, "ATHENA_ALLOWED_HOSTS", hosts);
-            let result = vm.gate().deploy(Env::Staging, &digest(HEX_A));
+            let result = vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]);
             assert_eq!(result.is_ok(), ok, "{hosts}: {result:?}");
             if !ok {
                 let err = result.unwrap_err().to_string();
@@ -965,7 +1020,7 @@ mod tests {
     #[test]
     fn oras_runs_as_root_with_home_set() {
         let vm = Vm::new();
-        vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
         for needle in ["oras pull", "oras manifest fetch"] {
             let cmd = vm.fake.find_run(needle).unwrap();
             assert_eq!(cmd.env, [("HOME".to_string(), "/root".to_string())]);
@@ -980,7 +1035,7 @@ mod tests {
             "etc/athena/gate.env",
             "ATHENA_REPO=ghcr.io/me/app\nORAS=/opt/oras\n",
         );
-        vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
         assert_eq!(
             vm.fake
                 .count(&format!("run /opt/oras pull ghcr.io/me/app@sha256:{HEX_A}")),
@@ -991,7 +1046,7 @@ mod tests {
         fs::create_dir_all(vm.root().join("etc/athena/gate.env")).unwrap();
         let err = vm
             .gate()
-            .deploy(Env::Staging, &digest(HEX_A))
+            .deploy(Env::Staging, &digest(HEX_A), &[])
             .unwrap_err()
             .to_string();
         assert!(err.contains("reading") && err.contains("gate.env"), "{err}");
@@ -1003,7 +1058,7 @@ mod tests {
         vm.fake.fail_run("systemctl stop", "access denied");
         let err = vm
             .gate()
-            .deploy(Env::Staging, &digest(HEX_A))
+            .deploy(Env::Staging, &digest(HEX_A), &[])
             .unwrap_err()
             .to_string();
         assert!(err.contains("access denied"), "{err}");
@@ -1013,13 +1068,19 @@ mod tests {
     #[test]
     fn promote_refuses_a_digest_staging_does_not_run() {
         let vm = Vm::new();
-        let err = vm.gate().deploy(Env::Prod, &digest(HEX_A)).unwrap_err();
+        let err = vm
+            .gate()
+            .deploy(Env::Prod, &digest(HEX_A), &[])
+            .unwrap_err();
         assert!(matches!(err, Failure::Rejected(_)), "{err:?}");
         assert_has(&err.to_string(), &["no recorded deployment"]);
 
-        vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
         vm.fake.clear();
-        let err = vm.gate().deploy(Env::Prod, &digest(HEX_B)).unwrap_err();
+        let err = vm
+            .gate()
+            .deploy(Env::Prod, &digest(HEX_B), &[])
+            .unwrap_err();
         assert!(matches!(err, Failure::Rejected(_)), "{err:?}");
         assert_has(&err.to_string(), &["is not what staging runs"]);
         assert_eq!(vm.fake.effects(), Vec::<String>::new());
@@ -1029,11 +1090,11 @@ mod tests {
     #[test]
     fn promote_reuses_the_staged_release_and_starts_telegram() {
         let vm = Vm::new();
-        vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
         vm.fake.telegram_enabled.set(true);
         vm.fake.clear();
 
-        let out = vm.gate().deploy(Env::Prod, &digest(HEX_A)).unwrap();
+        let out = vm.gate().deploy(Env::Prod, &digest(HEX_A), &[]).unwrap();
 
         assert_eq!(out["env"], "prod");
         assert_eq!(out["version"], REVISION);
@@ -1057,17 +1118,17 @@ mod tests {
         let vm = Vm::new();
         vm.write("etc/athena/gate.env", "ATHENA_KEEP_RELEASES=2\n");
         // Prod runs A (the oldest); staging moves through B, C, D.
-        vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
-        vm.gate().deploy(Env::Prod, &digest(HEX_A)).unwrap();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
+        vm.gate().deploy(Env::Prod, &digest(HEX_A), &[]).unwrap();
         for (i, hex) in [HEX_B, HEX_C, HEX_D].into_iter().enumerate() {
             vm.fake.now.set(NOW + 100 * (i as u64 + 1));
-            vm.gate().deploy(Env::Staging, &digest(hex)).unwrap();
+            vm.gate().deploy(Env::Staging, &digest(hex), &[]).unwrap();
         }
         let releases = vm.root().join("opt/athena/releases");
         fs::create_dir_all(releases.join("not-a-release")).unwrap();
         fs::create_dir_all(releases.join(format!("{HEX_B}.tmp"))).unwrap();
         vm.fake.now.set(NOW + 1000);
-        let out = vm.gate().deploy(Env::Staging, &digest(HEX_D)).unwrap();
+        let out = vm.gate().deploy(Env::Staging, &digest(HEX_D), &[]).unwrap();
 
         let mut left: Vec<String> = fs::read_dir(&releases)
             .unwrap()
@@ -1083,7 +1144,7 @@ mod tests {
     #[test]
     fn a_release_without_a_version_file_runs_as_its_short_digest() {
         let vm = Vm::new();
-        vm.gate().deploy(Env::Staging, &digest(HEX_A)).unwrap();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
         let release = vm.root().join("opt/athena/releases").join(HEX_A);
         fs::write(release.join(VERSION_FILE), "bad version\n").unwrap();
         assert_eq!(
@@ -1092,5 +1153,152 @@ mod tests {
         );
         assert_eq!(last_used(&release), NOW);
         assert_eq!(last_used(&vm.root().join("missing")), 0);
+    }
+
+    fn setting(key: &'static str, value: &str) -> Setting {
+        Setting {
+            key,
+            value: value.into(),
+        }
+    }
+
+    const URL: &str = "http://100.118.54.67:9090";
+
+    #[test]
+    fn settings_are_written_with_the_release_and_reported() {
+        let vm = Vm::new();
+        let path = vm.root().join("etc/athena/staging.env");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        vm.set_env_var(Env::Staging, "AGENT_MODEL", "same/model");
+        let changes = [
+            setting("OPEN_SANDBOX_URL", URL),
+            setting("AGENT_MODEL", "same/model"),
+        ];
+
+        let out = vm
+            .gate()
+            .deploy(Env::Staging, &digest(HEX_A), &changes)
+            .unwrap();
+
+        assert_eq!(
+            vm.env_var(Env::Staging, "OPEN_SANDBOX_URL").as_deref(),
+            Some(URL)
+        );
+        assert_eq!(
+            vm.env_var(Env::Staging, "SECRET").as_deref(),
+            Some("s3cret")
+        );
+        assert_eq!(
+            vm.env_var(Env::Staging, "ATHENA_VERSION").as_deref(),
+            Some(REVISION)
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
+        assert_eq!(
+            out["settings"],
+            json!([
+                {"key": "OPEN_SANDBOX_URL", "old": null, "new": URL},
+                {"key": "AGENT_MODEL", "old": "same/model", "new": "same/model"},
+            ])
+        );
+        assert!(
+            vm.fake
+                .said(&format!("setting OPEN_SANDBOX_URL: (unset) -> {URL}"))
+        );
+        // An unchanged value is reported but not logged as a change.
+        assert!(!vm.fake.said("setting AGENT_MODEL"));
+    }
+
+    #[test]
+    fn a_rollback_puts_the_env_file_back_as_it_was() {
+        let vm = Vm::new();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
+        let path = vm.root().join("etc/athena/staging.env");
+        let before = fs::read_to_string(&path).unwrap();
+        vm.fake
+            .unhealthy_versions
+            .borrow_mut()
+            .push(REVISION_B.into());
+
+        let err = vm
+            .gate()
+            .deploy(
+                Env::Staging,
+                &digest(HEX_B),
+                &[setting("OPEN_SANDBOX_URL", URL)],
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert_has(&err, &["rolled back to"]);
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(vm.env_var(Env::Staging, "OPEN_SANDBOX_URL"), None);
+    }
+
+    #[test]
+    fn a_failed_first_deploy_puts_the_env_file_back_too() {
+        let vm = Vm::new();
+        let path = vm.root().join("etc/athena/staging.env");
+        let before = fs::read_to_string(&path).unwrap();
+        vm.fake.fail_http("GET /health", 1000);
+
+        let err = vm
+            .gate()
+            .deploy(
+                Env::Staging,
+                &digest(HEX_A),
+                &[setting("OPEN_SANDBOX_URL", URL)],
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert_has(&err, &["no previous release"]);
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_failed_restore_stops_the_env_and_says_so() {
+        let vm = Vm::new();
+        vm.gate().deploy(Env::Staging, &digest(HEX_A), &[]).unwrap();
+        vm.fake
+            .unhealthy_versions
+            .borrow_mut()
+            .push(REVISION_B.into());
+        // Blocks the restore's temporary file, after the switch wrote.
+        let blocker = vm.root().join("etc/athena/staging.env.tmp");
+        *vm.fake.dir_on_http.borrow_mut() = Some(blocker);
+        vm.fake.clear();
+
+        let err = vm
+            .gate()
+            .deploy(
+                Env::Staging,
+                &digest(HEX_B),
+                &[setting("OPEN_SANDBOX_URL", URL)],
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert_has(
+            &err,
+            &["not healthy after 60s", "failed too, so staging is stopped"],
+        );
+        assert_eq!(vm.fake.count("systemctl stop"), 2);
+    }
+
+    #[test]
+    fn an_unreadable_env_file_fails_before_any_change() {
+        let vm = Vm::new();
+        let path = vm.root().join("etc/athena/staging.env");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let err = vm
+            .gate()
+            .deploy(Env::Staging, &digest(HEX_A), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("staging.env"), "{err}");
+        assert!(vm.fake.effects().is_empty());
     }
 }

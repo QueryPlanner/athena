@@ -151,8 +151,27 @@ ssh -t "$VM" 'sudoedit /etc/athena/staging.env'   # OPENROUTER_API_KEY (spend-ca
 ssh -t "$VM" 'sudoedit /etc/athena/prod.env'      # OPENROUTER_API_KEY, TELEGRAM_BOT_TOKEN (prod bot)
 ```
 
-Optional in both: `OPEN_SANDBOX_URL` (and `OPEN_SANDBOX_API_KEY`) once the
-sandbox host is ready.
+Optional in both: `OPEN_SANDBOX_API_KEY` once the sandbox host has one.
+
+Non-secret settings (`OPEN_SANDBOX_URL`, `ATHENA_SANDBOX_IMAGE`,
+`ATHENA_SANDBOX_TIMEOUT_SECS`, `AGENT_MODEL`) can instead come from GitHub:
+each deploy writes that environment's variables into its env file.
+
+```bash
+gh variable set OPEN_SANDBOX_URL --env staging --body http://<sandbox-tailnet-ip>:9090
+gh variable set OPEN_SANDBOX_URL --env prod    --body http://<sandbox-tailnet-ip>:9090
+```
+
+- **Install the new gate first** (`sudo /opt/athena/bin/deploy-gate install-gate <digest>` on the VM; see `DEPLOY.md`).
+  An older gate refuses a deploy that carries settings, so every deploy fails
+  until it is replaced.
+- A setting takes effect at the next deploy (re-run the deploy job to apply
+  one now). Deleting a variable leaves its last value in the env file; remove
+  it with `sudoedit`.
+- Anyone who can edit the environment's variables can point
+  `OPEN_SANDBOX_URL` at another host, which then receives session data and
+  `OPEN_SANDBOX_API_KEY`, without a commit. Every change is printed, old and
+  new, in the deploy job's summary. Keep variable access to repo admins.
 
 `TELEGRAM_BOT_TOKEN` is optional per env, but **each env needs its own bot**
 (@BotFather → /newbot): Telegram refuses a second process polling the same

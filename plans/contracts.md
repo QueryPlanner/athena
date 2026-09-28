@@ -141,12 +141,27 @@ must be exactly one of:
 
 | Key | Allowed commands |
 |---|---|
-| staging | `deploy staging <digest>`, `smoke staging`, `bench staging`, `eval staging`, `status staging` |
-| prod | `promote prod <digest>`, `smoke prod`, `status prod` |
+| staging | `deploy staging <digest> [KEY=VALUE ...]`, `smoke staging`, `bench staging`, `eval staging`, `status staging` |
+| prod | `promote prod <digest> [KEY=VALUE ...]`, `smoke prod`, `status prod` |
 | admin (run locally as root, no `--key-env`) | `restore <env> <backup-file>`, `install-gate <digest>` |
 
-**Validation.** `<digest>` must match `^sha256:[0-9a-f]{64}$`. Anything else exits 2
-with `rejected: ...` on stderr before any side effect.
+**Validation.** The line is at most 1024 bytes. `<digest>` must match
+`^sha256:[0-9a-f]{64}$`. Anything else exits 2 with `rejected: ...` on stderr before
+any side effect.
+
+**Settings** (`src/gate/settings.rs`). The optional `KEY=VALUE` words after the
+digest are non-secret settings written into that env's file:
+
+- Keys: `OPEN_SANDBOX_URL`, `ATHENA_SANDBOX_IMAGE`, `ATHENA_SANDBOX_TIMEOUT_SECS`,
+  `AGENT_MODEL`. Any other key is rejected, as is a key given twice.
+- Values: 1 to 200 bytes of `[A-Za-z0-9._:/@+-]`. `OPEN_SANDBOX_URL` must be an
+  http or https URL with no user or password; `ATHENA_SANDBOX_TIMEOUT_SECS` a
+  number of at least 60, as `athena` reads them.
+- A key given is set; a key not given is left alone. CI never removes a key: delete
+  it with `sudoedit`.
+- CI sends each GitHub environment's own variables (`vars.<KEY>` in `staging` or
+  `prod`). Settings are not promoted from staging to prod.
+- Old and new values are logged and returned in the JSON line (`settings`).
 
 **`deploy staging <digest>`**
 1. Take an exclusive lock on `/var/lib/athena/.gate.lock`.
@@ -160,13 +175,18 @@ with `rejected: ...` on stderr before any side effect.
    loaded. Keep the last 10.
 7. Point the `current` symlink at the new release (atomically: write a temp
    symlink, then rename).
-8. Write `ATHENA_VERSION` into the env file, replacing the existing line.
+8. Write the settings and `ATHENA_VERSION` into the env file in one atomic
+   rename, keeping its mode and owner and every other line.
 9. `systemctl start athena-serve@staging`, then poll
    `http://<ATHENA_ADDR>/health` and `/version` for up to 60 s.
 10. Start telegram if its unit is enabled for that env.
 11. Write `state.json` (`/var/lib/athena/gate/<env>.state.json`), then prune releases.
 
-On a failed health check it puts the previous `current` back, restarts, and exits 1.
+On a failed health check it puts the env file back exactly as it was before the
+deploy, then the previous `current`, restarts, and exits 1. With no previous release
+it restores the file and stops the env. The health check does not exercise the
+settings (a wrong `OPEN_SANDBOX_URL` still passes it and shows only when a tool
+runs), so a bad setting is rolled back only together with a bad release.
 
 **`promote prod <digest>`**
 - Refuses unless `<digest>` equals staging's `state.json` digest.
@@ -193,6 +213,7 @@ On a failed health check it puts the previous `current` back, restarts, and exit
 | `DEPLOY_SSH_KEY` | secret | environment `staging`; another in environment `prod` |
 | `VM_HOST` | variable | e.g. `100.124.202.79` |
 | `VM_KNOWN_HOSTS` | variable | the VM's host key line |
+| `OPEN_SANDBOX_URL`, `ATHENA_SANDBOX_IMAGE`, `ATHENA_SANDBOX_TIMEOUT_SECS`, `AGENT_MODEL` | variable, optional | environment `staging` and/or `prod`; sent with that env's deploy (see Settings). Never a secret. |
 
 **Jobs**
 - **pull_request:** `unit` (fmt, clippy, coverage.sh, `athena eval run --target
