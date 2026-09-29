@@ -738,6 +738,10 @@ async fn agent_browser_tells_the_model_to_read_the_guide_and_help_first() {
     ] {
         assert!(tool.description.contains(needed), "{needed}");
     }
+    // The guide path the model is sent to is where the image installs it.
+    let guide = "/usr/local/share/agent-browser/skill-data";
+    assert!(tool.description.contains(&format!("{guide}/core/SKILL.md")));
+    assert!(include_str!("../deploy/sandbox-image/Dockerfile").contains(guide));
     assert_eq!(tool.parameters["properties"]["args"]["type"], "array");
     assert_eq!(tool.parameters["required"], json!(["args"]));
 }
