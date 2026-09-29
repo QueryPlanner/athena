@@ -72,7 +72,7 @@ set it), else the crate version with `-dev`.
 | Variable | Used by | Default | Meaning |
 |---|---|---|---|
 | `OPENROUTER_API_KEY` | anything that talks to the model | none, required | OpenRouter API key |
-| `AGENT_MODEL` | all | `openai/gpt-5.6-luna` | Model id on OpenRouter |
+| `AGENT_MODEL` | all | `openai/gpt-6-luna` | Model id on OpenRouter |
 | `ATHENA_DB` | all | `agent.db`; `serve` and `telegram` require an absolute path | SQLite database file |
 | `ATHENA_VERSION` | `--version`, `GET /version` | `<crate version>-dev` | The deployed release |
 | `RUNS_STORE_RAW` | all | on | `0` drops raw provider responses from `runs.calls_json` |
@@ -760,9 +760,9 @@ log events never include prompt or reply text.
 - An album arrives as one message per photo, and a message during a running
   turn is dropped, so only an album's first photo reaches the model; the
   rest get the busy reply. Send photos one message at a time.
-- Whether the model can see images depends on `AGENT_MODEL`. Choose one
-  that accepts image input on OpenRouter; with one that does not, the
-  provider may refuse turns that carry a photo or a screenshot.
+- Whether the model can see images depends on `AGENT_MODEL`. The default,
+  `openai/gpt-6-luna`, accepts image input on OpenRouter; with a model that
+  does not, the provider may refuse turns that carry a photo or a screenshot.
 - The selected session is Telegram state. The CLI still uses `default`
   unless given a session name, and `sessions` does not mark the selection
   (`selected_sessions` is readable with `sqlite3`). `Service` does not
