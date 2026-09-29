@@ -134,7 +134,10 @@ path. The name is made safe first: only letters, digits, spaces and `._()-`
 are kept, anything else becomes `_`. A photo, or a PNG, JPEG, GIF or WebP file, is also shown to the model
 as an image. Files the model sends with `send_photo` and `send_file` arrive
 after its reply; a photo Telegram refuses (odd proportions, say) is sent
-again as a file. See "Images and files" below.
+again as a file. The photos of an album arrive as separate messages; the
+bot collects them until 2 seconds pass with no new one, then runs one turn
+for all of them, with the album's caption as the text. See "Images and
+files" below.
 
 While the model works the bot shows "typing...". A reply longer than
 Telegram's 4096-character limit is split, at a line break if there is one
@@ -757,9 +760,12 @@ log events never include prompt or reply text.
 - Edited messages, stickers, voice notes and other messages that are neither
   text, a photo nor a file are not prompts. Edits are ignored; the rest get
   "I read text, photos and files, not this kind of message."
-- An album arrives as one message per photo, and a message during a running
-  turn is dropped, so only an album's first photo reaches the model; the
-  rest get the busy reply. Send photos one message at a time.
+- An album is collected until 2 seconds pass with no new item from it, so
+  its reply starts 2 seconds late. An item that Telegram delivers later than
+  that becomes a turn of its own, or gets the busy reply if the album's turn
+  is still running. At most 4 photos are shown to the model at once; the
+  rest of an album are in the sandbox and the model opens them with
+  `view_image`.
 - Whether the model can see images depends on `AGENT_MODEL`. The default,
   `openai/gpt-6-luna`, accepts image input on OpenRouter; with a model that
   does not, the provider may refuse turns that carry a photo or a screenshot.

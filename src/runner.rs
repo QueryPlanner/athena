@@ -5,7 +5,7 @@
 //! `service::Service::send` and `send_stream` wrap the run with ownership,
 //! locking and telemetry.
 
-use crate::media::{File, Outbox};
+use crate::media::{File, MAX_IMAGES_PER_REQUEST, Outbox};
 use crate::store::{RunRecord, now_millis};
 use rig_agent::agent::{Agent, PromptResponse, StreamingResult};
 use rig_agent::completion::PromptError;
@@ -72,7 +72,9 @@ impl Request {
 
     /// The user message the model is given: the text, a note on each file
     /// saying what it is and where the sandbox has it, and each file shown
-    /// as an image (see [`crate::media::shown`]), as an image.
+    /// as an image (see [`crate::media::shown`]), as an image: the first
+    /// [`MAX_IMAGES_PER_REQUEST`] of them. The rest are left for the model
+    /// to open with `view_image`.
     pub fn message(&self) -> Message {
         let mut text = self.text.clone();
         let mut images = Vec::new();
@@ -88,6 +90,12 @@ impl Request {
                 Err(why) => format!("It is not in your sandbox: {why}."),
             });
             match &file.image {
+                Some(Ok(_)) if images.len() == MAX_IMAGES_PER_REQUEST => {
+                    note.push(format!(
+                        "It is not shown to you: only {MAX_IMAGES_PER_REQUEST} images are \
+                         shown at once; open it with view_image."
+                    ));
+                }
                 Some(Ok(image)) => {
                     images.push(UserContent::Image(image.clone()));
                     note.push("It is shown to you below.".into());
@@ -426,6 +434,30 @@ mod tests {
             ],
         };
         assert_eq!(request.message(), expected);
+    }
+
+    #[test]
+    fn only_as_many_images_as_a_request_carries_are_shown() {
+        let photos = (0..MAX_IMAGES_PER_REQUEST + 1)
+            .map(|n| file(&format!("{n}.png"), Some("image/png"), PNG, Ok("/in/p")))
+            .collect();
+        let request = Request {
+            files: photos,
+            ..Request::default()
+        };
+        let message = request.message();
+        let parts = serde_json::to_value(&message).unwrap()["content"].clone();
+        let images = parts
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["type"] == "image");
+        assert_eq!(images.count(), MAX_IMAGES_PER_REQUEST);
+        let text = message.rag_text().unwrap();
+        let last = "It is not shown to you: only 4 images are shown at once; open it with \
+                    view_image.]";
+        assert!(text.ends_with(last), "{text}");
+        assert_eq!(text.matches("It is shown to you below.").count(), 4);
     }
 
     #[test]

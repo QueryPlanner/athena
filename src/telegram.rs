@@ -26,8 +26,8 @@
 //! - A photo or a file is a prompt, its caption the text. It is downloaded
 //!   (Telegram lets bots download up to [`DOWNLOAD_LIMIT`]), put in the
 //!   session's sandbox when there is one, and a photo is shown to the model
-//!   as an image. Albums arrive as one message per item, so all but the
-//!   first get [`BUSY`].
+//!   as an image. Albums arrive as one message per item; the bot collects
+//!   them until none has come for [`ALBUM_WAIT`], then runs one turn.
 //! - Files the turn's tools send (`send_photo`, `send_file`) follow the
 //!   reply. A photo Telegram refuses is sent again as a file.
 
@@ -40,7 +40,7 @@ use crate::shutdown;
 use crate::store::{self, Store};
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -90,9 +90,16 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// The largest file a bot can download from Telegram (`getFile`).
 pub const DOWNLOAD_LIMIT: usize = 20 * 1024 * 1024;
 
-/// Files downloaded at once, across every user: each is held in memory
-/// until it is in the sandbox.
+/// Files downloaded at once, across every user.
 const DOWNLOADS: usize = 4;
+
+/// How long an album is collected after its latest item arrived. Telegram
+/// sends the items of an album as separate messages in quick succession and
+/// never says how many there are.
+pub const ALBUM_WAIT: Duration = Duration::from_secs(2);
+
+/// Items one album can hold, as Telegram allows.
+pub const ALBUM_LIMIT: usize = 10;
 
 pub const BUSY: &str =
     "Still working on your last message. Send this one again once I have replied.";
@@ -383,6 +390,8 @@ pub struct Incoming {
     pub text: Option<String>,
     /// The photo or file the message carries: Telegram sends at most one.
     pub files: Vec<IncomingFile>,
+    /// The album (Telegram's `media_group_id`) the message belongs to.
+    pub album: Option<String>,
 }
 
 /// A photo or file in a message, not yet downloaded.
@@ -422,6 +431,9 @@ pub struct Telegram<R> {
     typing_every: Duration,
     /// Users with a turn running.
     busy: Arc<Mutex<HashSet<u64>>>,
+    /// Albums being collected, by user and album id.
+    albums: Mutex<HashMap<(u64, String), Album>>,
+    album_wait: Duration,
     /// Turns running or finished and not yet reaped. [`Telegram::finish`]
     /// waits for them.
     turns: Mutex<JoinSet<()>>,
@@ -429,6 +441,14 @@ pub struct Telegram<R> {
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// An album's items so far.
+struct Album {
+    text: Option<String>,
+    files: Vec<IncomingFile>,
+    /// When the latest item arrived.
+    last: tokio::time::Instant,
 }
 
 /// A claim on a user's one turn. Released when dropped, panics included.
@@ -464,6 +484,8 @@ impl<R: Run + 'static> Telegram<R> {
             log,
             typing_every: TYPING_EVERY,
             busy: Arc::default(),
+            albums: Mutex::default(),
+            album_wait: ALBUM_WAIT,
             turns: Mutex::default(),
         }
     }
@@ -472,6 +494,13 @@ impl<R: Run + 'static> Telegram<R> {
     /// tools use.
     pub fn sandboxes(mut self, sandboxes: Option<Arc<Sandboxes>>) -> Self {
         self.sandboxes = sandboxes;
+        self
+    }
+
+    /// Collect an album for this long after its latest item instead of
+    /// [`ALBUM_WAIT`].
+    pub fn album_wait(mut self, wait: Duration) -> Self {
+        self.album_wait = wait;
         self
     }
 
@@ -552,6 +581,10 @@ impl<R: Run + 'static> Telegram<R> {
                 .find(|f| f.size > DOWNLOAD_LIMIT as u64)
             {
                 return Ok(Some(too_big(big)));
+            }
+            if let Some(album) = incoming.album {
+                self.collect(chat, user_id, album, incoming.text, incoming.files);
+                return Ok(None);
             }
             let user = self.service.user(TRANSPORT, &user_id.to_string()).await?;
             let text = incoming.text.unwrap_or_default();
@@ -688,6 +721,85 @@ impl<R: Run + 'static> Telegram<R> {
             })
             .collect();
         Ok(lines.join("\n"))
+    }
+
+    /// Add an album's item. The first item starts a task that waits until
+    /// no item has arrived for [`Telegram::album_wait`], then runs one turn
+    /// for all of them, in that task so [`Telegram::finish`] waits for it.
+    fn collect<C: Chat>(
+        self: &Arc<Self>,
+        chat: &C,
+        user_id: u64,
+        album: String,
+        text: Option<String>,
+        files: Vec<IncomingFile>,
+    ) {
+        let key = (user_id, album);
+        let now = tokio::time::Instant::now();
+        let mut albums = lock(&self.albums);
+        if let Some(open) = albums.get_mut(&key) {
+            if open.files.len() + files.len() > ALBUM_LIMIT {
+                (self.log)(&format!(
+                    "telegram user {user_id}: an album has more than {ALBUM_LIMIT} items; \
+                     ignoring the rest"
+                ));
+            } else {
+                open.files.extend(files);
+            }
+            // Telegram puts an album's caption on one item, not always the first.
+            open.text = open.text.take().or(text);
+            open.last = now;
+            return;
+        }
+        albums.insert(
+            key.clone(),
+            Album {
+                text,
+                files,
+                last: now,
+            },
+        );
+        drop(albums);
+        let (app, chat) = (self.clone(), chat.clone());
+        let mut turns = lock(&self.turns);
+        while turns.try_join_next().is_some() {}
+        turns.spawn(async move {
+            let album = loop {
+                let last = lock(&app.albums)[&key].last;
+                tokio::time::sleep_until(last + app.album_wait).await;
+                let mut albums = lock(&app.albums);
+                if albums[&key].last == last {
+                    break albums.remove(&key).expect("the album is still collected");
+                }
+            };
+            let text = album.text.unwrap_or_default();
+            let reply = match app.claim_turn(user_id).await {
+                Ok(Some((busy, user, session))) => {
+                    let _busy = busy;
+                    return app.turn(chat, user, session, text, album.files).await;
+                }
+                Ok(None) => BUSY.into(),
+                Err(e) => {
+                    (app.log)(&format!("telegram user {user_id}: {e}"));
+                    reply_for(&e)
+                }
+            };
+            say(&chat, &app.log, &reply).await;
+        });
+    }
+
+    /// The user's turn and their current session, or `None` if a turn of
+    /// theirs is already running.
+    async fn claim_turn(
+        &self,
+        user_id: u64,
+    ) -> Result<Option<(Busy, User, Session)>, service::Error> {
+        let Some(busy) = Busy::claim(&self.busy, user_id) else {
+            return Ok(None);
+        };
+        let user = self.service.user(TRANSPORT, &user_id.to_string()).await?;
+        let session = self.current(&user).await?;
+        Ok(Some((busy, user, session)))
     }
 
     /// Start a turn for `text` and `files` in the user's current session,
@@ -1041,6 +1153,7 @@ async fn on_message<R: Run + 'static>(
             .or(message.caption().filter(|_| !files.is_empty()))
             .map(str::to_string),
         files,
+        album: message.media_group_id().map(|id| id.0.clone()),
     };
     let chat = TelegramChat {
         bot,
@@ -1489,8 +1602,10 @@ mod tests {
         let sink = logged.clone();
         let log: Log = Arc::new(move |m| sink.lock().unwrap().push(m.to_string()));
         // Long enough that no renewal lands mid-test; one test shortens it.
+        // Albums close quickly, so their tests do not wait two seconds.
         let app = Telegram::new(Arc::new(service), store.clone(), agent, log)
-            .typing_every(Duration::from_secs(3600));
+            .typing_every(Duration::from_secs(3600))
+            .album_wait(Duration::from_millis(200));
         Harness {
             app: Arc::new(app),
             store,
@@ -1514,6 +1629,7 @@ mod tests {
             user_id: Some(user),
             text: Some(text.into()),
             files: vec![],
+            album: None,
         }
     }
 
@@ -1756,6 +1872,7 @@ mod tests {
             user_id: Some(1),
             text: Some("hello everyone".into()),
             files: vec![],
+            album: None,
         };
         let channel = Incoming {
             chat_id: 5,
@@ -1763,6 +1880,7 @@ mod tests {
             user_id: None,
             text: Some("post".into()),
             files: vec![],
+            album: None,
         };
         let sticker = Incoming {
             text: None,
@@ -2209,5 +2327,124 @@ mod tests {
         );
         let lost = "sending a file failed: connection reset".to_string();
         assert_eq!(h.logged().iter().filter(|l| **l == lost).count(), 2);
+    }
+
+    // ---- albums ----
+
+    /// Item `n` of album `album` from `user`: photo `p<n>`, captioned.
+    fn album_item(user: u64, album: &str, n: usize, caption: Option<&str>) -> Incoming {
+        Incoming {
+            album: Some(album.into()),
+            ..with_file(user, caption, photo(&format!("p{n}"), 13))
+        }
+    }
+
+    /// A recorder that can download photos `p0` to `p<n - 1>`.
+    fn album_chat(n: usize) -> (Recorder, mpsc::UnboundedReceiver<Event>) {
+        let (mut chat, rx) = recorder();
+        chat.files = Arc::new((0..n).map(|i| (format!("p{i}"), PNG.to_vec())).collect());
+        (chat, rx)
+    }
+
+    /// Hand every item to the bot, then wait for the album's turn.
+    async fn album<R: Run + 'static>(
+        h: &Harness<R>,
+        chat: Recorder,
+        mut rx: mpsc::UnboundedReceiver<Event>,
+        items: Vec<Incoming>,
+    ) -> Vec<Event> {
+        for item in items {
+            h.app.handle(chat.clone(), item).await;
+        }
+        h.app.finish().await;
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        events
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_album_is_one_turn_with_every_photo_and_its_caption() {
+        let (h, model) = watched(vec![MockTurn::text("three cats")]);
+        let (chat, rx) = album_chat(3);
+        let items = vec![
+            album_item(20, "a1", 0, None),
+            // Telegram puts the caption on whichever item it was typed on.
+            album_item(20, "a1", 1, Some("compare these")),
+            album_item(20, "a1", 2, None),
+        ];
+
+        let events = album(&h, chat, rx, items).await;
+
+        assert_eq!(events, [Event::Typing, said("three cats")]);
+        assert_eq!(model.requests().len(), 1);
+        let prompt = model.requests()[0].chat_history.last().unwrap().clone();
+        let text = prompt.rag_text().unwrap();
+        let start = "compare these\n\n[The user attached";
+        assert!(text.starts_with(start), "{text}");
+        assert_eq!(text.matches("It is shown to you below.").count(), 3);
+        let json = serde_json::to_value(&prompt).unwrap();
+        let images = json["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["type"] == "image");
+        assert_eq!(images.count(), 3);
+        assert!(lock(&h.app.albums).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn albums_are_per_user_and_a_busy_user_is_told() {
+        let (h, model) = watched(vec![MockTurn::text("one"), MockTurn::text("one")]);
+        // The same album id from two users: two albums, two turns.
+        let (chat, rx) = album_chat(2);
+        let items = vec![album_item(21, "a1", 0, None), album_item(25, "a1", 1, None)];
+        let events = album(&h, chat, rx, items).await;
+        let replies = events.iter().filter_map(Event::said).count();
+        assert_eq!(replies, 2, "{events:?}");
+        assert_eq!(model.requests().len(), 2);
+
+        // An album that closes while the user's turn runs gets BUSY.
+        let _running = Busy::claim(&h.app.busy, 22).unwrap();
+        let (chat, rx) = album_chat(1);
+        let events = album(&h, chat, rx, vec![album_item(22, "a3", 0, None)]).await;
+        assert_eq!(events, [said(BUSY)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_album_past_telegrams_limit_keeps_its_first_items() {
+        let (h, model) = watched(vec![MockTurn::text("ten")]);
+        let (chat, rx) = album_chat(ALBUM_LIMIT + 1);
+        let items = (0..=ALBUM_LIMIT)
+            .map(|n| album_item(23, "big", n, None))
+            .collect();
+        album(&h, chat, rx, items).await;
+        let text = model.requests()[0]
+            .chat_history
+            .last()
+            .unwrap()
+            .rag_text()
+            .unwrap();
+        assert_eq!(text.matches("[The user attached").count(), ALBUM_LIMIT);
+        assert_eq!(
+            h.logged(),
+            ["telegram user 23: an album has more than 10 items; ignoring the rest"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_storage_failure_when_an_album_closes_is_answered() {
+        let h = harness(vec![]);
+        h.store
+            .db_for_tests()
+            .execute_batch("DROP TABLE selected_sessions")
+            .unwrap();
+        let (chat, rx) = album_chat(1);
+        let events = album(&h, chat, rx, vec![album_item(24, "a", 0, None)]).await;
+        assert_eq!(events, [said(FAILED)]);
+        let first = h.logged().remove(0);
+        assert!(first.starts_with("telegram user 24: storage: "), "{first}");
+        assert!(!lock(&h.app.busy).contains(&24));
     }
 }

@@ -592,7 +592,9 @@ fn sandboxed(
     let logged = Logged::default();
     let sink = logged.clone();
     let log: Log = Arc::new(move |m| sink.lock().unwrap().push(m.to_string()));
-    let app = Telegram::new(Arc::new(service), store, agent, log).sandboxes(Some(sandboxes));
+    let app = Telegram::new(Arc::new(service), store, agent, log)
+        .sandboxes(Some(sandboxes))
+        .album_wait(std::time::Duration::from_millis(200));
     (Arc::new(app), logged, model)
 }
 
@@ -842,5 +844,42 @@ async fn a_photo_telegram_refuses_is_sent_as_a_file() {
     assert!(
         logged[0].starts_with("sending a photo failed, sending it as a file: "),
         "{logged:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_albums_photos_reach_the_model_in_one_turn() {
+    const PHOTO: &[u8] = b"\xff\xd8\xff\xe0 album photo";
+    let tmp = TempDb::new();
+    let api = FakeApi::start().await;
+    let sandbox = FakeSandbox::start().await;
+    api.host_file("one", "photos/file_1.jpg", PHOTO);
+    api.host_file("two", "photos/file_2.jpg", PHOTO);
+    let (app, logged, model) = sandboxed(&tmp, &sandbox, vec![MockTurn::text("both seen")]);
+    let running = run(&api, app).await;
+    for (id, caption) in [("one", Some("which is sharper?")), ("two", None)] {
+        let mut update = media_from(16, ("photo", photo_sizes(id, PHOTO.len() as u64)), caption);
+        update["message"]["media_group_id"] = json!("13579");
+        api.push(update);
+    }
+    let replies = api.messages_to(16, 1).await;
+    running.stop().await.unwrap();
+
+    assert_eq!(replies, ["both seen"]);
+    assert_eq!(model.requests().len(), 1);
+    let prompt = prompt(&model, 0);
+    let parts = prompt["content"].as_array().unwrap();
+    assert!(
+        parts[0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("which is sharper?")
+    );
+    assert_eq!(parts.iter().filter(|p| p["type"] == "image").count(), 2);
+    assert_eq!(api.calls_to("getFile").len(), 2);
+    assert!(
+        logged.lock().unwrap().is_empty(),
+        "{:?}",
+        logged.lock().unwrap()
     );
 }
