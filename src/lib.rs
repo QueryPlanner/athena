@@ -9,6 +9,7 @@ pub mod eval;
 pub mod flags;
 pub mod gate;
 pub mod http;
+pub mod media;
 pub mod ops;
 pub mod policy;
 pub mod runner;

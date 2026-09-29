@@ -44,6 +44,10 @@ const ENTRYPOINT: [&str; 3] = [
     "if command -v athena-sandbox-start >/dev/null 2>&1; \
      then exec athena-sandbox-start; else exec tail -f /dev/null; fi",
 ];
+/// Where files a user sends are put in their session's sandbox.
+pub const INBOX_DIR: &str = "/tmp/athena-inbox";
+/// How long creating [`INBOX_DIR`] may take.
+const STAGE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Where `athena-sandbox-start` runs Jupyter, for execd's code interpreter.
 const JUPYTER_HOST: &str = "http://127.0.0.1:44771";
 
@@ -66,6 +70,8 @@ pub enum Error {
     Protocol(String),
     /// Athena's database failed.
     Store(String),
+    /// A command Athena ran in the sandbox for itself failed.
+    Failed(String),
 }
 
 impl std::fmt::Display for Error {
@@ -79,6 +85,7 @@ impl std::fmt::Display for Error {
             }
             Self::Protocol(why) => write!(f, "sandbox server: {why}"),
             Self::Store(why) => write!(f, "storage: {why}"),
+            Self::Failed(why) => write!(f, "sandbox: {why}"),
         }
     }
 }
@@ -476,10 +483,36 @@ impl Sandboxes {
         &self,
         session_id: &str,
         path: &str,
-        content: &str,
+        content: Vec<u8>,
     ) -> Result<(), Error> {
         let lease = self.lease(session_id).await?;
-        lease.execd.upload(path, content.as_bytes().to_vec()).await
+        lease.execd.upload(path, content).await
+    }
+
+    /// Put a file the user sent into the session's sandbox, under
+    /// [`INBOX_DIR`], and return its path. `name` must already be safe as a
+    /// file name ([`crate::media::safe_name`]); a random prefix keeps two
+    /// files of the same name apart.
+    pub async fn stage(
+        &self,
+        session_id: &str,
+        name: &str,
+        content: Vec<u8>,
+    ) -> Result<String, Error> {
+        let made = self
+            .command(
+                session_id,
+                &shell::command_line(&["mkdir", "-p", INBOX_DIR])?,
+                STAGE_TIMEOUT,
+            )
+            .await?;
+        if let Some(error) = made.error {
+            return Err(Error::Failed(format!("creating {INBOX_DIR}: {error}")));
+        }
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let path = format!("{INBOX_DIR}/{}-{name}", &id[..8]);
+        self.write_file(session_id, &path, content).await?;
+        Ok(path)
     }
 
     /// Delete the session's sandbox, if it has one. Its files and processes

@@ -17,7 +17,7 @@ if [ -z "${OPENROUTER_API_KEY:-}" ] && ! grep -q '^OPENROUTER_API_KEY=..*' .env 
     echo "OPENROUTER_API_KEY not set: export it or add it to .env"
     exit 1
 fi
-export AGENT_MODEL="${AGENT_MODEL:-openai/gpt-5.6-luna}"
+export AGENT_MODEL="${AGENT_MODEL:-openai/gpt-6-luna}"
 command -v sqlite3 >/dev/null || { echo "sqlite3 is required"; exit 1; }
 command -v curl >/dev/null || { echo "curl is required"; exit 1; }
 python3 -c 'import http.server' 2>/dev/null || { echo "python3 is required"; exit 1; }

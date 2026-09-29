@@ -105,8 +105,20 @@ a `teloxide::Bot` at it with `set_api_url`, or the binary with
 `TELEGRAM_API_URL`. `api.push(text_from(user, text))` queues an update;
 `api.wait_for(...)` and `api.messages_to(chat, n)` wait on a condition over
 the recorded calls; `api.fail_next(method, error)` makes the next call to a
-method fail. The decision logic in `src/telegram.rs` is unit-tested through
+method fail. `api.host_file(id, path, bytes)` makes a file a user "sent"
+downloadable (`getFile`, then `/file/bot<token>/<path>`), and
+`media_from(user, ("photo", photo_sizes(id, size)), caption)` sends it.
+Uploads (`sendPhoto`, `sendDocument`) are multipart; the fake records each
+file part as `{"file_name", "bytes"}`, resolving teloxide's `attach://`
+references. The decision logic in `src/telegram.rs` is unit-tested through
 the `Chat` trait with a recording chat, so most cases need no server.
+
+`tests/sandbox/fake_server.rs` does not run commands, with one exception:
+a command containing `'screenshot' '--annotate' '<path>'` writes a small PNG
+(`SCREENSHOT`) to `<path>`, as agent-browser would, so the screenshot tool's
+image reaches the mock model. `screenshots_are(None)` turns that off. Agents
+in the sandbox tests wrap the mock model in `media::Vision`, as production
+wraps OpenRouter, so they check what the provider would be sent.
 
 Concurrency tests must be deterministic. Park a turn inside a wrapping
 `ConversationMemory` (see `Gated` in `src/service.rs`) and wait on a

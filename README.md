@@ -72,7 +72,7 @@ set it), else the crate version with `-dev`.
 | Variable | Used by | Default | Meaning |
 |---|---|---|---|
 | `OPENROUTER_API_KEY` | anything that talks to the model | none, required | OpenRouter API key |
-| `AGENT_MODEL` | all | `openai/gpt-5.6-luna` | Model id on OpenRouter |
+| `AGENT_MODEL` | all | `openai/gpt-6-luna` | Model id on OpenRouter |
 | `ATHENA_DB` | all | `agent.db`; `serve` and `telegram` require an absolute path | SQLite database file |
 | `ATHENA_VERSION` | `--version`, `GET /version` | `<crate version>-dev` | The deployed release |
 | `RUNS_STORE_RAW` | all | on | `0` drops raw provider responses from `runs.calls_json` |
@@ -126,6 +126,19 @@ The pick is stored (the `selected_sessions` table), so it survives a restart.
 The commands are registered with Telegram's command menu at startup. Any
 other text is a prompt for the current session.
 
+A photo or a file is a prompt too, with its caption as the text (a caption
+is never a command). The bot downloads it (Telegram allows bots up to 20 MB;
+a larger file is refused with a reply), saves it in the session's sandbox
+under `/tmp/athena-inbox/`, and tells the model its name, type, size and
+path. The name is made safe first: only letters, digits, spaces and `._()-`
+are kept, anything else becomes `_`. A photo, or a PNG, JPEG, GIF or WebP file, is also shown to the model
+as an image. Files the model sends with `send_photo` and `send_file` arrive
+after its reply; a photo Telegram refuses (odd proportions, say) is sent
+again as a file. The photos of an album arrive as separate messages; the
+bot collects them until 2 seconds pass with no new one, then runs one turn
+for all of them, with the album's caption as the text. See "Images and
+files" below.
+
 While the model works the bot shows "typing...". A reply longer than
 Telegram's 4096-character limit is split, at a line break if there is one
 near the limit, else at a space, never inside a character; at most 8
@@ -149,8 +162,11 @@ on the machine running athena. The template ships no host tool except `add`.
 |---|---|
 | `shell(command, timeout_secs?)` | bash in a persistent session: `cd`, exports and venvs carry over |
 | `run_code(language, code)` | a persistent Python interpreter (execd's Jupyter-backed code API) |
-| `read_file(path)` / `write_file(path, content)` | files inside the sandbox; reads stop at 64 KiB |
-| `browser_open(url)`, `browser_snapshot()`, `browser_click(ref)`, `browser_fill(ref, text)`, `browser_read(url)`, `browser_screenshot()` | [agent-browser](https://github.com/vercel-labs/agent-browser) inside the sandbox |
+| `read_file(path)` / `write_file(path, content)` | text files inside the sandbox; reads stop at 64 KiB |
+| `browser_open(url)`, `browser_snapshot()`, `browser_click(ref)`, `browser_fill(ref, text)`, `browser_press(key)`, `browser_scroll(direction, pixels?)`, `browser_read(url)` | [agent-browser](https://github.com/vercel-labs/agent-browser) inside the sandbox |
+| `browser_screenshot()` | an annotated screenshot the model looks at: element `[N]` is ref `@eN` |
+| `view_image(path)` | shows the model a PNG, JPEG, GIF or WebP file from the sandbox |
+| `send_photo(path, caption?)` / `send_file(path, caption?)` | sends the user a sandbox file after the reply (Telegram only) |
 
 **One sandbox per session.** The first tool call in a session creates it;
 later calls reuse it and push its expiry `ATHENA_SANDBOX_TIMEOUT_SECS` into
@@ -168,8 +184,34 @@ content boundaries, and `eval` and downloads need a confirmation no tool
 gives. Commands run without a terminal, so interactive programs hang until
 their timeout.
 
+**Images and files.** The model sees images, not descriptions of them:
+screenshots, `view_image`, and photos users send. `src/media.rs` does the
+plumbing:
+
+- OpenRouter's chat API takes images only from the user, and Rig refuses to
+  send one in a tool result. `media::Vision` wraps the provider's model and
+  moves each tool-result image into a user message right after the tool
+  results, labelled with the tool's name. A request carries at most 4
+  images, the newest; older ones become `[older image omitted]`.
+- An image is shown only up to 3.75 MB (5 MB of base64). A larger one is
+  described, not shown.
+- Images are not stored. The transcript keeps
+  `[image not kept in the transcript]` in their place, so a later turn
+  never pays for them again. The files are still in the sandbox until it
+  expires, and `view_image` shows them again.
+- Telemetry exports no image data: every span exporter cuts base64 runs over
+  1024 characters to a note of their length (`telemetry::Redacted`). The
+  stderr log is not filtered this way. With the default `warn,athena=info`
+  it shows none of Rig's spans, but `RUST_LOG=info` or finer prints their
+  fields, images included, with every event inside them.
+- `send_photo` takes images up to 10 MB and `send_file` any file up to
+  50 MB, Telegram's limits; at most 10 files a turn. Over HTTP and the CLI
+  there is nowhere to send a file, and both tools tell the model so.
+
 **Configuration.** Without `OPEN_SANDBOX_URL` none of these tools exist and
-everything else works as before.
+everything else works as before. Photos users send are still shown to the
+model. Other files are not downloaded; the model is told their name and
+size, and that there is no sandbox.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -251,6 +293,8 @@ Caddy or Tailscale settings, and never overwrites a file holding secrets.
     src/sandbox.rs     per-session OpenSandbox sandboxes; sandbox/ has the
                        HTTP client, stream parser, quoting and the tools
     src/policy.rs      the tool-call budget hook
+    src/media.rs       images and files: the provider adapter, the outbox,
+                       stripping images from transcripts
     src/cli.rs         the CLI transport: arguments, output, REPL
     src/http.rs        the HTTP transport: JSON API, SSE streaming, `serve`
     src/telegram.rs    the Telegram transport: commands, sessions, the bot
@@ -713,8 +757,18 @@ log events never include prompt or reply text.
   SIGKILL, which cannot be caught and loses those turns: raise the grace
   period (`docker stop -t`, `stop_grace_period`, `TimeoutStopSec`) to cover
   a slow tool-using turn.
-- Edited messages, photos and other non-text messages are not prompts.
-  Edits are ignored; the rest get "I only read text messages."
+- Edited messages, stickers, voice notes and other messages that are neither
+  text, a photo nor a file are not prompts. Edits are ignored; the rest get
+  "I read text, photos and files, not this kind of message."
+- An album is collected until 2 seconds pass with no new item from it, so
+  its reply starts 2 seconds late. An item that Telegram delivers later than
+  that becomes a turn of its own, or gets the busy reply if the album's turn
+  is still running. At most 4 photos are shown to the model at once; the
+  rest of an album are in the sandbox and the model opens them with
+  `view_image`.
+- Whether the model can see images depends on `AGENT_MODEL`. The default,
+  `openai/gpt-6-luna`, accepts image input on OpenRouter; with a model that
+  does not, the provider may refuse turns that carry a photo or a screenshot.
 - The selected session is Telegram state. The CLI still uses `default`
   unless given a session name, and `sessions` does not mark the selection
   (`selected_sessions` is readable with `sqlite3`). `Service` does not

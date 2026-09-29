@@ -118,7 +118,7 @@ mod tests {
             "OPEN_SANDBOX_URL=http://100.118.54.67:9090",
             "ATHENA_SANDBOX_IMAGE=ghcr.io/queryplanner/athena-sandbox@sha256:abc",
             "ATHENA_SANDBOX_TIMEOUT_SECS=60",
-            "AGENT_MODEL=openai/gpt-5.6-luna",
+            "AGENT_MODEL=openai/gpt-6-luna",
         ];
         let settings = parse(&words).unwrap();
         let keys: Vec<_> = settings.iter().map(|s| s.key).collect();

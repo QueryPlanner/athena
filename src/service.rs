@@ -21,7 +21,7 @@
 //!   above, and run the turn in its own task once it holds the session, so
 //!   a caller that goes away mid-turn does not cancel it.
 
-use crate::runner::{self, Run, RunStart, RunStream};
+use crate::runner::{self, Request, Run, RunStart, RunStream};
 use crate::store::{AppendError, SqliteMemory, Store, now_millis};
 use crate::{agent, telemetry};
 use futures_util::StreamExt;
@@ -212,11 +212,12 @@ impl Service {
         agent: &R,
         user: &User,
         session_id: &str,
-        text: &str,
+        request: impl Into<Request>,
     ) -> Result<Turn, Error> {
-        let (session, lock) = self.claim(user, session_id, text).await?;
+        let request = request.into();
+        let (session, lock) = self.claim(user, session_id, &request).await?;
         let span = turn_span(user, &session);
-        self.complete(&session, lock, agent.run(text, &session.id))
+        self.complete(&session, lock, agent.run(&request, &session.id))
             .instrument(span)
             .await
     }
@@ -233,14 +234,15 @@ impl Service {
         agent: Arc<R>,
         user: &User,
         session_id: &str,
-        text: &str,
+        request: impl Into<Request>,
     ) -> Result<Turn, Error> {
-        let (session, lock) = self.claim(user, session_id, text).await?;
+        let request = request.into();
+        let (session, lock) = self.claim(user, session_id, &request).await?;
         let span = turn_span(user, &session);
-        let (service, text) = (self.clone(), text.to_string());
+        let service = self.clone();
         self.spawn(
             async move {
-                let run = agent.run(&text, &session.id);
+                let run = agent.run(&request, &session.id);
                 service.complete(&session, lock, run).await
             }
             .instrument(span),
@@ -269,7 +271,7 @@ impl Service {
         session_id: &str,
         text: &str,
     ) -> Result<TurnStream, Error> {
-        let (session, lock) = self.claim(user, session_id, text).await?;
+        let (session, lock) = self.claim(user, session_id, &text.into()).await?;
         let span = turn_span(user, &session);
         let (events, receiver) = mpsc::unbounded_channel();
         let (service, text) = (self.clone(), text.to_string());
@@ -318,9 +320,11 @@ impl Service {
         &self,
         user: &User,
         session_id: &str,
-        text: &str,
+        request: &Request,
     ) -> Result<(Session, SessionLock), Error> {
-        non_empty("message", text)?;
+        if request.is_empty() {
+            return Err(Error::Invalid("message must not be empty".into()));
+        }
         let session = self.session(user, session_id).await?;
         let lock = self.store.lock_session(&session.id).await;
         Ok((session, lock))

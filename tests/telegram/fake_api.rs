@@ -3,13 +3,18 @@
 //!
 //! Tests queue updates with [`FakeApi::push`], wait for calls with
 //! [`FakeApi::wait_for`] (a condition, never a sleep), and can make the next
-//! call to a method fail with [`FakeApi::fail_next`].
+//! call to a method fail with [`FakeApi::fail_next`]. Files users "sent" are
+//! registered with [`FakeApi::host_file`] and served as the Bot API does:
+//! `getFile`, then `GET /file/bot<token>/<file_path>`. Uploads
+//! (`sendPhoto`, `sendDocument`) are multipart; each file part is recorded
+//! as `{"file_name": ..., "bytes": [...]}`.
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
-use axum::response::Json;
-use axum::routing::post;
+use axum::extract::{FromRequest, Multipart, Path, Request, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Json, Response};
+use axum::routing::{get, post};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -44,6 +49,8 @@ struct Inner {
     faults: Mutex<HashMap<String, VecDeque<Value>>>,
     changed: Option<watch::Sender<usize>>,
     next_message: Mutex<i64>,
+    /// file_id -> (file_path, content).
+    files: Mutex<HashMap<String, (String, Vec<u8>)>>,
 }
 
 pub struct FakeApi {
@@ -69,6 +76,7 @@ impl FakeApi {
         });
         let app = Router::new()
             .route("/{token}/{method}", post(handle))
+            .route("/file/{token}/{path}", get(download))
             .with_state(inner.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -101,6 +109,16 @@ impl FakeApi {
             .entry(method.to_string())
             .or_default()
             .push_back(error);
+    }
+
+    /// A file a user sent, as Telegram stores it: `getFile` for `id` gives
+    /// `path`, and downloading `path` gives `content`.
+    pub fn host_file(&self, id: &str, path: &str, content: &[u8]) {
+        self.inner
+            .files
+            .lock()
+            .unwrap()
+            .insert(id.into(), (path.into(), content.to_vec()));
     }
 
     pub fn calls(&self) -> Vec<Call> {
@@ -162,19 +180,98 @@ pub fn text_from(user: u64, text: &str) -> Value {
     })
 }
 
+/// A private message from `user` carrying `media` (e.g. `"photo"` and its
+/// sizes), with `caption`.
+pub fn media_from(user: u64, media: (&str, Value), caption: Option<&str>) -> Value {
+    let mut update = text_from(user, "");
+    let message = update["message"].as_object_mut().unwrap();
+    message.remove("text");
+    message.insert(media.0.into(), media.1);
+    if let Some(caption) = caption {
+        message.insert("caption".into(), json!(caption));
+    }
+    update
+}
+
+/// A photo's sizes as Telegram lists them, smallest first: `id` is the
+/// largest.
+pub fn photo_sizes(id: &str, size: u64) -> Value {
+    json!([
+        {"file_id": "thumb", "file_unique_id": "t", "width": 90, "height": 60, "file_size": 900},
+        {"file_id": id, "file_unique_id": "u", "width": 1280, "height": 853, "file_size": size},
+        {"file_id": "mid", "file_unique_id": "m", "width": 320, "height": 213, "file_size": 9000},
+    ])
+}
+
 pub fn bot_user() -> Value {
     json!({"id": 4242, "is_bot": true, "first_name": "athena", "username": "athena_test_bot"})
+}
+
+/// A multipart body as JSON: text parts as strings, file parts as their
+/// name and bytes.
+async fn form(request: Request) -> Value {
+    let mut form = Multipart::from_request(request, &()).await.unwrap();
+    let mut body = serde_json::Map::new();
+    while let Some(field) = form.next_field().await.unwrap() {
+        let name = field.name().unwrap().to_string();
+        let value = match field.file_name().map(str::to_string) {
+            Some(file_name) => {
+                json!({"file_name": file_name, "bytes": field.bytes().await.unwrap().to_vec()})
+            }
+            None => {
+                let text = field.text().await.unwrap();
+                serde_json::from_str(&text).unwrap_or(json!(text))
+            }
+        };
+        body.insert(name, value);
+    }
+    // A field may name another part as `attach://<part>`, as the Bot API
+    // allows and teloxide does: put the part in its place.
+    let references: Vec<(String, String)> = body
+        .iter()
+        .filter_map(|(k, v)| {
+            Some((
+                k.clone(),
+                v.as_str()?.strip_prefix("attach://")?.to_string(),
+            ))
+        })
+        .collect();
+    for (field, part) in references {
+        let file = body.remove(&part).unwrap();
+        body.insert(field, file);
+    }
+    Value::Object(body)
+}
+
+async fn download(
+    State(inner): State<Arc<Inner>>,
+    Path((_token, path)): Path<(String, String)>,
+) -> Response {
+    let files = inner.files.lock().unwrap();
+    match files.values().find(|(p, _)| *p == path) {
+        Some((_, content)) => content.clone().into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn handle(
     State(inner): State<Arc<Inner>>,
     Path((token, method)): Path<(String, String)>,
-    body: Bytes,
+    request: Request,
 ) -> Json<Value> {
     // Bot API method names are case-insensitive and teloxide sends
     // `SendMessage`; record them as the docs spell them, `sendMessage`.
     let method = method[..1].to_lowercase() + &method[1..];
-    let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let multipart = request
+        .headers()
+        .get("content-type")
+        .is_some_and(|t| t.to_str().unwrap().starts_with("multipart/"));
+    let body: Value = if multipart {
+        form(request).await
+    } else {
+        let bytes = Bytes::from_request(request, &()).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
     let call = Call {
         token,
         method: method.clone(),
@@ -206,19 +303,52 @@ async fn handle(
         }
         "getUpdates" => get_updates(&inner, &body).await,
         "sendMessage" => {
-            let mut id = inner.next_message.lock().unwrap();
-            *id += 1;
+            let mut sent = sent_message(&inner, &body);
+            sent["text"] = body["text"].clone();
+            sent
+        }
+        "sendPhoto" => {
+            let mut sent = sent_message(&inner, &body);
+            sent["photo"] = photo_sizes("sent", 1);
+            sent
+        }
+        "sendDocument" => {
+            let mut sent = sent_message(&inner, &body);
+            sent["document"] = json!({"file_id": "sent", "file_unique_id": "s"});
+            sent
+        }
+        "getFile" => {
+            let id = body["file_id"].as_str().unwrap();
+            let files = inner.files.lock().unwrap();
+            let Some((path, content)) = files.get(id) else {
+                return Json(json!({
+                    "ok": false,
+                    "error_code": 400,
+                    "description": "Bad Request: invalid file_id"
+                }));
+            };
             json!({
-                "message_id": *id,
-                "date": 1_790_000_000,
-                "chat": {"id": body["chat_id"], "type": "private", "first_name": "Tester"},
-                "from": bot_user(),
-                "text": body["text"],
+                "file_id": id,
+                "file_unique_id": "u",
+                "file_size": content.len(),
+                "file_path": path,
             })
         }
         _ => json!(true),
     };
     Json(json!({"ok": true, "result": result}))
+}
+
+/// The message a send method answers with, before its content.
+fn sent_message(inner: &Inner, body: &Value) -> Value {
+    let mut id = inner.next_message.lock().unwrap();
+    *id += 1;
+    json!({
+        "message_id": *id,
+        "date": 1_790_000_000,
+        "chat": {"id": body["chat_id"], "type": "private", "first_name": "Tester"},
+        "from": bot_user(),
+    })
 }
 
 /// Updates at or after `offset`, waiting up to `timeout` seconds for one.

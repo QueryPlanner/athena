@@ -23,23 +23,36 @@
 //!   up paid model calls and fill teloxide's per-chat worker queue, which
 //!   stalls every chat.
 //! - Message and reply text is never logged; user ids and errors are.
+//! - A photo or a file is a prompt, its caption the text. It is downloaded
+//!   (Telegram lets bots download up to [`DOWNLOAD_LIMIT`]), put in the
+//!   session's sandbox when there is one, and a photo is shown to the model
+//!   as an image. Albums arrive as one message per item; the bot collects
+//!   them until none has come for [`ALBUM_WAIT`], then runs one turn.
+//! - Files the turn's tools send (`send_photo`, `send_file`) follow the
+//!   reply. A photo Telegram refuses is sent again as a file.
 
 use crate::agent;
-use crate::runner::Run;
+use crate::media::{self, Attachment, File, Kind, Outbox};
+use crate::runner::{Request, Run};
+use crate::sandbox::Sandboxes;
 use crate::service::{self, Service, Session, User};
 use crate::shutdown;
 use crate::store::{self, Store};
 use anyhow::{Context, Result, bail};
-use std::collections::HashSet;
+use futures_util::StreamExt;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use teloxide::dispatching::{DefaultKey, Dispatcher, ShutdownToken, UpdateFilterExt};
+use teloxide::net::Download;
 use teloxide::prelude::{Requester, Update};
-use teloxide::types::{BotCommand, ChatAction, ChatId, Message};
+use teloxide::requests::HasPayload;
+use teloxide::types::{BotCommand, ChatAction, ChatId, FileId, InputFile, Message};
 use teloxide::update_listeners::Polling;
 use teloxide::{Bot, RequestError, dptree};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 /// The transport name every Telegram user is stored under.
@@ -69,9 +82,28 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Tries per message when Telegram answers 429 Too Many Requests.
 const SEND_ATTEMPTS: u32 = 3;
 
+/// How long one Bot API call may take, uploads and downloads included.
+/// teloxide's default, 17 s, is too short for a 50 MB file on a slow link;
+/// it must stay longer than [`POLL_TIMEOUT`].
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The largest file a bot can download from Telegram (`getFile`).
+pub const DOWNLOAD_LIMIT: usize = 20 * 1024 * 1024;
+
+/// Files downloaded at once, across every user.
+const DOWNLOADS: usize = 4;
+
+/// How long an album is collected after its latest item arrived. Telegram
+/// sends the items of an album as separate messages in quick succession and
+/// never says how many there are.
+pub const ALBUM_WAIT: Duration = Duration::from_secs(2);
+
+/// Items one album can hold, as Telegram allows.
+pub const ALBUM_LIMIT: usize = 10;
+
 pub const BUSY: &str =
     "Still working on your last message. Send this one again once I have replied.";
-pub const NOT_TEXT: &str = "I only read text messages.";
+pub const NOT_TEXT: &str = "I read text, photos and files, not this kind of message.";
 pub const SWITCH_USAGE: &str = "Usage: /switch NAME. /sessions lists your sessions.";
 pub const FAILED: &str = "Something went wrong on my side. Try again in a moment.";
 
@@ -130,7 +162,11 @@ impl Config {
     }
 
     pub fn bot(&self) -> Bot {
-        let bot = Bot::new(&self.token);
+        let client = teloxide::net::default_reqwest_settings()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .expect("an HTTP client with rustls builds");
+        let bot = Bot::with_client(&self.token, client);
         match &self.api_url {
             Some(url) => bot.set_api_url(url.clone()),
             None => bot,
@@ -336,6 +372,10 @@ pub trait Chat: Clone + Send + Sync + 'static {
     fn typing(&self) -> impl Future<Output = Result<()>> + Send;
     /// Send one message, at most [`MESSAGE_LIMIT`] long.
     fn say(&self, text: &str) -> impl Future<Output = Result<()>> + Send;
+    /// Download a file the user sent; fail past `limit` bytes.
+    fn download(&self, id: &str, limit: usize) -> impl Future<Output = Result<Vec<u8>>> + Send;
+    /// Send the user a file, as a photo or a document.
+    fn send_file(&self, attachment: &Attachment) -> impl Future<Output = Result<()>> + Send;
 }
 
 /// A message as the logic needs it, whatever transport library delivered it.
@@ -345,8 +385,35 @@ pub struct Incoming {
     pub private: bool,
     /// The sender's Telegram user id; absent for channel posts.
     pub user_id: Option<u64>,
-    /// Absent for photos, stickers and other non-text messages.
+    /// The text, or a photo's or file's caption. Absent for stickers and
+    /// other messages without one.
     pub text: Option<String>,
+    /// The photo or file the message carries: Telegram sends at most one.
+    pub files: Vec<IncomingFile>,
+    /// The album (Telegram's `media_group_id`) the message belongs to.
+    pub album: Option<String>,
+}
+
+/// A photo or file in a message, not yet downloaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingFile {
+    /// Telegram's `file_id`, for `getFile`.
+    pub id: String,
+    /// As the sender named it, not yet made safe.
+    pub name: String,
+    pub mime: Option<String>,
+    /// As Telegram reports it; 0 if it does not.
+    pub size: u64,
+}
+
+/// The reply to a file too large to download.
+pub fn too_big(file: &IncomingFile) -> String {
+    format!(
+        "`{}` is {} MB; I can only receive files up to {} MB.",
+        file.name,
+        file.size.div_ceil(1024 * 1024),
+        DOWNLOAD_LIMIT / (1024 * 1024)
+    )
 }
 
 /// The bot: turns messages into service calls and replies.
@@ -356,10 +423,17 @@ pub struct Telegram<R> {
     /// service does not expose yet.
     store: Store,
     agent: Arc<R>,
+    /// Where users' files are put; none without a sandbox server.
+    sandboxes: Option<Arc<Sandboxes>>,
+    /// Permits for [`DOWNLOADS`].
+    downloads: Arc<Semaphore>,
     log: Log,
     typing_every: Duration,
     /// Users with a turn running.
     busy: Arc<Mutex<HashSet<u64>>>,
+    /// Albums being collected, by user and album id.
+    albums: Mutex<HashMap<(u64, String), Album>>,
+    album_wait: Duration,
     /// Turns running or finished and not yet reaped. [`Telegram::finish`]
     /// waits for them.
     turns: Mutex<JoinSet<()>>,
@@ -367,6 +441,14 @@ pub struct Telegram<R> {
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// An album's items so far.
+struct Album {
+    text: Option<String>,
+    files: Vec<IncomingFile>,
+    /// When the latest item arrived.
+    last: tokio::time::Instant,
 }
 
 /// A claim on a user's one turn. Released when dropped, panics included.
@@ -397,11 +479,29 @@ impl<R: Run + 'static> Telegram<R> {
             service,
             store,
             agent: Arc::new(agent),
+            sandboxes: None,
+            downloads: Arc::new(Semaphore::new(DOWNLOADS)),
             log,
             typing_every: TYPING_EVERY,
             busy: Arc::default(),
+            albums: Mutex::default(),
+            album_wait: ALBUM_WAIT,
             turns: Mutex::default(),
         }
+    }
+
+    /// Put the files users send in these sandboxes: the ones the agent's
+    /// tools use.
+    pub fn sandboxes(mut self, sandboxes: Option<Arc<Sandboxes>>) -> Self {
+        self.sandboxes = sandboxes;
+        self
+    }
+
+    /// Collect an album for this long after its latest item instead of
+    /// [`ALBUM_WAIT`].
+    pub fn album_wait(mut self, wait: Duration) -> Self {
+        self.album_wait = wait;
+        self
     }
 
     /// Renew the typing indicator this often instead of [`TYPING_EVERY`].
@@ -434,7 +534,7 @@ impl<R: Run + 'static> Telegram<R> {
         let Some(user_id) = self.accept(&incoming) else {
             return;
         };
-        let reply = match self.respond(&chat, user_id, incoming.text.as_deref()).await {
+        let reply = match self.respond(&chat, user_id, incoming).await {
             Ok(Some(reply)) => reply,
             Ok(None) => return,
             Err(e) => {
@@ -471,9 +571,28 @@ impl<R: Run + 'static> Telegram<R> {
         self: &Arc<Self>,
         chat: &C,
         user_id: u64,
-        text: Option<&str>,
+        incoming: Incoming,
     ) -> Result<Option<String>, service::Error> {
-        let Some(text) = text else {
+        if !incoming.files.is_empty() {
+            // A caption is never a command: the file is what was sent.
+            if let Some(big) = incoming
+                .files
+                .iter()
+                .find(|f| f.size > DOWNLOAD_LIMIT as u64)
+            {
+                return Ok(Some(too_big(big)));
+            }
+            if let Some(album) = incoming.album {
+                self.collect(chat, user_id, album, incoming.text, incoming.files);
+                return Ok(None);
+            }
+            let user = self.service.user(TRANSPORT, &user_id.to_string()).await?;
+            let text = incoming.text.unwrap_or_default();
+            return self
+                .start_turn(chat, user, user_id, text, incoming.files)
+                .await;
+        }
+        let Some(text) = incoming.text.as_deref() else {
             return Ok(Some(NOT_TEXT.into()));
         };
         let user = self.service.user(TRANSPORT, &user_id.to_string()).await?;
@@ -485,7 +604,11 @@ impl<R: Run + 'static> Telegram<R> {
             Input::Switch(Some(name)) => self.switch(&user, name).await?,
             Input::Usage => self.usage(&user).await?,
             Input::Unknown(cmd) => format!("Unknown command /{cmd}.\n\n{}", command_list()),
-            Input::Text(prompt) => return self.start_turn(chat, user, user_id, prompt).await,
+            Input::Text(prompt) => {
+                return self
+                    .start_turn(chat, user, user_id, prompt.into(), Vec::new())
+                    .await;
+            }
         };
         Ok(Some(reply))
     }
@@ -600,44 +723,192 @@ impl<R: Run + 'static> Telegram<R> {
         Ok(lines.join("\n"))
     }
 
-    /// Start a turn for `prompt` in the user's current session, unless one
-    /// of theirs is already running. Returns what to reply now, if anything.
+    /// Add an album's item. The first item starts a task that waits until
+    /// no item has arrived for [`Telegram::album_wait`], then runs one turn
+    /// for all of them, in that task so [`Telegram::finish`] waits for it.
+    fn collect<C: Chat>(
+        self: &Arc<Self>,
+        chat: &C,
+        user_id: u64,
+        album: String,
+        text: Option<String>,
+        files: Vec<IncomingFile>,
+    ) {
+        let key = (user_id, album);
+        let now = tokio::time::Instant::now();
+        let mut albums = lock(&self.albums);
+        if let Some(open) = albums.get_mut(&key) {
+            if open.files.len() + files.len() > ALBUM_LIMIT {
+                (self.log)(&format!(
+                    "telegram user {user_id}: an album has more than {ALBUM_LIMIT} items; \
+                     ignoring the rest"
+                ));
+            } else {
+                open.files.extend(files);
+            }
+            // Telegram puts an album's caption on one item, not always the first.
+            open.text = open.text.take().or(text);
+            open.last = now;
+            return;
+        }
+        albums.insert(
+            key.clone(),
+            Album {
+                text,
+                files,
+                last: now,
+            },
+        );
+        drop(albums);
+        let (app, chat) = (self.clone(), chat.clone());
+        let mut turns = lock(&self.turns);
+        while turns.try_join_next().is_some() {}
+        turns.spawn(async move {
+            let album = loop {
+                let last = lock(&app.albums)[&key].last;
+                tokio::time::sleep_until(last + app.album_wait).await;
+                let mut albums = lock(&app.albums);
+                if albums[&key].last == last {
+                    break albums.remove(&key).expect("the album is still collected");
+                }
+            };
+            let text = album.text.unwrap_or_default();
+            let reply = match app.claim_turn(user_id).await {
+                Ok(Some((busy, user, session))) => {
+                    let _busy = busy;
+                    return app.turn(chat, user, session, text, album.files).await;
+                }
+                Ok(None) => BUSY.into(),
+                Err(e) => {
+                    (app.log)(&format!("telegram user {user_id}: {e}"));
+                    reply_for(&e)
+                }
+            };
+            say(&chat, &app.log, &reply).await;
+        });
+    }
+
+    /// The user's turn and their current session, or `None` if a turn of
+    /// theirs is already running.
+    async fn claim_turn(
+        &self,
+        user_id: u64,
+    ) -> Result<Option<(Busy, User, Session)>, service::Error> {
+        let Some(busy) = Busy::claim(&self.busy, user_id) else {
+            return Ok(None);
+        };
+        let user = self.service.user(TRANSPORT, &user_id.to_string()).await?;
+        let session = self.current(&user).await?;
+        Ok(Some((busy, user, session)))
+    }
+
+    /// Start a turn for `text` and `files` in the user's current session,
+    /// unless one of theirs is already running. Returns what to reply now,
+    /// if anything.
     async fn start_turn<C: Chat>(
         self: &Arc<Self>,
         chat: &C,
         user: User,
         user_id: u64,
-        prompt: &str,
+        text: String,
+        files: Vec<IncomingFile>,
     ) -> Result<Option<String>, service::Error> {
         let Some(busy) = Busy::claim(&self.busy, user_id) else {
             return Ok(Some(BUSY.into()));
         };
         let session = self.current(&user).await?;
-        let (app, chat, prompt) = (self.clone(), chat.clone(), prompt.to_string());
+        let (app, chat) = (self.clone(), chat.clone());
         let mut turns = lock(&self.turns);
         while turns.try_join_next().is_some() {}
         turns.spawn(async move {
             let _busy = busy;
-            app.turn(chat, user, session, prompt).await;
+            app.turn(chat, user, session, text, files).await;
         });
         Ok(None)
     }
 
-    /// Run one turn and send its reply, showing "typing..." meanwhile.
+    /// Download `file` and put it in `session`'s sandbox. A failure is not
+    /// the turn's: the model is told the file is missing and why.
+    ///
+    /// Only the image shown to the model stays in memory; the bytes move to
+    /// the sandbox. A file nothing could use (no sandbox, and not sent as an
+    /// image) is not downloaded at all.
+    async fn receive<C: Chat>(&self, chat: &C, session: &Session, file: IncomingFile) -> File {
+        let unreceived = |why: &str| File {
+            name: media::safe_name(&file.name),
+            mime: file.mime.clone(),
+            size: file.size,
+            image: None,
+            saved: Err(why.into()),
+        };
+        let sent_as_image = file
+            .mime
+            .as_deref()
+            .is_some_and(|m| m.starts_with("image/"));
+        if self.sandboxes.is_none() && !sent_as_image {
+            return unreceived("this assistant has no sandbox");
+        }
+        // Cannot fail: the semaphore is never closed.
+        let _permit = self
+            .downloads
+            .acquire()
+            .await
+            .expect("downloads is never closed");
+        let bytes = match chat.download(&file.id, DOWNLOAD_LIMIT).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                (self.log)(&format!("downloading a file from Telegram failed: {e:#}"));
+                return unreceived("it could not be downloaded from Telegram");
+            }
+        };
+        let mut received = unreceived("this assistant has no sandbox");
+        received.size = bytes.len() as u64;
+        received.image = media::shown(&bytes, file.mime.as_deref());
+        if let Some(sandboxes) = &self.sandboxes {
+            received.saved = sandboxes
+                .stage(&session.id, &received.name, bytes)
+                .await
+                .map_err(|e| {
+                    (self.log)(&format!("saving a file in the sandbox failed: {e}"));
+                    format!("saving it failed: {e}")
+                });
+        }
+        received
+    }
+
+    /// Run one turn and send its reply, then the files its tools sent,
+    /// showing "typing..." meanwhile.
     ///
     /// The model call runs in its own task: a panic in it becomes a reply,
     /// and nothing cancels it once started.
-    async fn turn<C: Chat>(&self, chat: C, user: User, session: Session, prompt: String) {
+    async fn turn<C: Chat>(
+        &self,
+        chat: C,
+        user: User,
+        session: Session,
+        text: String,
+        files: Vec<IncomingFile>,
+    ) {
         typing(&chat, &self.log).await;
         let typing = tokio::spawn(keep_typing(
             chat.clone(),
             self.typing_every,
             self.log.clone(),
         ));
+        let mut received = Vec::with_capacity(files.len());
+        for file in files {
+            received.push(self.receive(&chat, &session, file).await);
+        }
+        let outbox = Outbox::default();
+        let request = Request {
+            text,
+            files: received,
+            outbox: Some(outbox.clone()),
+        };
         let (service, agent) = (self.service.clone(), self.agent.clone());
         let who = user.external_id().to_string();
         let sent =
-            tokio::spawn(async move { service.send(&*agent, &user, &session.id, &prompt).await })
+            tokio::spawn(async move { service.send(&*agent, &user, &session.id, request).await })
                 .await;
         typing.abort();
         // Wait for it to stop, so no indicator can land after the reply.
@@ -658,6 +929,52 @@ impl<R: Run + 'static> Telegram<R> {
                 break;
             }
         }
+        // Even after a failed turn: the files were made before it failed.
+        for attachment in outbox.take() {
+            deliver(&chat, &self.log, attachment).await;
+        }
+    }
+}
+
+/// Telegram answered a send with an error, rather than the send failing
+/// on the way: the file did not arrive, and sending it differently may work.
+#[derive(Debug)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Telegram refused it: {}", self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Send one file the turn's tools queued. Telegram refuses some images as
+/// photos (too large, odd proportions); those go again as a file. Any other
+/// failure is not retried: a timed-out upload may still have arrived. A file
+/// that cannot be sent is logged and mentioned in the chat.
+async fn deliver<C: Chat>(chat: &C, log: &Log, attachment: Attachment) {
+    let mut sent = chat.send_file(&attachment).await;
+    if let (Err(e), Kind::Photo) = (&sent, attachment.kind)
+        && e.is::<Refused>()
+    {
+        log(&format!(
+            "sending a photo failed, sending it as a file: {e:#}"
+        ));
+        let document = Attachment {
+            kind: Kind::Document,
+            ..attachment.clone()
+        };
+        sent = chat.send_file(&document).await;
+    }
+    if let Err(e) = sent {
+        log(&format!("sending a file failed: {e:#}"));
+        say(
+            chat,
+            log,
+            &format!("(I could not send you `{}`.)", attachment.name),
+        )
+        .await;
     }
 }
 
@@ -712,6 +1029,56 @@ impl Chat for TelegramChat {
     async fn say(&self, text: &str) -> Result<()> {
         retrying(SEND_ATTEMPTS, || self.bot.send_message(self.chat, text)).await?;
         Ok(())
+    }
+
+    async fn download(&self, id: &str, limit: usize) -> Result<Vec<u8>> {
+        let file = retrying(SEND_ATTEMPTS, || self.bot.get_file(FileId(id.into()))).await?;
+        let mut body = self.bot.download_file_stream(&file.path);
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.next().await {
+            bytes.extend_from_slice(&chunk?);
+            if bytes.len() > limit {
+                bail!("the file is over {limit} bytes");
+            }
+        }
+        Ok(bytes)
+    }
+
+    async fn send_file(&self, attachment: &Attachment) -> Result<()> {
+        let file =
+            || InputFile::memory(attachment.bytes.clone()).file_name(attachment.name.clone());
+        let caption = attachment.caption.clone();
+        match attachment.kind {
+            Kind::Photo => {
+                retrying(SEND_ATTEMPTS, || {
+                    let caption = caption.clone();
+                    self.bot
+                        .send_photo(self.chat, file())
+                        .with_payload_mut(|p| p.caption = caption)
+                })
+                .await
+                .map_err(refused)?;
+            }
+            Kind::Document => {
+                retrying(SEND_ATTEMPTS, || {
+                    let caption = caption.clone();
+                    self.bot
+                        .send_document(self.chat, file())
+                        .with_payload_mut(|p| p.caption = caption)
+                })
+                .await
+                .map_err(refused)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A failed send, as [`Refused`] when Telegram answered it with an error.
+fn refused(e: RequestError) -> anyhow::Error {
+    match e {
+        RequestError::Api(api) => Refused(api.to_string()).into(),
+        other => other.into(),
     }
 }
 
@@ -774,11 +1141,19 @@ async fn on_message<R: Run + 'static>(
     message: Message,
     app: Arc<Telegram<R>>,
 ) -> Result<(), Infallible> {
+    let files = files(&message);
     let incoming = Incoming {
         chat_id: message.chat.id.0,
         private: message.chat.is_private(),
         user_id: message.from.as_ref().map(|user| user.id.0),
-        text: message.text().map(str::to_string),
+        // A caption only counts with the photo or file it came with: a
+        // captioned video is not a prompt, and its caption not a command.
+        text: message
+            .text()
+            .or(message.caption().filter(|_| !files.is_empty()))
+            .map(str::to_string),
+        files,
+        album: message.media_group_id().map(|id| id.0.clone()),
     };
     let chat = TelegramChat {
         bot,
@@ -786,6 +1161,27 @@ async fn on_message<R: Run + 'static>(
     };
     app.handle_isolated(chat, incoming).await;
     Ok(())
+}
+
+/// The photo or file in `message`. Of a photo's sizes, the largest:
+/// Telegram lists them smallest first, and sends photos as JPEG.
+fn files(message: &Message) -> Vec<IncomingFile> {
+    let photo = message
+        .photo()
+        .and_then(|sizes| sizes.iter().max_by_key(|s| s.width * s.height))
+        .map(|size| IncomingFile {
+            id: size.file.id.0.clone(),
+            name: "photo.jpg".into(),
+            mime: Some("image/jpeg".into()),
+            size: size.file.size.into(),
+        });
+    let document = message.document().map(|doc| IncomingFile {
+        id: doc.file.id.0.clone(),
+        name: doc.file_name.clone().unwrap_or_else(|| "file".into()),
+        mime: doc.mime_type.as_ref().map(ToString::to_string),
+        size: doc.file.size.into(),
+    });
+    photo.into_iter().chain(document).collect()
 }
 
 fn bot_commands() -> Vec<BotCommand> {
@@ -831,8 +1227,10 @@ pub async fn main(model: &str) -> Result<()> {
     let client = agent::client()?;
     let store = Store::open(&store::path())?;
     let service = Arc::new(Service::new(store.clone(), model, log_warning));
-    let agent = agent::build(&client, model, service.memory())?;
-    let app = Arc::new(Telegram::new(service, store, agent, Arc::new(log_warning)));
+    let sandboxes = agent::sandboxes_from_env(&store)?;
+    let agent = agent::build_with(&client, model, service.memory(), sandboxes.clone());
+    let app =
+        Arc::new(Telegram::new(service, store, agent, Arc::new(log_warning)).sandboxes(sandboxes));
     let bot = config.bot();
     let mut dispatcher = dispatcher(bot.clone(), app.clone());
     stop_on(dispatcher.shutdown_token(), stop);
@@ -1115,13 +1513,15 @@ mod tests {
     enum Event {
         Typing,
         Say(String),
+        /// A file sent, or tried: its name, kind and caption.
+        Sent(String, Kind, Option<String>),
     }
 
     impl Event {
         fn said(&self) -> Option<&str> {
             match self {
                 Event::Say(text) => Some(text),
-                Event::Typing => None,
+                _ => None,
             }
         }
     }
@@ -1129,7 +1529,12 @@ mod tests {
     #[derive(Clone)]
     struct Recorder {
         events: mpsc::UnboundedSender<Event>,
+        /// Every call fails.
         fail: bool,
+        /// What each file id downloads as; any other id fails.
+        files: Arc<std::collections::HashMap<String, Vec<u8>>>,
+        /// Sending a photo fails, as Telegram refuses some.
+        refuse_photos: bool,
     }
 
     impl Chat for Recorder {
@@ -1148,6 +1553,24 @@ mod tests {
             }
             Ok(())
         }
+
+        async fn download(&self, id: &str, _limit: usize) -> Result<Vec<u8>> {
+            self.files.get(id).cloned().context("file not found")
+        }
+
+        async fn send_file(&self, attachment: &Attachment) -> Result<()> {
+            let (name, caption) = (attachment.name.clone(), attachment.caption.clone());
+            self.events
+                .send(Event::Sent(name, attachment.kind, caption))
+                .unwrap();
+            if self.refuse_photos && attachment.kind == Kind::Photo {
+                return Err(Refused("Bad Request: PHOTO_INVALID_DIMENSIONS".into()).into());
+            }
+            if self.fail {
+                bail!("connection reset");
+            }
+            Ok(())
+        }
     }
 
     fn recorder() -> (Recorder, mpsc::UnboundedReceiver<Event>) {
@@ -1156,6 +1579,8 @@ mod tests {
             Recorder {
                 events,
                 fail: false,
+                files: Arc::default(),
+                refuse_photos: false,
             },
             rx,
         )
@@ -1177,8 +1602,10 @@ mod tests {
         let sink = logged.clone();
         let log: Log = Arc::new(move |m| sink.lock().unwrap().push(m.to_string()));
         // Long enough that no renewal lands mid-test; one test shortens it.
+        // Albums close quickly, so their tests do not wait two seconds.
         let app = Telegram::new(Arc::new(service), store.clone(), agent, log)
-            .typing_every(Duration::from_secs(3600));
+            .typing_every(Duration::from_secs(3600))
+            .album_wait(Duration::from_millis(200));
         Harness {
             app: Arc::new(app),
             store,
@@ -1201,6 +1628,8 @@ mod tests {
             private: true,
             user_id: Some(user),
             text: Some(text.into()),
+            files: vec![],
+            album: None,
         }
     }
 
@@ -1442,14 +1871,18 @@ mod tests {
             private: false,
             user_id: Some(1),
             text: Some("hello everyone".into()),
+            files: vec![],
+            album: None,
         };
         let channel = Incoming {
             chat_id: 5,
             private: true,
             user_id: None,
             text: Some("post".into()),
+            files: vec![],
+            album: None,
         };
-        let photo = Incoming {
+        let sticker = Incoming {
             text: None,
             ..from(9, "")
         };
@@ -1457,7 +1890,7 @@ mod tests {
         for (incoming, expected) in [
             (group, vec![]),
             (channel, vec![]),
-            (photo, vec![said(NOT_TEXT)]),
+            (sticker, vec![said(NOT_TEXT)]),
         ] {
             let (chat, mut rx) = recorder();
             h.app.handle(chat, incoming).await;
@@ -1492,8 +1925,8 @@ mod tests {
     async fn failed_sends_are_logged_and_stop_the_remaining_chunks() {
         let long = format!("{}\n{}", "a".repeat(4000), "b".repeat(4000));
         let h = harness(vec![MockTurn::text(long)]);
-        let (events, mut rx) = mpsc::unbounded_channel();
-        let chat = Recorder { events, fail: true };
+        let (mut chat, mut rx) = recorder();
+        chat.fail = true;
 
         h.app.handle(chat, from(1, "hi")).await;
         h.app.finish().await;
@@ -1526,7 +1959,7 @@ mod tests {
     impl Run for Parked {
         async fn run(
             &self,
-            prompt: &str,
+            prompt: &Request,
             conversation: &str,
         ) -> Result<rig_agent::agent::PromptResponse, rig_agent::completion::PromptError> {
             self.started.send(()).unwrap();
@@ -1615,7 +2048,7 @@ mod tests {
     impl Run for Panics {
         async fn run(
             &self,
-            _: &str,
+            _: &Request,
             _: &str,
         ) -> Result<rig_agent::agent::PromptResponse, rig_agent::completion::PromptError> {
             panic!("the agent blew up")
@@ -1648,5 +2081,370 @@ mod tests {
         let lines = log_lines.lock().unwrap().clone();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("formatting bug"), "{lines:?}");
+    }
+
+    // ---- files ----
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\nphoto";
+
+    fn photo(id: &str, size: u64) -> IncomingFile {
+        IncomingFile {
+            id: id.into(),
+            name: "photo.jpg".into(),
+            mime: Some("image/jpeg".into()),
+            size,
+        }
+    }
+
+    /// A message from `user` carrying `file`, captioned `caption`.
+    fn with_file(user: u64, caption: Option<&str>, file: IncomingFile) -> Incoming {
+        Incoming {
+            text: caption.map(str::to_string),
+            files: vec![file],
+            ..from(user, "")
+        }
+    }
+
+    /// Handle `incoming` with `chat`, wait for the turn, return the events.
+    async fn exchange<R: Run + 'static>(
+        h: &Harness<R>,
+        chat: Recorder,
+        mut rx: mpsc::UnboundedReceiver<Event>,
+        incoming: Incoming,
+    ) -> Vec<Event> {
+        h.app.handle(chat, incoming).await;
+        h.app.finish().await;
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        events
+    }
+
+    /// A harness whose model is `model`, so a test can see its requests.
+    fn watched(turns: Vec<MockTurn>) -> (Harness<Agent>, MockCompletionModel) {
+        let model = MockCompletionModel::new(turns);
+        let given = model.clone();
+        let h =
+            harness_with(move |s| agent::configure(AgentBuilder::new(given).memory(s.memory())));
+        (h, model)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_photo_is_shown_to_the_model_with_its_caption() {
+        let (h, model) = watched(vec![MockTurn::text("a cat")]);
+        let (mut chat, rx) = recorder();
+        chat.files = Arc::new([("f1".to_string(), PNG.to_vec())].into());
+
+        let events = exchange(
+            &h,
+            chat,
+            rx,
+            with_file(5, Some("what is it?"), photo("f1", 13)),
+        )
+        .await;
+
+        assert_eq!(events, [Event::Typing, said("a cat")]);
+        let prompt = model.requests()[0].chat_history.last().unwrap().clone();
+        let expected = Request {
+            text: "what is it?".into(),
+            files: vec![File {
+                name: "photo.jpg".into(),
+                mime: Some("image/jpeg".into()),
+                size: PNG.len() as u64,
+                image: Some(media::image(PNG)),
+                saved: Err("this assistant has no sandbox".into()),
+            }],
+            outbox: None,
+        };
+        assert_eq!(prompt, expected.message());
+        // The transcript has the note, not the photo.
+        assert_eq!(h.sessions(5), [("default".to_string(), 2)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_is_a_prompt_even_without_a_caption_and_its_caption_is_never_a_command() {
+        let (h, model) = watched(vec![MockTurn::text("got it"), MockTurn::text("again")]);
+        // Nothing to download: with no sandbox, a PDF is not fetched at all.
+        let (chat, rx) = recorder();
+        let doc = IncomingFile {
+            id: "f1".into(),
+            name: "../r\u{0}eport.pdf".into(),
+            mime: Some("application/pdf".into()),
+            size: 4,
+        };
+
+        let events = exchange(&h, chat.clone(), rx, with_file(6, None, doc.clone())).await;
+        assert_eq!(events, [Event::Typing, said("got it")]);
+        let text = model.requests()[0]
+            .chat_history
+            .last()
+            .unwrap()
+            .rag_text()
+            .unwrap();
+        assert_eq!(
+            text,
+            "[The user attached `r_eport.pdf` (application/pdf, 4 bytes). It is not in your \
+             sandbox: this assistant has no sandbox.]"
+        );
+
+        let (chat, rx) = recorder();
+        let events = exchange(&h, chat, rx, with_file(6, Some("/new x"), doc)).await;
+        assert_eq!(events, [Event::Typing, said("again")]);
+        assert_eq!(h.selected(6), None);
+        assert!(h.logged().is_empty(), "{:?}", h.logged());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_too_large_to_download_is_refused_before_any_turn() {
+        let h = harness(vec![]);
+        let (chat, rx) = recorder();
+        let big = photo("f1", DOWNLOAD_LIMIT as u64 + 1);
+        let events = exchange(&h, chat, rx, with_file(7, None, big.clone())).await;
+        assert_eq!(events, [said(&too_big(&big))]);
+        assert_eq!(
+            too_big(&big),
+            "`photo.jpg` is 21 MB; I can only receive files up to 20 MB."
+        );
+        assert!(h.sessions(7).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_that_cannot_be_downloaded_is_described_to_the_model_and_logged() {
+        let (h, model) = watched(vec![MockTurn::text("I could not open it")]);
+        let (chat, rx) = recorder();
+        let events = exchange(&h, chat, rx, with_file(8, Some("see"), photo("gone", 10))).await;
+        assert_eq!(events, [Event::Typing, said("I could not open it")]);
+        let text = model.requests()[0]
+            .chat_history
+            .last()
+            .unwrap()
+            .rag_text()
+            .unwrap();
+        let note = "(image/jpeg, 10 bytes). It is not in your sandbox: it could not be \
+                    downloaded from Telegram.]";
+        assert!(text.ends_with(note), "{text}");
+        assert_eq!(
+            h.logged(),
+            ["downloading a file from Telegram failed: file not found"]
+        );
+    }
+
+    /// An agent whose tools queued `attachments` during the turn.
+    struct Sends {
+        inner: Agent,
+        attachments: Vec<Attachment>,
+    }
+
+    impl Run for Sends {
+        async fn run(
+            &self,
+            request: &Request,
+            conversation: &str,
+        ) -> Result<rig_agent::agent::PromptResponse, rig_agent::completion::PromptError> {
+            let outbox = request.outbox.as_ref().unwrap();
+            for attachment in &self.attachments {
+                outbox.push(attachment.clone()).unwrap();
+            }
+            self.inner.run(request, conversation).await
+        }
+    }
+
+    fn attachment(name: &str, kind: Kind, caption: Option<&str>) -> Attachment {
+        Attachment {
+            name: name.into(),
+            bytes: PNG.to_vec(),
+            kind,
+            caption: caption.map(str::to_string),
+        }
+    }
+
+    fn sends(turns: Vec<MockTurn>) -> Harness<Sends> {
+        harness_with(|s| Sends {
+            inner: mock(s, turns),
+            attachments: vec![
+                attachment("shot.png", Kind::Photo, Some("the page")),
+                attachment("report.csv", Kind::Document, None),
+            ],
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn files_the_tools_queued_follow_the_reply() {
+        let h = sends(vec![MockTurn::text("here you go")]);
+        let (chat, rx) = recorder();
+        let events = exchange(&h, chat, rx, from(9, "screenshot please")).await;
+        assert_eq!(
+            events,
+            [
+                Event::Typing,
+                said("here you go"),
+                Event::Sent("shot.png".into(), Kind::Photo, Some("the page".into())),
+                Event::Sent("report.csv".into(), Kind::Document, None),
+            ]
+        );
+        assert!(h.logged().is_empty(), "{:?}", h.logged());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_photo_goes_again_as_a_file_and_an_unsendable_file_is_mentioned() {
+        let h = sends(vec![MockTurn::text("one"), MockTurn::text("two")]);
+        let (mut chat, rx) = recorder();
+        chat.refuse_photos = true;
+        let events = exchange(&h, chat, rx, from(10, "go")).await;
+        assert_eq!(
+            events[2..],
+            [
+                Event::Sent("shot.png".into(), Kind::Photo, Some("the page".into())),
+                Event::Sent("shot.png".into(), Kind::Document, Some("the page".into())),
+                Event::Sent("report.csv".into(), Kind::Document, None),
+            ]
+        );
+        assert_eq!(
+            h.logged(),
+            [
+                "sending a photo failed, sending it as a file: Telegram refused it: Bad Request: \
+              PHOTO_INVALID_DIMENSIONS"
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_lost_on_the_way_is_not_sent_again_but_mentioned() {
+        let h = sends(vec![MockTurn::text("one")]);
+        let (mut chat, rx) = recorder();
+        chat.fail = true;
+        let events = exchange(&h, chat, rx, from(10, "go")).await;
+        // The photo is not retried as a file: it may have arrived.
+        assert_eq!(
+            events[2..],
+            [
+                Event::Sent("shot.png".into(), Kind::Photo, Some("the page".into())),
+                said("(I could not send you `shot.png`.)"),
+                Event::Sent("report.csv".into(), Kind::Document, None),
+                said("(I could not send you `report.csv`.)"),
+            ]
+        );
+        let lost = "sending a file failed: connection reset".to_string();
+        assert_eq!(h.logged().iter().filter(|l| **l == lost).count(), 2);
+    }
+
+    // ---- albums ----
+
+    /// Item `n` of album `album` from `user`: photo `p<n>`, captioned.
+    fn album_item(user: u64, album: &str, n: usize, caption: Option<&str>) -> Incoming {
+        Incoming {
+            album: Some(album.into()),
+            ..with_file(user, caption, photo(&format!("p{n}"), 13))
+        }
+    }
+
+    /// A recorder that can download photos `p0` to `p<n - 1>`.
+    fn album_chat(n: usize) -> (Recorder, mpsc::UnboundedReceiver<Event>) {
+        let (mut chat, rx) = recorder();
+        chat.files = Arc::new((0..n).map(|i| (format!("p{i}"), PNG.to_vec())).collect());
+        (chat, rx)
+    }
+
+    /// Hand every item to the bot, then wait for the album's turn.
+    async fn album<R: Run + 'static>(
+        h: &Harness<R>,
+        chat: Recorder,
+        mut rx: mpsc::UnboundedReceiver<Event>,
+        items: Vec<Incoming>,
+    ) -> Vec<Event> {
+        for item in items {
+            h.app.handle(chat.clone(), item).await;
+        }
+        h.app.finish().await;
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        events
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_album_is_one_turn_with_every_photo_and_its_caption() {
+        let (h, model) = watched(vec![MockTurn::text("three cats")]);
+        let (chat, rx) = album_chat(3);
+        let items = vec![
+            album_item(20, "a1", 0, None),
+            // Telegram puts the caption on whichever item it was typed on.
+            album_item(20, "a1", 1, Some("compare these")),
+            album_item(20, "a1", 2, None),
+        ];
+
+        let events = album(&h, chat, rx, items).await;
+
+        assert_eq!(events, [Event::Typing, said("three cats")]);
+        assert_eq!(model.requests().len(), 1);
+        let prompt = model.requests()[0].chat_history.last().unwrap().clone();
+        let text = prompt.rag_text().unwrap();
+        let start = "compare these\n\n[The user attached";
+        assert!(text.starts_with(start), "{text}");
+        assert_eq!(text.matches("It is shown to you below.").count(), 3);
+        let json = serde_json::to_value(&prompt).unwrap();
+        let images = json["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["type"] == "image");
+        assert_eq!(images.count(), 3);
+        assert!(lock(&h.app.albums).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn albums_are_per_user_and_a_busy_user_is_told() {
+        let (h, model) = watched(vec![MockTurn::text("one"), MockTurn::text("one")]);
+        // The same album id from two users: two albums, two turns.
+        let (chat, rx) = album_chat(2);
+        let items = vec![album_item(21, "a1", 0, None), album_item(25, "a1", 1, None)];
+        let events = album(&h, chat, rx, items).await;
+        let replies = events.iter().filter_map(Event::said).count();
+        assert_eq!(replies, 2, "{events:?}");
+        assert_eq!(model.requests().len(), 2);
+
+        // An album that closes while the user's turn runs gets BUSY.
+        let _running = Busy::claim(&h.app.busy, 22).unwrap();
+        let (chat, rx) = album_chat(1);
+        let events = album(&h, chat, rx, vec![album_item(22, "a3", 0, None)]).await;
+        assert_eq!(events, [said(BUSY)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_album_past_telegrams_limit_keeps_its_first_items() {
+        let (h, model) = watched(vec![MockTurn::text("ten")]);
+        let (chat, rx) = album_chat(ALBUM_LIMIT + 1);
+        let items = (0..=ALBUM_LIMIT)
+            .map(|n| album_item(23, "big", n, None))
+            .collect();
+        album(&h, chat, rx, items).await;
+        let text = model.requests()[0]
+            .chat_history
+            .last()
+            .unwrap()
+            .rag_text()
+            .unwrap();
+        assert_eq!(text.matches("[The user attached").count(), ALBUM_LIMIT);
+        assert_eq!(
+            h.logged(),
+            ["telegram user 23: an album has more than 10 items; ignoring the rest"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_storage_failure_when_an_album_closes_is_answered() {
+        let h = harness(vec![]);
+        h.store
+            .db_for_tests()
+            .execute_batch("DROP TABLE selected_sessions")
+            .unwrap();
+        let (chat, rx) = album_chat(1);
+        let events = album(&h, chat, rx, vec![album_item(24, "a", 0, None)]).await;
+        assert_eq!(events, [said(FAILED)]);
+        let first = h.logged().remove(0);
+        assert!(first.starts_with("telegram user 24: storage: "), "{first}");
+        assert!(!lock(&h.app.busy).contains(&24));
     }
 }

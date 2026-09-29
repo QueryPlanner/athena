@@ -32,14 +32,16 @@ use opentelemetry::{Context, KeyValue};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_http::HeaderExtractor;
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::logs::{LogExporter, LoggerProviderBuilder, SdkLoggerProvider};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
-use opentelemetry_sdk::trace::{SdkTracerProvider, SpanExporter, TracerProviderBuilder};
+use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter, TracerProviderBuilder};
 use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -189,6 +191,70 @@ pub fn otlp_exporters()
     })
 }
 
+/// A run of base64 this long is image or file data, not text anyone reads.
+const BASE64_RUN: usize = 1024;
+
+/// `text` with every run of base64 longer than [`BASE64_RUN`] replaced by a
+/// note of its length, or `None` if there is none.
+///
+/// Content telemetry records every model request, and a turn that looks at
+/// screenshots would otherwise export each one, base64-encoded, on every
+/// later model call of the turn.
+pub fn without_base64(text: &str) -> Option<String> {
+    static RUN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(&format!("[A-Za-z0-9+/]{{{BASE64_RUN},}}={{0,2}}"))
+            .expect("a valid regex")
+    });
+    RUN.is_match(text).then(|| {
+        RUN.replace_all(text, |run: &regex::Captures<'_>| {
+            format!("[{} characters of base64 omitted]", run[0].len())
+        })
+        .into_owned()
+    })
+}
+
+fn redact(attributes: &mut [KeyValue]) {
+    for attribute in attributes {
+        if let opentelemetry::Value::String(value) = &attribute.value
+            && let Some(kept) = without_base64(value.as_str())
+        {
+            attribute.value = kept.into();
+        }
+    }
+}
+
+/// A span exporter that exports spans without base64 data in their
+/// attributes or events ([`without_base64`]). Every sink gets one.
+#[derive(Debug)]
+pub struct Redacted<S>(pub S);
+
+impl<S: SpanExporter> SpanExporter for Redacted<S> {
+    fn export(
+        &self,
+        mut batch: Vec<SpanData>,
+    ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+        for span in &mut batch {
+            redact(&mut span.attributes);
+            for event in span.events.events.iter_mut() {
+                redact(&mut event.attributes);
+            }
+        }
+        self.0.export(batch)
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.0.shutdown_with_timeout(timeout)
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        self.0.force_flush()
+    }
+
+    fn set_resource(&mut self, resource: &Resource) {
+        self.0.set_resource(resource);
+    }
+}
+
 /// Where spans and logs are exported to, each sink behind its own batch
 /// processor (and thread). None means OpenTelemetry is off.
 pub struct Sinks {
@@ -233,7 +299,7 @@ impl Sinks {
     {
         Self {
             count: self.count + 1,
-            tracer: self.tracer.with_batch_exporter(exporters.spans),
+            tracer: self.tracer.with_batch_exporter(Redacted(exporters.spans)),
             logger: self.logger.with_batch_exporter(exporters.logs),
         }
     }
@@ -617,6 +683,102 @@ mod tests {
         stderr.clone().flush().unwrap();
         let shown = String::from_utf8(stderr.0.lock().unwrap().clone()).unwrap();
         (bodies, shown)
+    }
+
+    #[test]
+    fn long_base64_runs_are_cut_and_everything_else_is_kept() {
+        let image = "iVBORw0KGgo+/".repeat(100);
+        assert_eq!(without_base64("plain text, a short aGVsbG8= token"), None);
+        assert_eq!(without_base64(&"A".repeat(BASE64_RUN - 1)), None);
+        assert_eq!(
+            without_base64(&format!(
+                r#"{{"value":"{image}==","type":"base64"}} and {image}"#
+            )),
+            Some(
+                r#"{"value":"[1302 characters of base64 omitted]","type":"base64"} and [1300 characters of base64 omitted]"#
+                    .to_string()
+            )
+        );
+    }
+
+    /// An exporter whose flush fails, to tell a forwarded call from the
+    /// trait's default.
+    #[derive(Debug)]
+    struct FailsToFlush;
+
+    impl SpanExporter for FailsToFlush {
+        async fn export(&self, _: Vec<SpanData>) -> OTelSdkResult {
+            Ok(())
+        }
+
+        fn force_flush(&self) -> OTelSdkResult {
+            Err(opentelemetry_sdk::error::OTelSdkError::InternalFailure(
+                "flush".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_redacting_exporter_exports_and_flushes_through_what_it_wraps() {
+        let redacted = Redacted(FailsToFlush);
+        assert!(redacted.export(Vec::new()).await.is_ok());
+        assert!(redacted.force_flush().is_err());
+    }
+
+    #[test]
+    fn exported_spans_carry_no_image_data() {
+        // An image as Rig records a model's input: its own serialisation.
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.resize(2000, 7);
+        let encoded = crate::media::base64(&png);
+        let message = rig_core::message::Message::User {
+            content: vec![
+                rig_core::message::UserContent::text("look"),
+                rig_core::message::UserContent::Image(crate::media::image(&png).unwrap()),
+            ],
+        };
+        let exporters = in_memory();
+        let spans = exporters.spans.clone();
+        let (layers, telemetry) = layers(
+            &settings(&[]),
+            Sinks::default().with(exporters),
+            std::io::sink,
+        );
+        let subscriber = tracing_subscriber::registry().with(layers);
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "chat",
+                gen_ai.input.messages = tracing::field::Empty,
+                gen_ai.usage.input_tokens = 12,
+            );
+            rig_core::telemetry::record_model_input(&span, &[message], true);
+            let _entered = span.enter();
+            tracing::info!(gen_ai.tool.call.result = encoded.as_str(), "tool");
+        });
+        telemetry.tracer.as_ref().unwrap().force_flush().unwrap();
+        let exported = spans.get_finished_spans().unwrap();
+        let attribute = |key: &str| {
+            exported[0]
+                .attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.to_string())
+                .unwrap()
+        };
+        let input = attribute("gen_ai.input.messages");
+        assert!(input.contains("look"), "{input}");
+        let omitted = format!("[{} characters of base64 omitted]", encoded.len());
+        assert!(input.contains(&omitted), "{input}");
+        assert!(!input.contains(&encoded[..BASE64_RUN]), "{input}");
+        assert_eq!(attribute("gen_ai.usage.input_tokens"), "12");
+        let event = &exported[0].events.events[0];
+        let result = event
+            .attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == "gen_ai.tool.call.result")
+            .unwrap();
+        assert_eq!(result.value.to_string(), omitted);
+        telemetry.shutdown_to(&mut Vec::new());
     }
 
     #[test]

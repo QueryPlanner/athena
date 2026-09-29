@@ -14,6 +14,7 @@
 //! outside this file goes through it, so the choice of handle (one connection
 //! behind a mutex, see the README) can change here without touching callers.
 
+use crate::media;
 use anyhow::{Context, Result, bail};
 use rig_agent::prelude::Message;
 use rig_core::memory::{ConversationMemory, MemoryError};
@@ -804,6 +805,8 @@ impl Store {
     ///
     /// With `expected_next`, refuses to write unless the next seq is still
     /// that one. Earlier rows are never touched. Returns the seq range written.
+    /// Images are not stored (see [`media::strip_images`]): the turn they
+    /// came in has used them, and a later turn would pay for them again.
     pub(crate) fn append(
         &self,
         session_id: &str,
@@ -822,7 +825,7 @@ impl Store {
                 found: next,
             });
         }
-        for (i, m) in messages.iter().enumerate() {
+        for (i, m) in media::strip_images(messages).iter().enumerate() {
             tx.execute(
                 "INSERT INTO messages (session_id, seq, json) VALUES (?1, ?2, ?3)",
                 rusqlite::params![
@@ -1341,6 +1344,26 @@ mod tests {
             .query_row("SELECT json FROM messages WHERE seq = 0", [], |r| r.get(0))
             .unwrap();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn images_are_not_stored_but_the_rest_of_the_message_is() {
+        use rig_core::message::UserContent;
+        let (store, _, id) = with_session();
+        let photo = media::image(b"\x89PNG\r\n\x1a\nrest").unwrap();
+        let sent = Message::User {
+            content: vec![UserContent::text("look"), UserContent::Image(photo)],
+        };
+        store.append(&id, Some(0), &[sent]).unwrap();
+        assert_eq!(
+            store.load(&id).unwrap(),
+            [Message::User {
+                content: vec![
+                    UserContent::text("look"),
+                    UserContent::text(media::NOT_KEPT)
+                ],
+            }]
+        );
     }
 
     #[test]

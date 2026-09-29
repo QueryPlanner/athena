@@ -41,6 +41,8 @@ struct Inner {
     bash: Mutex<HashSet<String>>,
     contexts: Mutex<HashSet<String>>,
     files: Mutex<HashMap<String, Vec<u8>>>,
+    /// What an annotated screenshot command writes to its path, if anything.
+    screenshot: Mutex<Option<Vec<u8>>>,
     replies: Mutex<VecDeque<(StatusCode, String)>>,
     /// The next response to a request whose path ends with the key.
     faults: Mutex<HashMap<String, (StatusCode, String)>>,
@@ -67,6 +69,7 @@ impl FakeSandbox {
         let inner = Arc::new(Inner {
             host: host.clone(),
             startup: Mutex::new(vec!["Running".into()]),
+            screenshot: Mutex::new(Some(SCREENSHOT.to_vec())),
             ..Default::default()
         });
         let app = Router::new().fallback(handle).with_state(inner.clone());
@@ -150,6 +153,12 @@ impl FakeSandbox {
         *self.inner.on_create.lock().unwrap() = Some(Box::new(hook));
     }
 
+    /// What the next screenshots write: `None` writes nothing, as if
+    /// agent-browser failed.
+    pub fn screenshots_are(&self, content: Option<&[u8]>) {
+        *self.inner.screenshot.lock().unwrap() = content.map(<[u8]>::to_vec);
+    }
+
     pub fn file(&self, path: &str) -> Option<Vec<u8>> {
         self.inner.files.lock().unwrap().get(path).cloned()
     }
@@ -162,6 +171,25 @@ impl FakeSandbox {
             .insert(path.to_string(), content.to_vec());
     }
 }
+
+/// Sandbox settings pointing at the fake server at `url`.
+pub fn config(url: &str) -> athena::sandbox::Config {
+    athena::sandbox::Config {
+        url: url::Url::parse(url).unwrap(),
+        api_key: None,
+        image: "athena-sandbox:test".into(),
+        timeout: std::time::Duration::from_secs(600),
+        env: "test".into(),
+        cpu: "500m".into(),
+        memory: "1Gi".into(),
+        startup_timeout: std::time::Duration::from_secs(5),
+        startup_poll: std::time::Duration::from_millis(1),
+    }
+}
+
+/// A PNG, as far as anyone checking its first bytes can tell: what the fake
+/// agent-browser saves for a screenshot.
+pub const SCREENSHOT: &[u8] = b"\x89PNG\r\n\x1a\nfake screenshot";
 
 /// execd's stream: init, one stdout event, completion.
 pub fn printed(text: &str) -> String {
@@ -329,7 +357,17 @@ async fn execd(
         reply(status, text)
     };
     match (method, rest) {
-        (Method::POST, ["command"]) => stream(body["command"].as_str().unwrap().to_string()),
+        (Method::POST, ["command"]) => {
+            let command = body["command"].as_str().unwrap();
+            // agent-browser would write the file; `--annotate` then the path.
+            if let Some((_, rest)) = command.split_once("'screenshot' '--annotate' '")
+                && let Some(content) = inner.screenshot.lock().unwrap().clone()
+            {
+                let path = rest.split('\'').next().unwrap();
+                inner.files.lock().unwrap().insert(path.into(), content);
+            }
+            stream(command.to_string())
+        }
         (Method::POST, ["session"]) => {
             let id = format!("bash-{}", uuid::Uuid::new_v4().simple());
             inner.bash.lock().unwrap().insert(id.clone());

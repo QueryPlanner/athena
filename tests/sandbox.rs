@@ -6,13 +6,15 @@ mod common;
 mod fake_server;
 
 use athena::agent;
+use athena::media::{self, Kind, Outbox};
 use athena::policy::MAX_TOOL_CALLS;
-use athena::sandbox::tools::READ_LIMIT;
-use athena::sandbox::{Config, Error, Sandboxes};
+use athena::runner::Request;
+use athena::sandbox::tools::{CAPTION_LIMIT, PHOTO_LIMIT, READ_LIMIT};
+use athena::sandbox::{Config, Error, INBOX_DIR, Sandboxes};
 use athena::service::{Service, User};
 use athena::store::SandboxRow;
 use common::*;
-use fake_server::{FakeSandbox, printed};
+use fake_server::{FakeSandbox, SCREENSHOT, config, printed};
 use reqwest::header::HeaderValue;
 use rig_agent::agent::AgentBuilder;
 use rig_core::message::AssistantContent;
@@ -20,20 +22,6 @@ use rig_core::test_utils::{MockCompletionModel, MockTurn};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
-
-fn config(url: &str) -> Config {
-    Config {
-        url: url::Url::parse(url).unwrap(),
-        api_key: None,
-        image: "athena-sandbox:test".into(),
-        timeout: Duration::from_secs(600),
-        env: "test".into(),
-        cpu: "500m".into(),
-        memory: "1Gi".into(),
-        startup_timeout: Duration::from_secs(5),
-        startup_poll: Duration::from_millis(1),
-    }
-}
 
 struct Harness {
     fake: FakeSandbox,
@@ -77,25 +65,39 @@ impl Harness {
         session(&self.service, &self.user, name).await.id
     }
 
+    /// The production agent in front of the mock model, with the same
+    /// [`media::Vision`] adapter as the real provider gets.
     fn agent(&self, turns: Vec<MockTurn>) -> (rig_agent::agent::Agent, MockCompletionModel) {
         let model = MockCompletionModel::new(turns);
-        let builder = AgentBuilder::new(model.clone()).memory(self.service.memory());
+        let builder = AgentBuilder::new(media::Vision(model.clone())).memory(self.service.memory());
         let agent = agent::configure_with(builder, Some(self.sandboxes.clone()));
         (agent, model)
     }
 
-    /// One turn in which the model calls `tool` with `args`; returns what
-    /// the tool answered.
-    async fn call(&self, session_id: &str, tool: &str, args: Value) -> String {
+    /// One turn of `request` in which the model calls `tool` with `args`;
+    /// returns the request the model got next, holding the tool's result.
+    async fn turn(
+        &self,
+        session_id: &str,
+        tool: &str,
+        args: Value,
+        request: Request,
+    ) -> rig_core::completion::CompletionRequest {
         let (agent, model) = self.agent(vec![
             MockTurn::tool_call("call_1", tool, args),
             MockTurn::text("done"),
         ]);
         self.service
-            .send(&agent, &self.user, session_id, "go")
+            .send(&agent, &self.user, session_id, request)
             .await
             .unwrap();
-        tool_result(&model.requests()[1])
+        model.requests().remove(1)
+    }
+
+    /// One turn in which the model calls `tool` with `args`; returns what
+    /// the tool answered.
+    async fn call(&self, session_id: &str, tool: &str, args: Value) -> String {
+        tool_result(&self.turn(session_id, tool, args, "go".into()).await)
     }
 
     fn row(&self, session_id: &str) -> Option<SandboxRow> {
@@ -413,6 +415,17 @@ async fn browser_tools_run_agent_browser_with_quoted_arguments() {
             json!({"url": "http://docs.rs"}),
             "'read' 'http://docs.rs/'",
         ),
+        (
+            "browser_scroll",
+            json!({"direction": "down"}),
+            "'scroll' 'down'",
+        ),
+        (
+            "browser_scroll",
+            json!({"direction": "up", "pixels": 400}),
+            "'scroll' 'up' '400'",
+        ),
+        ("browser_press", json!({"key": "Enter"}), "'press' 'Enter'"),
     ];
     for (tool, args, tail) in cases {
         let expected = format!("{prefix} {tail}");
@@ -441,8 +454,225 @@ async fn browser_tools_run_agent_browser_with_quoted_arguments() {
     );
     assert_eq!(
         command,
-        format!("mkdir -p /tmp/athena-screenshots && {prefix} 'screenshot' '{path}'")
+        format!("mkdir -p /tmp/athena-screenshots && {prefix} 'screenshot' '--annotate' '{path}'")
     );
+}
+
+/// The last message the model was sent, as JSON.
+fn last_message(request: &rig_core::completion::CompletionRequest) -> Value {
+    serde_json::to_value(request.chat_history.last().unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn the_model_sees_an_annotated_screenshot_after_the_tool_result() {
+    let h = harness().await;
+    let s = h.session("s").await;
+    h.fake
+        .reply_next(printed("Screenshot saved\n[1] @e1 button \"Submit\"\n"));
+    let request = h
+        .turn(&s, "browser_screenshot", json!({}), "go".into())
+        .await;
+
+    let last = last_message(&request);
+    let content = last["content"].as_array().unwrap();
+    // The tool result stays text, so it can be sent as the tool's reply.
+    let note = content[0]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        note.starts_with("screenshot: /tmp/athena-screenshots/"),
+        "{note}"
+    );
+    assert!(note.contains("[1] @e1 button \"Submit\""), "{note}");
+    assert_eq!(content[0]["content"].as_array().unwrap().len(), 1);
+    // Then the image itself, as the user's.
+    assert_eq!(content[1]["text"], "Image from browser_screenshot:");
+    assert_eq!(content[2]["type"], "image");
+    assert_eq!(content[2]["data"]["value"], media::base64(SCREENSHOT));
+    assert_eq!(content[2]["media_type"], "png");
+    assert_eq!(content.len(), 3);
+
+    // The transcript keeps the note but not the image's bytes.
+    let stored = raw_rows(&h.tmp.raw(), &s).join("\n");
+    assert!(stored.contains("[1] @e1 button"));
+    assert!(!stored.contains(&media::base64(SCREENSHOT)));
+    assert!(stored.contains(media::NOT_KEPT));
+}
+
+#[tokio::test]
+async fn a_screenshot_that_was_not_saved_is_reported_not_shown() {
+    let h = harness().await;
+    let s = h.session("s").await;
+    h.fake.screenshots_are(None);
+    h.fake.reply_next(printed("Error: no page is open\n"));
+    let out = h.call(&s, "browser_screenshot", json!({})).await;
+    // What agent-browser said, then why there is no image.
+    assert!(
+        out.contains("\nError: no page is open\n[not shown: "),
+        "{out}"
+    );
+    assert!(out.ends_with("file not found\"}]"), "{out}");
+}
+
+#[tokio::test]
+async fn view_image_shows_images_and_says_why_it_shows_nothing_else() {
+    let h = harness().await;
+    let s = h.session("s").await;
+    h.fake.put_file("/w/chart.png", SCREENSHOT);
+    let request = h
+        .turn(
+            &s,
+            "view_image",
+            json!({"path": "/w/chart.png"}),
+            "go".into(),
+        )
+        .await;
+    let last = last_message(&request);
+    assert_eq!(
+        last["content"][0]["content"][0]["text"],
+        "image: /w/chart.png"
+    );
+    assert_eq!(last["content"][1]["text"], "Image from view_image:");
+    assert_eq!(
+        last["content"][2]["data"]["value"],
+        media::base64(SCREENSHOT)
+    );
+
+    h.fake.put_file("/w/notes.txt", b"just text");
+    let out = h
+        .call(&s, "view_image", json!({"path": "/w/notes.txt"}))
+        .await;
+    assert_eq!(
+        out,
+        "image: /w/notes.txt\n[not shown: not a PNG, JPEG, GIF or WebP image]"
+    );
+
+    let mut big = SCREENSHOT.to_vec();
+    big.resize(media::MAX_IMAGE_BYTES + 1, 0);
+    h.fake.put_file("/w/big.png", &big);
+    let out = h
+        .call(&s, "view_image", json!({"path": "/w/big.png"}))
+        .await;
+    assert!(out.ends_with("bytes the model can be shown]"), "{out}");
+
+    let out = h
+        .call(&s, "view_image", json!({"path": "/w/none.png"}))
+        .await;
+    assert!(out.starts_with("image: /w/none.png\n[not shown: "), "{out}");
+    assert!(out.contains("HTTP 404"), "{out}");
+}
+
+/// A turn in which the model sends `path` with `tool`, with an outbox.
+async fn sent(h: &Harness, s: &str, tool: &str, args: Value) -> (String, Outbox) {
+    let outbox = Outbox::default();
+    let request = Request {
+        text: "go".into(),
+        outbox: Some(outbox.clone()),
+        ..Request::default()
+    };
+    let out = tool_result(&h.turn(s, tool, args, request).await);
+    (out, outbox)
+}
+
+#[tokio::test]
+async fn sent_files_are_queued_for_the_transport_with_a_safe_name() {
+    let h = harness().await;
+    let s = h.session("s").await;
+    h.fake.put_file("/w/out/shot.png", SCREENSHOT);
+    h.fake.put_file("/w/report.csv", b"a,b\n1,2\n");
+
+    let (out, outbox) = sent(
+        &h,
+        &s,
+        "send_photo",
+        json!({"path": "/w/out/shot.png", "caption": "the page"}),
+    )
+    .await;
+    assert_eq!(
+        out,
+        "shot.png (23 bytes) will be sent to the user with your reply"
+    );
+    let queued = outbox.take();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(
+        (
+            queued[0].name.as_str(),
+            queued[0].kind,
+            queued[0].caption.as_deref()
+        ),
+        ("shot.png", Kind::Photo, Some("the page"))
+    );
+    assert_eq!(queued[0].bytes, SCREENSHOT);
+
+    let (out, outbox) = sent(&h, &s, "send_file", json!({"path": "/w/report.csv"})).await;
+    assert!(out.starts_with("report.csv (8 bytes)"), "{out}");
+    let queued = outbox.take();
+    assert_eq!(
+        (queued[0].kind, queued[0].caption.clone()),
+        (Kind::Document, None)
+    );
+}
+
+#[tokio::test]
+async fn files_are_not_sent_where_they_cannot_arrive_or_should_not() {
+    let h = harness().await;
+    let s = h.session("s").await;
+    h.fake.put_file("/w/report.csv", b"a,b");
+    let mut big = SCREENSHOT.to_vec();
+    big.resize(PHOTO_LIMIT + 1, 0);
+    h.fake.put_file("/w/huge.png", &big);
+
+    // No outbox: the HTTP API and the CLI.
+    let out = h
+        .call(&s, "send_file", json!({"path": "/w/report.csv"}))
+        .await;
+    assert!(out.contains("cannot receive files"), "{out}");
+
+    for (tool, args, why) in [
+        (
+            "send_photo",
+            json!({"path": "/w/report.csv"}),
+            "send it with send_file",
+        ),
+        ("send_photo", json!({"path": "/w/huge.png"}), "is over the"),
+        (
+            "send_file",
+            json!({"path": "/w/report.csv", "caption": "c".repeat(CAPTION_LIMIT + 1)}),
+            "caption is over",
+        ),
+        ("send_file", json!({"path": "/w/missing"}), "HTTP 404"),
+    ] {
+        let (out, outbox) = sent(&h, &s, tool, args).await;
+        assert!(out.contains(why), "{tool}: {out}");
+        assert!(outbox.take().is_empty(), "{tool}");
+    }
+}
+
+#[tokio::test]
+async fn a_users_file_is_staged_in_the_sessions_inbox() {
+    let h = harness().await;
+    let s = h.session("s").await;
+    let path = h
+        .sandboxes
+        .stage(&s, "a b.pdf", b"%PDF".to_vec())
+        .await
+        .unwrap();
+    let name = path.strip_prefix(&format!("{INBOX_DIR}/")).unwrap();
+    assert_eq!(name.len(), "12345678-a b.pdf".len(), "{path}");
+    assert!(name.ends_with("-a b.pdf"), "{path}");
+    assert_eq!(h.fake.file(&path).unwrap(), b"%PDF");
+    let mkdir = &h.fake.requests_to("POST", "/command")[0];
+    assert_eq!(mkdir.body["command"], "'mkdir' '-p' '/tmp/athena-inbox'");
+
+    let failed =
+        json!({"type": "error", "error": {"ename": "CommandExecError", "evalue": "exit status 1"}});
+    h.fake.reply_next(format!("{failed}\n\n"));
+    let err = h.sandboxes.stage(&s, "x", vec![]).await.unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "sandbox: creating /tmp/athena-inbox: CommandExecError: exit status 1"
+    );
+    h.fake.fail_next("/command", 500, "down");
+    let err = h.sandboxes.stage(&s, "x", vec![]).await.unwrap_err();
+    assert!(err.to_string().contains("HTTP 500"), "{err}");
 }
 
 #[tokio::test]
@@ -722,12 +952,17 @@ async fn the_model_is_offered_every_sandbox_tool_only_with_a_server() {
             "browser_click",
             "browser_fill",
             "browser_open",
+            "browser_press",
             "browser_read",
             "browser_screenshot",
+            "browser_scroll",
             "browser_snapshot",
             "read_file",
             "run_code",
+            "send_file",
+            "send_photo",
             "shell",
+            "view_image",
             "write_file"
         ]
     );

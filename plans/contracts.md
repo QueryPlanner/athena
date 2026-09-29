@@ -73,6 +73,20 @@ it needs no user header. Every other endpoint is unchanged.
 - **Pull:** anonymous `oras pull ghcr.io/queryplanner/athena@sha256:...` works once
   the package is made public (one-time human step).
 
+## Files between Telegram, the model and the sandbox
+
+| Name | Value | Owner |
+|---|---|---|
+| Inbox in each sandbox | `/tmp/athena-inbox/<8 hex>-<safe name>` (`sandbox::INBOX_DIR`) | `Sandboxes::stage` |
+| Screenshots in each sandbox | `/tmp/athena-screenshots/<uuid>.png` | `browser_screenshot` |
+| Bot API methods | `getFile`, file download `GET /file/bot<token>/<file_path>`, `sendPhoto`, `sendDocument` (multipart) | `telegram.rs` |
+| Download limit | 20 MB (`telegram::DOWNLOAD_LIMIT`) | Bot API |
+| Albums | collected by `(user, media_group_id)` until 2 s pass with no new item (`telegram::ALBUM_WAIT`), at most 10 items, one turn | `telegram.rs` |
+| Upload limits | photo 10 MB, document 50 MB, caption 1024 chars, 10 files a turn | `sandbox::tools`, `media::MAX_ATTACHMENTS` |
+| Image shown to the model | PNG, JPEG, GIF, WebP up to 3.75 MB; 4 a request | `media` |
+| Stored transcripts | images replaced by `[image not kept in the transcript]` | `store::append` |
+| Exported spans | base64 runs over 1024 chars replaced by `[N characters of base64 omitted]` | `telemetry::Redacted` |
+
 The sandbox image is a separate Docker image:
 - repository `ghcr.io/queryplanner/athena-sandbox`, tags `latest` and `sha-<sha>`;
 - built from `deploy/sandbox-image/Dockerfile` by CI on push to `main`;
