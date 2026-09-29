@@ -177,9 +177,10 @@ Tools know their session from the run itself (Rig's per-request
 `ToolContext`, set in `src/runner.rs`), never from the model.
 
 **Limits.** Each tool result is cut to 16 KiB. URLs must be http or https;
-element refs must look like `@e3`. A run may make 40 tool calls, each with at
-most 128 KiB of arguments; past that the call is skipped and the model is
-told why (`src/policy.rs`). Browser output is wrapped in agent-browser's
+element refs must look like `@e3`. A tool call may carry at most 128 KiB of
+arguments; a larger one is skipped and the model is told why
+(`src/policy.rs`). There is no limit on how many model turns or tool calls
+one reply makes, and no way yet to stop a reply that is running. Browser output is wrapped in agent-browser's
 content boundaries, and `eval` and downloads need a confirmation no tool
 gives. Commands run without a terminal, so interactive programs hang until
 their timeout.
@@ -292,7 +293,7 @@ Caddy or Tailscale settings, and never overwrites a file holding secrets.
     src/runner.rs      the Run trait, the run record, each run's tool context
     src/sandbox.rs     per-session OpenSandbox sandboxes; sandbox/ has the
                        HTTP client, stream parser, quoting and the tools
-    src/policy.rs      the tool-call budget hook
+    src/policy.rs      the tool-call argument-size hook
     src/media.rs       images and files: the provider adapter, the outbox,
                        stripping images from transcripts
     src/cli.rs         the CLI transport: arguments, output, REPL
