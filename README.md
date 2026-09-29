@@ -163,8 +163,7 @@ on the machine running athena. The template ships no host tool except `add`.
 | `shell(command, timeout_secs?)` | bash in a persistent session: `cd`, exports and venvs carry over |
 | `run_code(language, code)` | a persistent Python interpreter (execd's Jupyter-backed code API) |
 | `read_file(path)` / `write_file(path, content)` | text files inside the sandbox; reads stop at 64 KiB |
-| `browser_open(url)`, `browser_snapshot()`, `browser_click(ref)`, `browser_fill(ref, text)`, `browser_press(key)`, `browser_scroll(direction, pixels?)`, `browser_read(url)` | [agent-browser](https://github.com/vercel-labs/agent-browser) inside the sandbox |
-| `browser_screenshot()` | an annotated screenshot the model looks at: element `[N]` is ref `@eN` |
+| `agent_browser(args)` | the whole agent-browser CLI, unrestricted: `args` are the arguments after `agent-browser`, run on the conversation's own browser. The description tells the model to read `skills get core` and `--help` first. Output is capped like `shell`'s; there is no confirmation list, so `eval` and `download` run. The model can pass its own `--session`, which starts a separate browser |
 | `view_image(path)` | shows the model a PNG, JPEG, GIF or WebP file from the sandbox |
 | `send_photo(path, caption?)` / `send_file(path, caption?)` | sends the user a sandbox file after the reply (Telegram only) |
 
@@ -176,14 +175,13 @@ kept in the `sandboxes` table, so restarts and other processes find them.
 Tools know their session from the run itself (Rig's per-request
 `ToolContext`, set in `src/runner.rs`), never from the model.
 
-**Limits.** Each tool result is cut to 16 KiB. URLs must be http or https;
-element refs must look like `@e3`. A tool call may carry at most 128 KiB of
+**Limits.** Each tool result is cut to 16 KiB. A tool call may carry at most 128 KiB of
 arguments; a larger one is skipped and the model is told why
 (`src/policy.rs`). There is no limit on how many model turns or tool calls
-one reply makes, and no way yet to stop a reply that is running. Browser output is wrapped in agent-browser's
-content boundaries, and `eval` and downloads need a confirmation no tool
-gives. Commands run without a terminal, so interactive programs hang until
-their timeout.
+one reply makes, and no way yet to stop a reply that is running. `agent_browser`
+runs whatever arguments the model gives, including `eval` and downloads; only
+page content is wrapped in agent-browser's content boundaries. Commands run
+without a terminal, so interactive programs hang until their timeout.
 
 **Images and files.** The model sees images, not descriptions of them:
 screenshots, `view_image`, and photos users send. `src/media.rs` does the
@@ -235,15 +233,22 @@ Build it on (or for) the sandbox host, then check every tool runs:
 CI runs the same check on every PR, and on `main` before pushing the image.
 A tool added to the Dockerfile belongs in the check's list too.
 
-To upgrade agent-browser, change `AGENT_BROWSER_VERSION` and both
-`AGENT_BROWSER_SHA256_*` digests together.
+To upgrade agent-browser, change `AGENT_BROWSER_VERSION`, both
+`AGENT_BROWSER_SHA256_*` digests and `AGENT_BROWSER_SKILLS_SHA512` together.
+The last one pins the npm tarball the usage guides come from: the release
+binaries do not carry them, and `agent_browser` tells the model to read them.
 
 **Accepted risk, until the sandbox host is hardened** (plan section 4):
 sandboxes run as root with internet egress, can reach other tailnet
 machines, and the OpenSandbox server accepts requests from any tailnet
 device. A prompt injection can therefore make the agent send anything it
 has seen to the internet. athena passes none of its own secrets into a
-sandbox; keep secrets out of conversations too. Sandboxes are not deleted
+sandbox; keep secrets out of conversations too. `agent_browser` adds to this:
+the model can run `eval` on pages that hold the user's signed-in state, no
+domain allowlist applies, and it can save cookies and profiles to the
+sandbox's disk or start listeners (`dashboard`, `stream`) that other tailnet
+machines can reach. The only guard is the prompt's rule to ask before
+signing in. Sandboxes are not deleted
 when a session is (there is no session delete yet); they expire after the
 timeout.
 

@@ -78,7 +78,6 @@ it needs no user header. Every other endpoint is unchanged.
 | Name | Value | Owner |
 |---|---|---|
 | Inbox in each sandbox | `/tmp/athena-inbox/<8 hex>-<safe name>` (`sandbox::INBOX_DIR`) | `Sandboxes::stage` |
-| Screenshots in each sandbox | `/tmp/athena-screenshots/<uuid>.png` | `browser_screenshot` |
 | Bot API methods | `getFile`, file download `GET /file/bot<token>/<file_path>`, `sendPhoto`, `sendDocument` (multipart) | `telegram.rs` |
 | Download limit | 20 MB (`telegram::DOWNLOAD_LIMIT`) | Bot API |
 | Albums | collected by `(user, media_group_id)` until 2 s pass with no new item (`telegram::ALBUM_WAIT`), at most 10 items, one turn | `telegram.rs` |
@@ -90,7 +89,8 @@ it needs no user header. Every other endpoint is unchanged.
 The sandbox image is a separate Docker image:
 - repository `ghcr.io/queryplanner/athena-sandbox`, tags `latest` and `sha-<sha>`;
 - built from `deploy/sandbox-image/Dockerfile` by CI on push to `main`;
-- includes execd-compatible tooling, `agent-browser` (pinned) and Chromium.
+- includes execd-compatible tooling, `agent-browser` (pinned) and Chromium;
+- ships agent-browser's usage guides in `/usr/local/share/agent-browser/skill-data`, found through `AGENT_BROWSER_SKILLS_DIR`, for `agent_browser skills get core`.
 
 ## VM layout
 

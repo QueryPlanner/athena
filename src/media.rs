@@ -478,7 +478,7 @@ mod tests {
                 UserContent::text("look"),
                 UserContent::Image(png()),
                 tool_result(
-                    "browser_screenshot",
+                    "view_image",
                     vec![text("saved"), ToolResultContent::Image(png())],
                 ),
             ]),
@@ -495,7 +495,7 @@ mod tests {
             user(vec![
                 UserContent::text("look"),
                 UserContent::text(NOT_KEPT),
-                tool_result("browser_screenshot", vec![text("saved"), text(NOT_KEPT)]),
+                tool_result("view_image", vec![text("saved"), text(NOT_KEPT)]),
             ]),
             Message::Assistant {
                 id: Some("m1".into()),
@@ -515,7 +515,7 @@ mod tests {
             calls.clone(),
             user(vec![
                 tool_result(
-                    "browser_screenshot",
+                    "view_image",
                     vec![text("saved"), ToolResultContent::Image(png())],
                 ),
                 tool_result("shell", vec![text("ok")]),
@@ -525,10 +525,10 @@ mod tests {
         let expected = vec![
             calls,
             user(vec![
-                tool_result("browser_screenshot", vec![text("saved")]),
+                tool_result("view_image", vec![text("saved")]),
                 tool_result("shell", vec![text("ok")]),
                 tool_result("view_image", vec![text("[image follows]")]),
-                UserContent::text("Image from browser_screenshot:"),
+                UserContent::text("Image from view_image:"),
                 UserContent::Image(png()),
                 UserContent::text("Image from view_image:"),
                 UserContent::Image(png()),
@@ -542,7 +542,7 @@ mod tests {
         use rig_core::providers::openrouter::messages_from_rig_message;
         let message = user(vec![
             tool_result(
-                "browser_screenshot",
+                "view_image",
                 vec![text("saved"), ToolResultContent::Image(png())],
             ),
             tool_result("shell", vec![text("ok")]),

@@ -41,8 +41,6 @@ struct Inner {
     bash: Mutex<HashSet<String>>,
     contexts: Mutex<HashSet<String>>,
     files: Mutex<HashMap<String, Vec<u8>>>,
-    /// What an annotated screenshot command writes to its path, if anything.
-    screenshot: Mutex<Option<Vec<u8>>>,
     replies: Mutex<VecDeque<(StatusCode, String)>>,
     /// The next response to a request whose path ends with the key.
     faults: Mutex<HashMap<String, (StatusCode, String)>>,
@@ -69,7 +67,6 @@ impl FakeSandbox {
         let inner = Arc::new(Inner {
             host: host.clone(),
             startup: Mutex::new(vec!["Running".into()]),
-            screenshot: Mutex::new(Some(SCREENSHOT.to_vec())),
             ..Default::default()
         });
         let app = Router::new().fallback(handle).with_state(inner.clone());
@@ -153,12 +150,6 @@ impl FakeSandbox {
         *self.inner.on_create.lock().unwrap() = Some(Box::new(hook));
     }
 
-    /// What the next screenshots write: `None` writes nothing, as if
-    /// agent-browser failed.
-    pub fn screenshots_are(&self, content: Option<&[u8]>) {
-        *self.inner.screenshot.lock().unwrap() = content.map(<[u8]>::to_vec);
-    }
-
     pub fn file(&self, path: &str) -> Option<Vec<u8>> {
         self.inner.files.lock().unwrap().get(path).cloned()
     }
@@ -187,8 +178,8 @@ pub fn config(url: &str) -> athena::sandbox::Config {
     }
 }
 
-/// A PNG, as far as anyone checking its first bytes can tell: what the fake
-/// agent-browser saves for a screenshot.
+/// A PNG, as far as anyone checking its first bytes can tell: sample image
+/// bytes for tests that show, store or send an image.
 pub const SCREENSHOT: &[u8] = b"\x89PNG\r\n\x1a\nfake screenshot";
 
 /// execd's stream: init, one stdout event, completion.
@@ -359,13 +350,6 @@ async fn execd(
     match (method, rest) {
         (Method::POST, ["command"]) => {
             let command = body["command"].as_str().unwrap();
-            // agent-browser would write the file; `--annotate` then the path.
-            if let Some((_, rest)) = command.split_once("'screenshot' '--annotate' '")
-                && let Some(content) = inner.screenshot.lock().unwrap().clone()
-            {
-                let path = rest.split('\'').next().unwrap();
-                inner.files.lock().unwrap().insert(path.into(), content);
-            }
             stream(command.to_string())
         }
         (Method::POST, ["session"]) => {

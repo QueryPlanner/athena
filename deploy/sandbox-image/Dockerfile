@@ -1,8 +1,8 @@
 # The image Athena's per-session sandboxes run (ATHENA_SANDBOX_IMAGE).
 #
 # OpenSandbox injects its own execd into every sandbox, so this image only
-# carries the tools: Chromium and a pinned agent-browser for the browser
-# tools, Python with a Jupyter server for run_code, and everyday CLI
+# carries the tools: Chromium and a pinned agent-browser for the
+# agent_browser tool, Python with a Jupyter server for run_code, and everyday CLI
 # tools and Python libraries for shell (scripts/sandbox-image-check.sh
 # lists them). Build (x86_64 or arm64, matching the sandbox host):
 #
@@ -19,6 +19,11 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG AGENT_BROWSER_VERSION=v0.38.1
 ARG AGENT_BROWSER_SHA256_AMD64=5100149a1903211c889de4e545bf36d90803740cea4f99aa22651649f9205ea1
 ARG AGENT_BROWSER_SHA256_ARM64=937b315ee0761e8a62f7950ddcfef9b3d3d8e8d5eb9c9d2bf9e23e5725664511
+# The usage guides `agent-browser skills get` prints ship only in the npm
+# package, not in the release binaries. The digest is the tarball's sha512
+# in hex; npm lists it base64-encoded as dist.integrity
+# (`npm view agent-browser@<version> dist.integrity`).
+ARG AGENT_BROWSER_SKILLS_SHA512=939f050b3d3250e080368364322a897be1f6cbaafab1465acea5ec585f8c62ad62442e363e3b4b701a1a83a4924ce0ff151429a6f3c3bc4e470d8121725be787
 ARG TARGETARCH
 
 RUN set -eux; \
@@ -60,6 +65,18 @@ RUN set -eux; \
     echo "${sum}  /usr/local/lib/agent-browser" | sha256sum -c -; \
     chmod 0755 /usr/local/lib/agent-browser
 
+# Only skill-data/ is kept from the npm tarball; the tarball is large because
+# it bundles every platform's binary.
+RUN set -eux; \
+    version="${AGENT_BROWSER_VERSION#v}"; \
+    curl -fsSL -o /tmp/agent-browser.tgz \
+      "https://registry.npmjs.org/agent-browser/-/agent-browser-${version}.tgz"; \
+    echo "${AGENT_BROWSER_SKILLS_SHA512}  /tmp/agent-browser.tgz" | sha512sum -c -; \
+    mkdir -p /usr/local/share/agent-browser; \
+    tar -xzf /tmp/agent-browser.tgz -C /usr/local/share/agent-browser \
+      --strip-components=1 package/skill-data; \
+    rm /tmp/agent-browser.tgz
+
 # Jupyter in its own venv: execd's code interpreter (run_code) talks to it.
 # The venv is first on PATH, so `pip install` in the shell works too (Debian
 # refuses system-wide installs).
@@ -88,6 +105,7 @@ RUN ln -s /usr/bin/fdfind /usr/local/bin/fd
 RUN printf '%s\n' \
       '#!/bin/sh' \
       'export AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium' \
+      'export AGENT_BROWSER_SKILLS_DIR=/usr/local/share/agent-browser/skill-data' \
       'export AGENT_BROWSER_ARGS="--no-sandbox,--disable-dev-shm-usage"' \
       'exec /usr/local/lib/agent-browser "$@"' \
       > /usr/local/bin/agent-browser; \
