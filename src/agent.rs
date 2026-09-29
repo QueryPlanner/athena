@@ -122,7 +122,9 @@ pub fn configure_with(
         .preamble(PREAMBLE)
         .tool(Add)
         .add_hook(ToolPolicy::default())
-        .default_max_turns(20);
+        // No limit on model calls per reply, nor on tool calls (`policy.rs`):
+        // a task takes as many steps as it needs.
+        .default_max_turns(usize::MAX);
     match sandboxes {
         Some(sandboxes) => sandbox::tools::register(builder, sandboxes).build(),
         None => builder.build(),

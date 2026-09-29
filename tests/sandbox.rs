@@ -7,7 +7,6 @@ mod fake_server;
 
 use athena::agent;
 use athena::media::{self, Kind, Outbox};
-use athena::policy::MAX_TOOL_CALLS;
 use athena::runner::Request;
 use athena::sandbox::tools::{CAPTION_LIMIT, PHOTO_LIMIT, READ_LIMIT};
 use athena::sandbox::{Config, Error, INBOX_DIR, Sandboxes};
@@ -1010,13 +1009,16 @@ async fn a_streamed_turn_reaches_the_same_sandbox() {
 
 // ---------------- tool policy ----------------
 
+/// More calls than the old budget of 40, to show there is no budget.
+const MANY_CALLS: usize = 100;
+
 #[tokio::test]
-async fn tool_calls_past_the_runs_budget_are_skipped_with_a_reason() {
+async fn every_tool_call_runs_however_many_a_run_makes() {
     let tmp = TempDb::new();
     let (service, _) = tmp.service();
     let user = cli_user(&service).await;
     let s = session(&service, &user, "s").await;
-    let calls: Vec<AssistantContent> = (0..=MAX_TOOL_CALLS)
+    let calls: Vec<AssistantContent> = (0..MANY_CALLS)
         .map(|i| AssistantContent::tool_call(format!("call_{i}"), "add", json!({"a": 1, "b": i})))
         .collect();
     let (agent, model) = mock_agent(
@@ -1029,14 +1031,8 @@ async fn tool_calls_past_the_runs_budget_are_skipped_with_a_reason() {
         .unwrap();
 
     let results = serde_json::to_string(model.requests()[1].chat_history.last().unwrap()).unwrap();
-    let ran = results.matches("\"json\"").count();
-    assert_eq!(ran, MAX_TOOL_CALLS, "{results}");
-    assert_eq!(
-        results
-            .matches(&format!("used its {MAX_TOOL_CALLS} tool calls"))
-            .count(),
-        1
-    );
+    assert_eq!(results.matches("\"json\"").count(), MANY_CALLS, "{results}");
+    assert!(!results.contains("Not run"), "{results}");
 }
 
 #[tokio::test]

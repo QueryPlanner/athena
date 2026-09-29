@@ -489,8 +489,9 @@ attaches with `AgentBuilder::add_hook`, or per prompt, stream or runner request.
 
 There is no `on_error`.
 
-Athena uses one hook in v1: **`ToolPolicy`** (`on_tool_call`). It enforces a per-run
-tool-call budget and argument size limits, and returns `Skip` with a reason. Output
+Athena uses one hook in v1: **`ToolPolicy`** (`on_tool_call`). It enforces an
+argument size limit and returns `Skip` with a reason. (The per-run tool-call budget
+and the 20-turn limit were removed: a run takes as many steps as it needs.) Output
 truncation stays in the tool code. Tracing uses rig's spans, not hooks.
 
 ## 7. Observability (OTel standard practice)

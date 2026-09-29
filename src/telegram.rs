@@ -2413,6 +2413,36 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn an_item_arriving_during_the_wait_restarts_it() {
+        let (h, model) = watched(vec![MockTurn::text("both")]);
+        let (chat, mut rx) = album_chat(2);
+        h.app
+            .handle(chat.clone(), album_item(26, "late", 0, None))
+            .await;
+        // Halfway through the wait: the collector is asleep with the first
+        // item's time, wakes, finds a newer one and waits again.
+        tokio::time::sleep(h.app.album_wait / 2).await;
+        h.app
+            .handle(chat.clone(), album_item(26, "late", 1, None))
+            .await;
+        h.app.finish().await;
+
+        assert_eq!(model.requests().len(), 1);
+        let text = model.requests()[0]
+            .chat_history
+            .last()
+            .unwrap()
+            .rag_text()
+            .unwrap();
+        assert_eq!(text.matches("[The user attached").count(), 2);
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        assert_eq!(events, [Event::Typing, said("both")]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn an_album_past_telegrams_limit_keeps_its_first_items() {
         let (h, model) = watched(vec![MockTurn::text("ten")]);
         let (chat, rx) = album_chat(ALBUM_LIMIT + 1);
