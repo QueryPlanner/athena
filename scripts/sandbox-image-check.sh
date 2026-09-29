@@ -11,6 +11,7 @@ image="${1:-athena-sandbox:dev}"
 # One command per tool; each must exit 0.
 checks=(
   "agent-browser --version"
+  "agent-browser skills get core | grep -q 'name: core'"
   "chromium --version"
   "git --version"
   "curl --version"

@@ -675,6 +675,74 @@ async fn a_users_file_is_staged_in_the_sessions_inbox() {
 }
 
 #[tokio::test]
+async fn agent_browser_runs_the_cli_with_exactly_the_arguments_given() {
+    let h = harness().await;
+    let s = h.session("s").await;
+    let prefix = format!("'agent-browser' '--session' '{s}' '--content-boundaries'");
+    for (args, tail) in [
+        (json!(["--help"]), "'--help'"),
+        (json!(["skills", "get", "core"]), "'skills' 'get' 'core'"),
+        (
+            json!(["eval", "document.title", "--stdin"]),
+            "'eval' 'document.title' '--stdin'",
+        ),
+        (
+            json!(["fill", "@e3", "it's `id` $(rm -rf /)\n"]),
+            "'fill' '@e3' 'it'\\''s `id` $(rm -rf /)\n'",
+        ),
+    ] {
+        let expected = format!("{prefix} {tail}");
+        assert_eq!(
+            h.call(&s, "agent_browser", json!({ "args": args })).await,
+            format!("ran: {expected}")
+        );
+        let sent = h.fake.requests_to("POST", "/command").pop().unwrap();
+        assert_eq!(sent.body["command"], expected);
+        assert_eq!(sent.body["timeout"], 90_000);
+    }
+}
+
+#[tokio::test]
+async fn agent_browser_refuses_no_arguments_and_nul_bytes_before_anything_runs() {
+    let h = harness().await;
+    let s = h.session("s").await;
+    let out = h.call(&s, "agent_browser", json!({"args": []})).await;
+    assert!(out.contains("args is empty"), "{out}");
+    let out = h
+        .call(
+            &s,
+            "agent_browser",
+            json!({"args": ["fill", "@e1", "nul\u{0}"]}),
+        )
+        .await;
+    assert!(out.contains("NUL byte"), "{out}");
+    assert!(h.fake.requests_to("POST", "/command").is_empty());
+}
+
+#[tokio::test]
+async fn agent_browser_tells_the_model_to_read_the_guide_and_help_first() {
+    let h = harness().await;
+    let s = h.session("s").await;
+    let (agent, model) = h.agent(vec![MockTurn::text("hi")]);
+    h.service.send(&agent, &h.user, &s, "hi").await.unwrap();
+    let tool = model.requests()[0]
+        .tools
+        .iter()
+        .find(|t| t.name == "agent_browser")
+        .unwrap()
+        .clone();
+    for needed in [
+        "\"skills\", \"get\", \"core\"",
+        "\"--help\"",
+        "Before your first use",
+    ] {
+        assert!(tool.description.contains(needed), "{needed}");
+    }
+    assert_eq!(tool.parameters["properties"]["args"]["type"], "array");
+    assert_eq!(tool.parameters["required"], json!(["args"]));
+}
+
+#[tokio::test]
 async fn bad_browser_arguments_are_refused_before_anything_runs() {
     let h = harness().await;
     let s = h.session("s").await;
@@ -948,6 +1016,7 @@ async fn the_model_is_offered_every_sandbox_tool_only_with_a_server() {
         tools,
         [
             "add",
+            "agent_browser",
             "browser_click",
             "browser_fill",
             "browser_open",

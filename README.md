@@ -165,6 +165,7 @@ on the machine running athena. The template ships no host tool except `add`.
 | `read_file(path)` / `write_file(path, content)` | text files inside the sandbox; reads stop at 64 KiB |
 | `browser_open(url)`, `browser_snapshot()`, `browser_click(ref)`, `browser_fill(ref, text)`, `browser_press(key)`, `browser_scroll(direction, pixels?)`, `browser_read(url)` | [agent-browser](https://github.com/vercel-labs/agent-browser) inside the sandbox |
 | `browser_screenshot()` | an annotated screenshot the model looks at: element `[N]` is ref `@eN` |
+| `agent_browser(args)` | the whole agent-browser CLI, unrestricted: `args` are the arguments after `agent-browser`, run on the conversation's own browser. The description tells the model to read `skills get core` and `--help` first. Output is capped like `shell`'s; there is no confirmation list, so `eval` and `download` run |
 | `view_image(path)` | shows the model a PNG, JPEG, GIF or WebP file from the sandbox |
 | `send_photo(path, caption?)` / `send_file(path, caption?)` | sends the user a sandbox file after the reply (Telegram only) |
 
@@ -235,8 +236,10 @@ Build it on (or for) the sandbox host, then check every tool runs:
 CI runs the same check on every PR, and on `main` before pushing the image.
 A tool added to the Dockerfile belongs in the check's list too.
 
-To upgrade agent-browser, change `AGENT_BROWSER_VERSION` and both
-`AGENT_BROWSER_SHA256_*` digests together.
+To upgrade agent-browser, change `AGENT_BROWSER_VERSION`, both
+`AGENT_BROWSER_SHA256_*` digests and `AGENT_BROWSER_SKILLS_SHA512` together.
+The last one pins the npm tarball the usage guides come from: the release
+binaries do not carry them, and `agent_browser` tells the model to read them.
 
 **Accepted risk, until the sandbox host is hardened** (plan section 4):
 sandboxes run as root with internet egress, can reach other tailnet
