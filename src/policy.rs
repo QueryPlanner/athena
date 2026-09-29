@@ -7,8 +7,9 @@
 
 use rig_agent::agent::{AgentHook, HookContext, ToolCall, ToolCallAction};
 
-/// Tool calls one run may make. The agent allows 20 model turns, and a
-/// turn can ask for several tools at once.
+/// Tool calls one run may make. The agent sets no limit on model turns,
+/// and a turn can ask for several tools at once, so this is what bounds a
+/// run.
 pub const MAX_TOOL_CALLS: usize = 40;
 /// The largest arguments one tool call may carry, in bytes of JSON. Room
 /// for `write_file` with a sizeable source file.
