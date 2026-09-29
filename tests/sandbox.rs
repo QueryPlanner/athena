@@ -384,106 +384,32 @@ async fn files_are_written_and_read_inside_the_sandbox_only() {
     assert!(out.contains("HTTP 404"), "{out}");
 }
 
-#[tokio::test]
-async fn browser_tools_run_agent_browser_with_quoted_arguments() {
-    let h = harness().await;
-    let s = h.session("s").await;
-    let prefix = format!(
-        "'agent-browser' '--session' '{s}' '--content-boundaries' '--max-output' '12000' \
-         '--confirm-actions' 'eval,download'"
-    );
-    let cases = [
-        (
-            "browser_open",
-            json!({"url": "https://example.com/a b"}),
-            "'open' 'https://example.com/a%20b'",
-        ),
-        (
-            "browser_snapshot",
-            json!({}),
-            "'snapshot' '-i' '-c' '-d' '12'",
-        ),
-        ("browser_click", json!({"ref": "@e12"}), "'click' '@e12'"),
-        (
-            "browser_fill",
-            json!({"ref": "@e3", "text": "it's `id` $(rm -rf /)\n"}),
-            "'fill' '@e3' 'it'\\''s `id` $(rm -rf /)\n'",
-        ),
-        (
-            "browser_read",
-            json!({"url": "http://docs.rs"}),
-            "'read' 'http://docs.rs/'",
-        ),
-        (
-            "browser_scroll",
-            json!({"direction": "down"}),
-            "'scroll' 'down'",
-        ),
-        (
-            "browser_scroll",
-            json!({"direction": "up", "pixels": 400}),
-            "'scroll' 'up' '400'",
-        ),
-        ("browser_press", json!({"key": "Enter"}), "'press' 'Enter'"),
-    ];
-    for (tool, args, tail) in cases {
-        let expected = format!("{prefix} {tail}");
-        assert_eq!(
-            h.call(&s, tool, args).await,
-            format!("ran: {expected}"),
-            "{tool}"
-        );
-        let sent = h.fake.requests_to("POST", "/command").pop().unwrap();
-        assert_eq!(sent.body["command"], expected, "{tool}");
-        assert_eq!(sent.body["timeout"], 90_000);
-    }
-
-    let out = h.call(&s, "browser_screenshot", json!({})).await;
-    let sent = h.fake.requests_to("POST", "/command").pop().unwrap();
-    let command = sent.body["command"].as_str().unwrap();
-    let path = out
-        .lines()
-        .next()
-        .unwrap()
-        .strip_prefix("screenshot: ")
-        .unwrap();
-    assert!(
-        path.starts_with("/tmp/athena-screenshots/") && path.ends_with(".png"),
-        "{out}"
-    );
-    assert_eq!(
-        command,
-        format!("mkdir -p /tmp/athena-screenshots && {prefix} 'screenshot' '--annotate' '{path}'")
-    );
-}
-
 /// The last message the model was sent, as JSON.
 fn last_message(request: &rig_core::completion::CompletionRequest) -> Value {
     serde_json::to_value(request.chat_history.last().unwrap()).unwrap()
 }
 
 #[tokio::test]
-async fn the_model_sees_an_annotated_screenshot_after_the_tool_result() {
+async fn an_image_the_model_looks_at_is_not_kept_in_the_transcript() {
     let h = harness().await;
     let s = h.session("s").await;
-    h.fake
-        .reply_next(printed("Screenshot saved\n[1] @e1 button \"Submit\"\n"));
+    h.fake.put_file("/w/shot.png", SCREENSHOT);
     let request = h
-        .turn(&s, "browser_screenshot", json!({}), "go".into())
+        .turn(
+            &s,
+            "view_image",
+            json!({"path": "/w/shot.png"}),
+            "go".into(),
+        )
         .await;
 
     let last = last_message(&request);
     let content = last["content"].as_array().unwrap();
     // The tool result stays text, so it can be sent as the tool's reply.
-    let note = content[0]["content"][0]["text"].as_str().unwrap();
-    assert!(
-        note.starts_with("screenshot: /tmp/athena-screenshots/"),
-        "{note}"
-    );
-    assert!(note.contains("[1] @e1 button \"Submit\""), "{note}");
+    assert_eq!(content[0]["content"][0]["text"], "image: /w/shot.png");
     assert_eq!(content[0]["content"].as_array().unwrap().len(), 1);
     // Then the image itself, as the user's.
-    assert_eq!(content[1]["text"], "Image from browser_screenshot:");
+    assert_eq!(content[1]["text"], "Image from view_image:");
     assert_eq!(content[2]["type"], "image");
     assert_eq!(content[2]["data"]["value"], media::base64(SCREENSHOT));
     assert_eq!(content[2]["media_type"], "png");
@@ -491,24 +417,9 @@ async fn the_model_sees_an_annotated_screenshot_after_the_tool_result() {
 
     // The transcript keeps the note but not the image's bytes.
     let stored = raw_rows(&h.tmp.raw(), &s).join("\n");
-    assert!(stored.contains("[1] @e1 button"));
+    assert!(stored.contains("image: /w/shot.png"));
     assert!(!stored.contains(&media::base64(SCREENSHOT)));
     assert!(stored.contains(media::NOT_KEPT));
-}
-
-#[tokio::test]
-async fn a_screenshot_that_was_not_saved_is_reported_not_shown() {
-    let h = harness().await;
-    let s = h.session("s").await;
-    h.fake.screenshots_are(None);
-    h.fake.reply_next(printed("Error: no page is open\n"));
-    let out = h.call(&s, "browser_screenshot", json!({})).await;
-    // What agent-browser said, then why there is no image.
-    assert!(
-        out.contains("\nError: no page is open\n[not shown: "),
-        "{out}"
-    );
-    assert!(out.ends_with("file not found\"}]"), "{out}");
 }
 
 #[tokio::test]
@@ -744,41 +655,6 @@ async fn agent_browser_tells_the_model_to_read_the_guide_and_help_first() {
     assert!(include_str!("../deploy/sandbox-image/Dockerfile").contains(guide));
     assert_eq!(tool.parameters["properties"]["args"]["type"], "array");
     assert_eq!(tool.parameters["required"], json!(["args"]));
-}
-
-#[tokio::test]
-async fn bad_browser_arguments_are_refused_before_anything_runs() {
-    let h = harness().await;
-    let s = h.session("s").await;
-    for (tool, args, why) in [
-        (
-            "browser_open",
-            json!({"url": "file:///etc/passwd"}),
-            "not an http or https URL",
-        ),
-        ("browser_read", json!({"url": "not a url"}), "is not a URL"),
-        (
-            "browser_click",
-            json!({"ref": "@e1; reboot"}),
-            "is not an element ref",
-        ),
-        (
-            "browser_fill",
-            json!({"ref": "#q", "text": "x"}),
-            "is not an element ref",
-        ),
-        (
-            "browser_fill",
-            json!({"ref": "@e1", "text": "nul\u{0}"}),
-            "NUL byte",
-        ),
-    ] {
-        let out = h.call(&s, tool, args).await;
-        assert!(out.contains(why), "{tool}: {out}");
-    }
-    // Only the NUL case got as far as needing a session; nothing ran.
-    assert!(h.fake.requests_to("POST", "/command").is_empty());
-    assert!(h.fake.requests_to("POST", "/v1/sandboxes").is_empty());
 }
 
 #[tokio::test]
@@ -1021,14 +897,6 @@ async fn the_model_is_offered_every_sandbox_tool_only_with_a_server() {
         [
             "add",
             "agent_browser",
-            "browser_click",
-            "browser_fill",
-            "browser_open",
-            "browser_press",
-            "browser_read",
-            "browser_screenshot",
-            "browser_scroll",
-            "browser_snapshot",
             "read_file",
             "run_code",
             "send_file",

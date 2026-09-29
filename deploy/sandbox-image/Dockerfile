@@ -1,8 +1,8 @@
 # The image Athena's per-session sandboxes run (ATHENA_SANDBOX_IMAGE).
 #
 # OpenSandbox injects its own execd into every sandbox, so this image only
-# carries the tools: Chromium and a pinned agent-browser for the browser
-# tools, Python with a Jupyter server for run_code, and everyday CLI
+# carries the tools: Chromium and a pinned agent-browser for the
+# agent_browser tool, Python with a Jupyter server for run_code, and everyday CLI
 # tools and Python libraries for shell (scripts/sandbox-image-check.sh
 # lists them). Build (x86_64 or arm64, matching the sandbox host):
 #

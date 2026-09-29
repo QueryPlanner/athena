@@ -163,8 +163,6 @@ on the machine running athena. The template ships no host tool except `add`.
 | `shell(command, timeout_secs?)` | bash in a persistent session: `cd`, exports and venvs carry over |
 | `run_code(language, code)` | a persistent Python interpreter (execd's Jupyter-backed code API) |
 | `read_file(path)` / `write_file(path, content)` | text files inside the sandbox; reads stop at 64 KiB |
-| `browser_open(url)`, `browser_snapshot()`, `browser_click(ref)`, `browser_fill(ref, text)`, `browser_press(key)`, `browser_scroll(direction, pixels?)`, `browser_read(url)` | [agent-browser](https://github.com/vercel-labs/agent-browser) inside the sandbox |
-| `browser_screenshot()` | an annotated screenshot the model looks at: element `[N]` is ref `@eN` |
 | `agent_browser(args)` | the whole agent-browser CLI, unrestricted: `args` are the arguments after `agent-browser`, run on the conversation's own browser. The description tells the model to read `skills get core` and `--help` first. Output is capped like `shell`'s; there is no confirmation list, so `eval` and `download` run. The model can pass its own `--session`, which starts a separate browser |
 | `view_image(path)` | shows the model a PNG, JPEG, GIF or WebP file from the sandbox |
 | `send_photo(path, caption?)` / `send_file(path, caption?)` | sends the user a sandbox file after the reply (Telegram only) |
@@ -177,14 +175,13 @@ kept in the `sandboxes` table, so restarts and other processes find them.
 Tools know their session from the run itself (Rig's per-request
 `ToolContext`, set in `src/runner.rs`), never from the model.
 
-**Limits.** Each tool result is cut to 16 KiB. URLs must be http or https;
-element refs must look like `@e3`. A tool call may carry at most 128 KiB of
+**Limits.** Each tool result is cut to 16 KiB. A tool call may carry at most 128 KiB of
 arguments; a larger one is skipped and the model is told why
 (`src/policy.rs`). There is no limit on how many model turns or tool calls
-one reply makes, and no way yet to stop a reply that is running. Browser output is wrapped in agent-browser's
-content boundaries, and `eval` and downloads need a confirmation no tool
-gives. Commands run without a terminal, so interactive programs hang until
-their timeout.
+one reply makes, and no way yet to stop a reply that is running. `agent_browser`
+runs whatever arguments the model gives, including `eval` and downloads; only
+page content is wrapped in agent-browser's content boundaries. Commands run
+without a terminal, so interactive programs hang until their timeout.
 
 **Images and files.** The model sees images, not descriptions of them:
 screenshots, `view_image`, and photos users send. `src/media.rs` does the
