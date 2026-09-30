@@ -215,11 +215,17 @@ plumbing:
    `url`, and returns a link such as
    `http://100.124.202.79:18080/browser/<token>`, which the agent sends in
    its reply (Telegram or HTTP).
-2. The user opens it on any device on the tailnet. `athena serve` shows the
-   browser as a screenshot refreshed every second: tap to click, type into a
-   text box (with a "hide" switch for passwords), Enter, Tab, Backspace,
-   Escape, scroll and a URL bar. Each goes to the same agent-browser session
-   the agent drives, as `mouse`, `keyboard type`, `press`, `scroll` or `open`.
+2. The user opens it on any device on the tailnet. `athena serve` lists the
+   page's fields and buttons (`snapshot -i`) as real ones: email or username,
+   password and one-time-code fields get the `autocomplete` hints that let a
+   phone's password manager and SMS-code autofill fill them. Pressing one of
+   the page's buttons, or Enter, fills every field and clicks it in one
+   command (`fill @eN ...`, `click @eN`), then lists the next page's fields,
+   so a 2FA code step works the same way. What a field is for is guessed
+   from its accessible name (`sandbox::login::kind`). Below the fields is the
+   browser as a screenshot refreshed every second, with a fallback to tap
+   it, type into whatever has focus, press keys, scroll and open a URL. All
+   of it drives the same agent-browser session the agent uses.
 3. **Done** runs `agent-browser state save` and keeps the result (cookies and
    local storage) in `browser_states`, one per user. The user then tells the
    agent in the chat that they are done, and the agent carries on in the

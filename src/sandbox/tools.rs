@@ -404,9 +404,10 @@ impl Tool for BrowserLoginLink {
 
     fn description(&self) -> String {
         format!(
-            "When a website needs the user to sign in, open its sign-in page with this and \
-             send the user the link it returns. The link shows them this conversation's \
-             browser; they sign in there themselves and press Done, which saves the \
+            "When a website needs the user to sign in, including when a page you opened \
+             redirects to a sign-in form, open that page with this and send the user the \
+             link it returns, not the site's own address. The link shows them this conversation's \
+             browser and its sign-in fields; they sign in there themselves and press Done, which saves the \
              sign-in for all their future conversations. Then end your turn and wait for \
              them to say they are done before continuing. Never ask the user for a \
              password. The link works for {} minutes; if a site asks to sign in again \

@@ -580,3 +580,98 @@ async fn a_new_link_loads_the_latest_saved_state_before_opening_its_page() {
         .unwrap();
     assert_eq!(links, 1);
 }
+
+#[tokio::test]
+async fn the_pages_fields_and_buttons_are_listed_in_page_order() {
+    let h = harness().await;
+    let (s, token) = h.linked("shop").await;
+    let router = h.router(Hosts::Loopback);
+    let snapshot = json!({
+        "_boundary": {"nonce": "n", "origin": "https://shop.example/login"},
+        "data": {
+            "refs": {
+                "e2": {"name": "Password", "role": "textbox"},
+                "e3": {"name": "Sign in", "role": "button"},
+                "e4": {"name": "Email", "role": "textbox"},
+                "e5": {"name": "Forgot?", "role": "link"}
+            },
+            "snapshot": "- textbox \"Email\" [ref=e4]\n- textbox \"Password\" [ref=e2]\n- link \"Forgot?\" [ref=e5]\n- button \"Sign in\" [ref=e3]"
+        },
+        "success": true
+    });
+    h.fake.reply_next(printed(&snapshot.to_string()));
+
+    let uri = format!("/browser/{token}/controls");
+    let (status, _, body) = send(&router, request("GET", &uri, "localhost", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({"controls": [
+            {"ref": "e4", "name": "Email", "kind": "username"},
+            {"ref": "e2", "name": "Password", "kind": "password"},
+            {"ref": "e3", "name": "Sign in", "kind": "button"}
+        ]})
+    );
+    assert_eq!(h.last_command(), browser(&s, &["snapshot", "-i", "--json"]));
+
+    // Output that is not agent-browser's JSON, or a failed snapshot.
+    let (status, _, body) = send(&router, request("GET", &uri, "localhost", None)).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    h.fake.reply_next(failed("no page"));
+    let (status, _, body) = send(&router, request("GET", &uri, "localhost", None)).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(
+        String::from_utf8(body)
+            .unwrap()
+            .contains("snapshot: CommandExecError: no page")
+    );
+}
+
+#[tokio::test]
+async fn a_submit_fills_every_field_then_clicks_in_one_command() {
+    let h = harness().await;
+    let (s, token) = h.linked("shop").await;
+    let router = h.router(Hosts::Loopback);
+    let before = h.commands().len();
+
+    let form = json!({
+        "fills": [{"ref": "e4", "text": "me@shop.example"}, {"ref": "e2", "text": "-p4ss 'word' $(id)"}],
+        "click": "e3"
+    });
+    let (status, body) = post(&router, &token, "submit", form).await;
+    assert_eq!((status, body), (StatusCode::OK, json!({"ok": true})));
+    assert_eq!(
+        h.last_command(),
+        [
+            browser(&s, &["fill", "@e4", "me@shop.example"]),
+            browser(&s, &["fill", "@e2", "-p4ss 'word' $(id)"]),
+            browser(&s, &["click", "@e3"]),
+        ]
+        .join(" && ")
+    );
+    assert_eq!(h.commands().len(), before + 1);
+
+    // A code with no button to press, or a button alone.
+    post(
+        &router,
+        &token,
+        "submit",
+        json!({"fills": [{"ref": "e8", "text": "123456"}]}),
+    )
+    .await;
+    assert_eq!(h.last_command(), browser(&s, &["fill", "@e8", "123456"]));
+    post(&router, &token, "submit", json!({"click": "e7"})).await;
+    assert_eq!(h.last_command(), browser(&s, &["click", "@e7"]));
+
+    let (status, body) = post(&router, &token, "submit", json!({"click": "@e7"})).await;
+    assert_eq!(
+        (status, body["error"]["code"].clone()),
+        (StatusCode::BAD_REQUEST, json!("invalid"))
+    );
+    assert_eq!(h.commands().len(), before + 3);
+}

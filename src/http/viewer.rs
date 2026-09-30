@@ -26,6 +26,8 @@ const PAGE: &str = include_str!("viewer.html");
 const MAX_TEXT: usize = 1000;
 /// The largest coordinate a tap may name, in CSS pixels.
 const MAX_COORDINATE: u64 = 10_000;
+/// The most fields one submit fills.
+const MAX_FILLS: usize = 20;
 /// How far one scroll moves, in pixels.
 const SCROLL_PX: &str = "400";
 
@@ -39,6 +41,8 @@ pub(super) fn routes() -> Router<App> {
         .route("/browser/{token}/press", post(press))
         .route("/browser/{token}/scroll", post(scroll))
         .route("/browser/{token}/open", post(open))
+        .route("/browser/{token}/controls", get(controls))
+        .route("/browser/{token}/submit", post(submit))
         .route("/browser/{token}/done", post(done))
 }
 
@@ -194,6 +198,89 @@ async fn open(viewer: Viewer, body: Bytes) -> Result<Json<Value>, ApiError> {
     viewer.act(&[&["open", &url]]).await
 }
 
+/// The page's fields and buttons, for the sign-in page to show as its own.
+async fn controls(viewer: Viewer) -> Result<Json<Value>, ApiError> {
+    let controls = viewer
+        .sandboxes
+        .controls(&viewer.link.session_id)
+        .await
+        .map_err(sandbox_error)?;
+    Ok(Json(json!({"controls": controls})))
+}
+
+/// An element ref from `controls`: `e` and digits.
+fn checked_ref(reference: &str) -> Result<&str, ApiError> {
+    match reference.strip_prefix('e') {
+        Some(n) if (1..=9).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_digit()) => {
+            Ok(reference)
+        }
+        _ => Err(ApiError::invalid(format!(
+            "`{reference}` is not a field; use a ref like e4 from controls"
+        ))),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct Fill {
+    #[serde(rename = "ref")]
+    reference: String,
+    text: String,
+}
+
+#[derive(serde::Deserialize)]
+struct Submit {
+    #[serde(default)]
+    fills: Vec<Fill>,
+    #[serde(default)]
+    click: Option<String>,
+}
+
+/// What a submit asks for: (ref, text) pairs to fill, then maybe a button.
+type Form = (Vec<(String, String)>, Option<String>);
+
+/// `{"fills": [{"ref", "text"}], "click": "e3"}`, checked.
+fn submission(body: &[u8]) -> Result<Form, ApiError> {
+    let form: Submit = serde_json::from_slice(body).map_err(|e| {
+        ApiError::invalid(format!(
+            "the body must be {{\"fills\": [{{\"ref\", \"text\"}}], \"click\": ref}}: {e}"
+        ))
+    })?;
+    if form.fills.is_empty() && form.click.is_none() {
+        return Err(ApiError::invalid("nothing to fill or click".into()));
+    }
+    if form.fills.len() > MAX_FILLS {
+        return Err(ApiError::invalid(format!(
+            "at most {MAX_FILLS} fields at once"
+        )));
+    }
+    let mut fills = Vec::new();
+    for fill in form.fills {
+        checked_ref(&fill.reference)?;
+        if fill.text.chars().count() > MAX_TEXT {
+            return Err(ApiError::invalid(format!(
+                "a field's text must be at most {MAX_TEXT} characters"
+            )));
+        }
+        fills.push((fill.reference, fill.text));
+    }
+    if let Some(click) = &form.click {
+        checked_ref(click)?;
+    }
+    Ok((fills, form.click))
+}
+
+/// Fill the page's fields with what the user typed into the sign-in
+/// page's own, then click a button: one command, so one round trip.
+async fn submit(viewer: Viewer, body: Bytes) -> Result<Json<Value>, ApiError> {
+    let (fills, click) = submission(&body)?;
+    viewer
+        .sandboxes
+        .submit(&viewer.link.session_id, &fills, click.as_deref())
+        .await
+        .map_err(sandbox_error)?;
+    Ok(Json(json!({"ok": true})))
+}
+
 /// Save the browser's sign-ins for the link's user.
 async fn done(viewer: Viewer) -> Result<Json<Value>, ApiError> {
     let saved = viewer
@@ -231,6 +318,41 @@ mod tests {
         assert_eq!(checked_key("Shift+Tab").unwrap(), "Shift+Tab");
         for bad in ["", "a b", "Enter;", &"k".repeat(33)] {
             assert!(checked_key(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn refs_are_e_and_digits() {
+        assert_eq!(checked_ref("e4").unwrap(), "e4");
+        for bad in ["", "e", "@e4", "e4;id", "x4", "e1234567890"] {
+            assert!(checked_ref(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_submission_fills_then_clicks_and_is_checked_first() {
+        let (fills, click) =
+            submission(br#"{"fills":[{"ref":"e4","text":"me@x.example"},{"ref":"e2","text":""}],"click":"e3"}"#)
+                .unwrap();
+        let expected = [("e4", "me@x.example"), ("e2", "")].map(|(r, t)| (r.into(), t.into()));
+        assert_eq!(fills, expected);
+        assert_eq!(click.as_deref(), Some("e3"));
+        assert!(submission(br#"{"click":"e3"}"#).unwrap().0.is_empty());
+
+        let many: Vec<Value> = (0..=MAX_FILLS)
+            .map(|_| json!({"ref": "e1", "text": ""}))
+            .collect();
+        let long = "x".repeat(MAX_TEXT + 1);
+        for bad in [
+            json!({}),
+            json!({"fills": many}),
+            json!({"fills": [{"ref": "e1", "text": long}]}),
+            json!({"fills": [{"ref": "@e1", "text": "a"}]}),
+            json!({"fills": [{"ref": "e1"}]}),
+            json!({"click": "e3; reboot"}),
+        ] {
+            let err = submission(bad.to_string().as_bytes()).unwrap_err();
+            assert_eq!(err.code, "invalid", "{bad}");
         }
     }
 
