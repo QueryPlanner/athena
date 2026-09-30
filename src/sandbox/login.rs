@@ -17,6 +17,8 @@ use super::stream::Output;
 use super::tools::cli_command;
 use super::{Error, Sandboxes};
 use crate::store::now_millis;
+use serde::Serialize;
+use serde_json::Value;
 use std::time::Duration;
 
 /// Where the saved state is put in a sandbox, and saved from.
@@ -39,6 +41,86 @@ pub struct Link {
     pub session_id: String,
     /// Where the browser starts when it shows nothing.
     pub url: String,
+}
+
+/// What a control on the page is for, from its role and accessible name,
+/// so the sign-in page can offer the right field: a phone fills a
+/// `username`, `current-password` or `one-time-code` field itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlKind {
+    Username,
+    Password,
+    Code,
+    Text,
+    Button,
+}
+
+/// A field or button on the page, shown on the sign-in page as a real
+/// control. `reference` is agent-browser's ref without the `@`, like `e4`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Control {
+    #[serde(rename = "ref")]
+    pub reference: String,
+    pub name: String,
+    pub kind: ControlKind,
+}
+
+/// `kind` for an element with this accessibility role and name, or `None`
+/// for elements the sign-in page does not offer (links, headings...).
+fn kind(role: &str, name: &str) -> Option<ControlKind> {
+    let name = name.to_lowercase();
+    let says = |words: &[&str]| words.iter().any(|w| name.contains(w));
+    match role {
+        "button" => Some(ControlKind::Button),
+        "textbox" | "searchbox" | "spinbutton" | "combobox" => {
+            Some(if says(&["password", "passcode", "passphrase"]) {
+                ControlKind::Password
+            } else if says(&["code", "otp", "verification", "one-time", "2fa", "pin"]) {
+                ControlKind::Code
+            } else if says(&["email", "e-mail", "user", "login", "phone", "account"]) {
+                ControlKind::Username
+            } else {
+                ControlKind::Text
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The controls in `snapshot -i --json` output, in page order: the order
+/// of their refs in the snapshot text, named and typed from its `refs`.
+fn controls(stdout: &str) -> Result<Vec<Control>, Error> {
+    let unreadable = |why: &str| Error::Protocol(format!("agent-browser snapshot: {why}"));
+    let value: Value =
+        serde_json::from_str(stdout.trim()).map_err(|e| unreadable(&e.to_string()))?;
+    let data = &value["data"];
+    let (Some(text), Some(refs)) = (data["snapshot"].as_str(), data["refs"].as_object()) else {
+        return Err(unreadable("no snapshot or refs"));
+    };
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let Some((_, rest)) = line.split_once("ref=") else {
+            continue;
+        };
+        let reference: String = rest
+            .chars()
+            .take_while(char::is_ascii_alphanumeric)
+            .collect();
+        let element = refs.get(&reference).unwrap_or(&Value::Null);
+        let (role, name) = (element["role"].as_str(), element["name"].as_str());
+        if let (Some(role), Some(name)) = (role, name)
+            && let Some(kind) = kind(role, name)
+        {
+            let name = name.to_string();
+            found.push(Control {
+                reference,
+                name,
+                kind,
+            });
+        }
+    }
+    Ok(found)
 }
 
 /// `steps`, each an agent-browser argument list for `session`'s browser,
@@ -168,6 +250,36 @@ impl Sandboxes {
         Ok(())
     }
 
+    /// The fields and buttons on the page the session's browser shows.
+    pub async fn controls(&self, session_id: &str) -> Result<Vec<Control>, Error> {
+        let lease = self.lease(session_id).await?;
+        let look = chain(session_id, &[&["snapshot", "-i", "--json"]])?;
+        let output = succeeded("snapshot", lease.execd.command(&look, TIMEOUT).await?)?;
+        controls(&output.stdout)
+    }
+
+    /// Fill fields, then click a button, as one command: `fills` are
+    /// (ref, text) pairs, refs without the `@`.
+    pub async fn submit(
+        &self,
+        session_id: &str,
+        fills: &[(String, String)],
+        click: Option<&str>,
+    ) -> Result<(), Error> {
+        let refs: Vec<String> = fills.iter().map(|(r, _)| format!("@{r}")).collect();
+        let mut steps: Vec<Vec<&str>> = fills
+            .iter()
+            .zip(&refs)
+            .map(|((_, text), at)| vec!["fill", at.as_str(), text.as_str()])
+            .collect();
+        let button = click.map(|r| format!("@{r}"));
+        if let Some(button) = &button {
+            steps.push(vec!["click", button]);
+        }
+        let steps: Vec<&[&str]> = steps.iter().map(Vec::as_slice).collect();
+        self.browser(session_id, &steps).await
+    }
+
     /// Save the session's browser state as its owner's, for every sandbox
     /// they get from now on. Returns its size in bytes. Refused when the
     /// sandbox had to be replaced: its browser holds only the old state,
@@ -220,6 +332,60 @@ mod tests {
         let err = succeeded("state save", failed).unwrap_err();
         assert_eq!(err.to_string(), "sandbox: state save: exit status 1");
         assert!(succeeded("x", Output::default()).is_ok());
+    }
+
+    const SNAPSHOT: &str = r#"{"_boundary":{"nonce":"n","origin":"https://x.example/login"},
+        "data":{"refs":{"e1":{"name":"Login","role":"heading"},"e2":{"name":"Password","role":"textbox"},
+        "e3":{"name":"Sign in","role":"button"},"e4":{"name":"User Email","role":"textbox"},
+        "e5":{"name":"Enter the 6-digit code","role":"textbox"},"e6":{"name":"Search","role":"searchbox"},
+        "e7":{"name":"Help","role":"link"}},
+        "snapshot":"- heading \"Login\" [level=1, ref=e1]\n- textbox \"User Email\" [ref=e4]\n- textbox \"Password\" [ref=e2]\n- textbox \"Enter the 6-digit code\" [ref=e5]\n- searchbox \"Search\" [ref=e6]\n- link \"Help\" [ref=e7]\n- button \"Sign in\" [ref=e3]\n- text: no ref here"},
+        "error":null,"success":true}"#;
+
+    #[test]
+    fn controls_come_in_page_order_with_what_each_is_for() {
+        let found = controls(SNAPSHOT).unwrap();
+        let summary: Vec<(&str, &str, ControlKind)> = found
+            .iter()
+            .map(|c| (c.reference.as_str(), c.name.as_str(), c.kind))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("e4", "User Email", ControlKind::Username),
+                ("e2", "Password", ControlKind::Password),
+                ("e5", "Enter the 6-digit code", ControlKind::Code),
+                ("e6", "Search", ControlKind::Text),
+                ("e3", "Sign in", ControlKind::Button),
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(&found[1]).unwrap(),
+            serde_json::json!({"ref": "e2", "name": "Password", "kind": "password"})
+        );
+    }
+
+    #[test]
+    fn an_empty_page_has_no_controls_and_other_output_is_an_error() {
+        let blank = r#"{"data":{"refs":{},"snapshot":"(no interactive elements)"}}"#;
+        assert_eq!(controls(blank).unwrap(), []);
+        for bad in ["not json", r#"{"data":{}}"#, r#"{"error":"no browser"}"#] {
+            assert!(matches!(controls(bad), Err(Error::Protocol(_))), "{bad}");
+        }
+        // A ref the snapshot names but `refs` lacks is skipped.
+        let odd = r#"{"data":{"refs":{},"snapshot":"- textbox \"A\" [ref=e9]"}}"#;
+        assert_eq!(controls(odd).unwrap(), []);
+    }
+
+    #[test]
+    fn kinds_follow_the_role_then_the_name() {
+        assert_eq!(
+            kind("combobox", "Phone or email"),
+            Some(ControlKind::Username)
+        );
+        assert_eq!(kind("spinbutton", "PIN"), Some(ControlKind::Code));
+        assert_eq!(kind("textbox", "Passcode"), Some(ControlKind::Password));
+        assert_eq!(kind("heading", "Password"), None);
     }
 
     #[test]

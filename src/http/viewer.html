@@ -26,14 +26,25 @@
             cursor: crosshair; touch-action: manipulation; min-height: 120px; }
   #status { min-height: 1.4em; margin: 6px 0; }
   #status.ok { color: var(--ok); } #status.bad { color: var(--bad); }
+  #fields { display: flex; flex-direction: column; gap: 8px; margin: 8px 0 12px; padding: 12px;
+            border: 1px solid var(--line); border-radius: 8px; }
+  #fields label { flex-direction: column; align-items: stretch; gap: 4px; color: var(--fg); }
+  #fields input { flex: none; }
+  #fields .buttons { display: flex; gap: 8px; flex-wrap: wrap; }
+  #fields .none { color: var(--muted); }
+  details { margin-top: 8px; } summary { cursor: pointer; color: var(--muted); }
 </style>
 </head>
 <body>
 <h1>Sign in for Athena</h1>
-<p>This is Athena's browser. Tap the page to click, type below, then press Done. Athena never sees what you type here.</p>
-<form id="go"><input id="url" type="url" placeholder="https://…" autocomplete="off"><button>Go</button></form>
-<img id="screen" alt="The browser's page">
+<p>This is Athena's browser. Fill in the page's fields below and press its button, then press Done. Athena never sees what you type here.</p>
+<form id="fields" autocomplete="on"><span class="none">Looking for fields…</span></form>
 <div id="status"></div>
+<div class="row"><button id="done" class="primary">Done, save sign-in</button><button id="reload" type="button">Find fields again</button></div>
+<img id="screen" alt="The browser's page">
+<details>
+<summary>Tap and type on the page instead</summary>
+<form id="go"><input id="url" type="url" placeholder="https://…" autocomplete="off"><button>Go</button></form>
 <form id="typing">
   <input id="text" type="text" placeholder="Text to type into the selected field" autocomplete="off" autocapitalize="off" spellcheck="false">
   <label><input id="hide" type="checkbox"> hide</label>
@@ -44,7 +55,7 @@
   <button data-key="Backspace">⌫</button><button data-key="Escape">Esc</button>
   <button data-scroll="up">▲</button><button data-scroll="down">▼</button>
 </div>
-<div class="row"><button id="done" class="primary">Done, save sign-in</button></div>
+</details>
 <script>
   const base = location.pathname.replace(/\/+$/, "");
   const screen = document.getElementById("screen");
@@ -102,9 +113,9 @@
   });
   document.getElementById("go").addEventListener("submit", (e) => {
     e.preventDefault();
-    act("open", { url: document.getElementById("url").value });
+    act("open", { url: document.getElementById("url").value }).then(findFieldsSoon);
   });
-  document.querySelectorAll("[data-key]").forEach((b) => b.addEventListener("click", () => act("press", { key: b.dataset.key })));
+  document.querySelectorAll("[data-key]").forEach((b) => b.addEventListener("click", () => act("press", { key: b.dataset.key }).then(findFieldsSoon)));
   document.querySelectorAll("[data-scroll]").forEach((b) => b.addEventListener("click", () => act("scroll", { direction: b.dataset.scroll })));
   document.getElementById("done").addEventListener("click", () => {
     show("Saving…");
@@ -113,7 +124,65 @@
       (e) => show(e.message, "bad"),
     );
   });
-  post("start").catch((e) => show(e.message, "bad")).finally(refresh);
+  // The page's fields as real ones, so a phone's password manager and
+  // one-time-code autofill work, and text cannot land in the wrong field.
+  const fields = document.getElementById("fields");
+  const autocomplete = { username: "username", password: "current-password", code: "one-time-code" };
+  function field(control) {
+    const label = document.createElement("label");
+    label.textContent = control.name || "(unnamed field)";
+    const input = document.createElement("input");
+    input.type = control.kind === "password" ? "password" : "text";
+    input.autocomplete = autocomplete[control.kind] || "off";
+    if (control.kind === "code") input.inputMode = "numeric";
+    input.autocapitalize = "off";
+    input.spellcheck = false;
+    input.dataset.ref = control.ref;
+    label.append(input);
+    return label;
+  }
+  async function findFields() {
+    try {
+      const response = await fetch(base + "/controls", { cache: "no-store" });
+      const json = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error((json.error && json.error.message) || "HTTP " + response.status);
+      const controls = json.controls || [];
+      const inputs = controls.filter((c) => c.kind !== "button");
+      const buttons = document.createElement("div");
+      buttons.className = "buttons";
+      for (const c of controls.filter((c) => c.kind === "button")) {
+        const b = document.createElement("button");
+        b.type = "submit";
+        b.textContent = c.name || "(button)";
+        b.dataset.ref = c.ref;
+        buttons.append(b);
+      }
+      fields.replaceChildren(...inputs.map(field));
+      if (buttons.childElementCount) fields.append(buttons);
+      if (!controls.length) {
+        const none = document.createElement("span");
+        none.className = "none";
+        none.textContent = "No fields on this page. Tap and type on the page below instead.";
+        fields.append(none);
+      }
+    } catch (e) { show(e.message, "bad"); }
+  }
+  // Pages change after a submit: look again once it has had time to load.
+  function findFieldsSoon() { setTimeout(() => { queue = queue.then(findFields); }, 1500); }
+  fields.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const inputs = [...fields.querySelectorAll("input")];
+    const fills = inputs.filter((i) => i.value).map((i) => ({ ref: i.dataset.ref, text: i.value }));
+    const first = fields.querySelector("button");
+    const pressed = (e.submitter && e.submitter.dataset.ref) || (first && first.dataset.ref) || null;
+    show("Sending…");
+    act("submit", { fills, click: pressed }).then(() => {
+      inputs.filter((i) => i.type === "password").forEach((i) => { i.value = ""; });
+      findFieldsSoon();
+    });
+  });
+  document.getElementById("reload").addEventListener("click", () => { queue = queue.then(findFields); });
+  post("start").catch((e) => show(e.message, "bad")).finally(() => { queue = queue.then(findFields); refresh(); });
 </script>
 </body>
 </html>

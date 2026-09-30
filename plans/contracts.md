@@ -69,6 +69,8 @@ Unknown or expired tokens are `404`.
 | `POST /browser/{token}/press` `{"key"}` | `press` |
 | `POST /browser/{token}/scroll` `{"direction"}` | `scroll <dir> 400` |
 | `POST /browser/{token}/open` `{"url"}` | `open` (http or https) |
+| `GET /browser/{token}/controls` | `snapshot -i --json`, as `{"controls": [{"ref": "e4", "name", "kind"}]}` in page order; `kind` is `username`, `password`, `code`, `text` or `button` |
+| `POST /browser/{token}/submit` `{"fills": [{"ref", "text"}], "click"}` | `fill @ref text` for each (at most 20, 1000 chars each), then `click @ref`, as one command |
 | `POST /browser/{token}/done` | `state save`, stored for the session's owner; answers `{"saved_bytes"}` |
 
 ## Release artifact (GHCR via ORAS)
