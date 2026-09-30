@@ -20,6 +20,10 @@ description: What athena does not do yet. Read this before exposing it.
   budget; `/usage` and the `runs` table show who spent what.
 - Provider errors are logged to stderr in full and can include account
   details from the provider's error body. Message text is never logged.
+- Sign-in links (`browser_login_link`) are protected only by their token:
+  anyone who can reach the server with the link drives the user's signed-in
+  browser for an hour. Saved sign-ins are stored unencrypted and loaded into
+  every sandbox of their user, where the agent's tools can read them.
 
 ## Durability
 

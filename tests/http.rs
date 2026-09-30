@@ -775,6 +775,7 @@ async fn the_server_answers_over_tcp_and_finishes_turns_in_flight_before_it_stop
         Hosts::Loopback,
         service.clone(),
         Arc::new(agent),
+        None,
         next,
     ));
     let alice = service.user("http", "alice").await.unwrap();
@@ -819,6 +820,7 @@ async fn a_second_interrupt_quits_without_waiting_for_turns_in_flight() {
         Hosts::Loopback,
         service.clone(),
         Arc::new(agent),
+        None,
         next,
     ));
     let alice = service.user("http", "alice").await.unwrap();
@@ -864,6 +866,7 @@ fn athena_serve(
         .env_remove("ATHENA_ADDR")
         .env_remove("ATHENA_ALLOWED_HOSTS")
         .env_remove("ATHENA_VERSION")
+        .env_remove("OPEN_SANDBOX_URL")
         .env_remove("OPENROUTER_API_KEY");
     if let Some(key) = key {
         command.env("OPENROUTER_API_KEY", key);

@@ -45,12 +45,14 @@ async fn run(args: Vec<String>) -> Result<()> {
     }
     let service = Service::new(store::Store::open(&store::path())?, &model, cli::warn);
     if serving {
-        // Up front: a server without a key would fail every turn.
-        let agent = agent::build(&agent::client()?, &model, service.memory())?;
+        // Up front: a server without a key would fail every turn. One set
+        // of sandboxes serves the agent and the sign-in pages.
+        let (agent, sandboxes) = agent::build(&agent::client()?, &model, service.memory())?;
         let stop = shutdown::listen()?;
-        return http::run(&args[1..], Arc::new(service), Arc::new(agent), stop).await;
+        let (service, agent) = (Arc::new(service), Arc::new(agent));
+        return http::run(&args[1..], service, agent, sandboxes, stop).await;
     }
-    let make_agent = || agent::build(&agent::client()?, &model, service.memory());
+    let make_agent = || Ok(agent::build(&agent::client()?, &model, service.memory())?.0);
     cli::run(
         &args,
         &service,

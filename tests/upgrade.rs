@@ -24,6 +24,7 @@ const V0_RUN_OBSERVABILITY: &str = include_str!("fixtures/v0_run_observability.s
 const V2_RUN_TELEMETRY: &str = include_str!("fixtures/v2_run_telemetry.sql");
 const V3_USERS_SESSIONS: &str = include_str!("fixtures/v3_users_sessions.sql");
 const V4_SELECTED_SESSIONS: &str = include_str!("fixtures/v4_selected_sessions.sql");
+const V5_SANDBOXES: &str = include_str!("fixtures/v5_sandboxes.sql");
 
 /// Every row of a table, every column, in rowid order, as SQLite holds it.
 fn dump(db: &Connection, table: &str) -> Vec<Vec<Value>> {
@@ -251,6 +252,58 @@ async fn a_database_at_schema_4_gains_sandboxes_without_changing_a_row() {
     let user = service.user("telegram", "111111").await.unwrap();
     let notes = store.selected_session(&user).unwrap().unwrap();
     assert_eq!(notes.name, "notes");
+    let (agent, _) = mock_agent(&service, [MockTurn::text("noted")]);
+    service
+        .send(&agent, &user, &notes.id, "hello")
+        .await
+        .unwrap();
+
+    let now: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
+    for ((table, old), new) in TABLES.iter().zip(&before).zip(&now) {
+        assert_eq!(&new[..old.len()], &old[..], "{table}");
+    }
+    assert_eq!(runs(&db, &notes.id), [run_row(0, 1, 1, "ok")]);
+}
+
+/// The upgrade this build adds: schema version 5, with a recorded sandbox.
+/// Migration 6 only adds `browser_links` and `browser_states`; every
+/// existing row of every table must survive it, and a turn must still work.
+#[tokio::test]
+async fn a_database_at_schema_5_gains_sign_in_tables_without_changing_a_row() {
+    const TABLES: [&str; 6] = [
+        "messages",
+        "runs",
+        "users",
+        "sessions",
+        "selected_sessions",
+        "sandboxes",
+    ];
+    let tmp = from_fixture(V5_SANDBOXES);
+    let before: Vec<Vec<Vec<Value>>> = {
+        let db = tmp.raw();
+        assert_eq!(user_version(&db), 5);
+        TABLES.iter().map(|t| dump(&db, t)).collect()
+    };
+    let sizes: Vec<usize> = before.iter().map(Vec::len).collect();
+    assert_eq!(sizes, [14, 3, 3, 6, 1, 1]);
+
+    let (service, _) = tmp.service();
+    let db = tmp.raw();
+
+    assert_eq!(user_version(&db), store::SCHEMA_VERSION as i64);
+    let after: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
+    assert_eq!(after, before);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM browser_links"), 0);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM browser_states"), 0);
+
+    // The sandbox still belongs to its session, and a turn there appends.
+    let store = tmp.open();
+    let user = service.user("telegram", "111111").await.unwrap();
+    let notes = store.selected_session(&user).unwrap().unwrap();
+    assert_eq!(
+        store.sandbox(&notes.id).unwrap().unwrap().sandbox_id,
+        "sbx-fixture-1"
+    );
     let (agent, _) = mock_agent(&service, [MockTurn::text("noted")]);
     service
         .send(&agent, &user, &notes.id, "hello")

@@ -325,6 +325,22 @@ const MIGRATIONS: &[&str] = &[
          created_at    INTEGER NOT NULL,
          expires_at    INTEGER NOT NULL
      );",
+    // 6: signing in to websites through a session's browser. A link's
+    // token opens that session's browser for the user until `expires_at`;
+    // `url` is where it starts. `browser_states` is each user's saved
+    // browser state (agent-browser's `state save` JSON: cookies and local
+    // storage), loaded into every new sandbox of theirs.
+    "CREATE TABLE browser_links (
+         token      TEXT NOT NULL PRIMARY KEY,
+         session_id TEXT NOT NULL REFERENCES sessions (id),
+         url        TEXT NOT NULL,
+         expires_at INTEGER NOT NULL
+     );
+     CREATE TABLE browser_states (
+         user_id  INTEGER NOT NULL PRIMARY KEY REFERENCES users (id),
+         state    BLOB NOT NULL,
+         saved_at INTEGER NOT NULL
+     );",
 ];
 
 /// The schema version this build writes.
@@ -376,6 +392,11 @@ const EXPECTED_COLUMNS: &[(&str, &[&str])] = &[
             "expires_at",
         ],
     ),
+    (
+        "browser_links",
+        &["token", "session_id", "url", "expires_at"],
+    ),
+    ("browser_states", &["user_id", "state", "saved_at"]),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -790,6 +811,66 @@ impl Store {
         Ok(())
     }
 
+    /// Record a sign-in link to a session's browser, starting at `url`.
+    pub fn insert_browser_link(
+        &self,
+        token: &str,
+        session_id: &str,
+        url: &str,
+        expires_at: i64,
+    ) -> Result<()> {
+        self.db().execute(
+            "INSERT INTO browser_links (token, session_id, url, expires_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![token, session_id, url, expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// The session and start URL a sign-in link opens, if it has not
+    /// expired by `now`.
+    pub fn browser_link(&self, token: &str, now: i64) -> Result<Option<(String, String)>> {
+        Ok(self
+            .db()
+            .query_row(
+                "SELECT session_id, url FROM browser_links
+                 WHERE token = ?1 AND expires_at > ?2",
+                rusqlite::params![token, now],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Keep `state` as the browser state of the session's owner, replacing
+    /// the last one they saved from any session.
+    pub fn save_browser_state(&self, session_id: &str, state: &[u8], saved_at: i64) -> Result<()> {
+        let saved = self.db().execute(
+            "INSERT INTO browser_states (user_id, state, saved_at)
+             SELECT user_id, ?2, ?3 FROM sessions WHERE id = ?1
+             ON CONFLICT (user_id) DO UPDATE SET state = excluded.state,
+                                                 saved_at = excluded.saved_at",
+            rusqlite::params![session_id, state, saved_at],
+        )?;
+        if saved == 0 {
+            bail!("no session `{session_id}`");
+        }
+        Ok(())
+    }
+
+    /// The browser state the session's owner saved last, if any.
+    pub fn browser_state(&self, session_id: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .db()
+            .query_row(
+                "SELECT b.state FROM browser_states b
+                 JOIN sessions s ON s.user_id = b.user_id
+                 WHERE s.id = ?1",
+                [session_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// A session's transcript, oldest first. Does not check ownership:
     /// callers look the session up through [`Store::session`] first.
     pub(crate) fn load(&self, session_id: &str) -> Result<Vec<Message>> {
@@ -1071,6 +1152,8 @@ mod tests {
         assert_eq!(
             tables,
             [
+                "browser_links",
+                "browser_states",
                 "messages",
                 "runs",
                 "sandboxes",
@@ -1558,6 +1641,50 @@ mod tests {
 
         // A sandbox needs a real session.
         assert!(store.insert_sandbox(&sandbox_for("missing", "x")).is_err());
+    }
+
+    #[test]
+    fn a_sign_in_link_opens_its_session_until_it_expires() {
+        let (store, _, id) = with_session();
+        store
+            .insert_browser_link("tok", &id, "https://example.com/login", 100)
+            .unwrap();
+        let opened = Some((id.clone(), "https://example.com/login".to_string()));
+        assert_eq!(store.browser_link("tok", 99).unwrap(), opened);
+        assert_eq!(store.browser_link("tok", 100).unwrap(), None);
+        assert_eq!(store.browser_link("other", 0).unwrap(), None);
+        // A token is used once, and only for a real session.
+        assert!(store.insert_browser_link("tok", &id, "u", 1).is_err());
+        assert!(store.insert_browser_link("t2", "missing", "u", 1).is_err());
+    }
+
+    #[test]
+    fn a_users_browser_state_is_shared_by_their_sessions_and_replaced_by_the_next_save() {
+        let (store, user, first) = with_session();
+        let second = store.open_session(&user, "other").unwrap().id;
+        let stranger = store.user("cli", "someone-else").unwrap();
+        let theirs = store.open_session(&stranger, "s").unwrap().id;
+        assert_eq!(store.browser_state(&first).unwrap(), None);
+
+        store.save_browser_state(&first, b"one", 1).unwrap();
+        store.save_browser_state(&second, b"two", 2).unwrap();
+        assert_eq!(store.browser_state(&first).unwrap(), Some(b"two".to_vec()));
+        assert_eq!(store.browser_state(&second).unwrap(), Some(b"two".to_vec()));
+        // Another user's sessions never see it.
+        assert_eq!(store.browser_state(&theirs).unwrap(), None);
+        let rows: Vec<(i64, i64)> = store
+            .db()
+            .prepare("SELECT user_id, saved_at FROM browser_states")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows, [(user.id(), 2)]);
+
+        let err = store.save_browser_state("missing", b"x", 1).unwrap_err();
+        assert!(err.to_string().contains("no session `missing`"), "{err}");
+        assert_eq!(store.browser_state("missing").unwrap(), None);
     }
 
     #[test]

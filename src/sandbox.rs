@@ -16,6 +16,7 @@
 //! device. Athena passes none of its own secrets into a sandbox.
 
 pub mod client;
+pub mod login;
 pub mod shell;
 pub mod stream;
 pub mod tools;
@@ -123,6 +124,9 @@ pub struct Config {
     /// to look.
     pub startup_timeout: Duration,
     pub startup_poll: Duration,
+    /// Where users open sign-in links: this HTTP server as they reach it
+    /// ([`viewer_url`]).
+    pub viewer_url: Url,
 }
 
 impl Config {
@@ -130,13 +134,14 @@ impl Config {
     /// `OPEN_SANDBOX_URL`.
     pub fn from_env() -> Result<Option<Self>, Error> {
         let var = |name| std::env::var(name).ok();
-        Self::parse(
+        let config = Self::parse(
             var("OPEN_SANDBOX_URL"),
             var("OPEN_SANDBOX_API_KEY"),
             var("ATHENA_SANDBOX_IMAGE"),
             var("ATHENA_SANDBOX_TIMEOUT_SECS"),
             var("ATHENA_ENV"),
-        )
+        );
+        with_viewer(config, var("ATHENA_PUBLIC_URL"), var("ATHENA_ADDR"))
     }
 
     pub(crate) fn parse(
@@ -190,8 +195,56 @@ impl Config {
             memory: "1Gi".into(),
             startup_timeout: Duration::from_secs(60),
             startup_poll: Duration::from_millis(250),
+            viewer_url: viewer_url(None, None)?,
         }))
     }
+}
+
+/// `config` with its [`Config::viewer_url`] from these settings. Without a
+/// sandbox there are no sign-in links, so the settings are not checked.
+fn with_viewer(
+    config: Result<Option<Config>, Error>,
+    public_url: Option<String>,
+    addr: Option<String>,
+) -> Result<Option<Config>, Error> {
+    let Some(config) = config? else {
+        return Ok(None);
+    };
+    let viewer_url = viewer_url(public_url, addr)?;
+    Ok(Some(Config {
+        viewer_url,
+        ..config
+    }))
+}
+
+/// Where sign-in links point: `ATHENA_PUBLIC_URL` when set, otherwise the
+/// address `athena serve` listens on (`ATHENA_ADDR`, or its default). On
+/// the VM that is the tailnet address, which `ATHENA_ALLOWED_HOSTS` already
+/// lists. Both processes read the same env file, so the Telegram bot's
+/// links reach the HTTP server.
+pub fn viewer_url(public_url: Option<String>, addr: Option<String>) -> Result<Url, Error> {
+    let set = |v: Option<String>| v.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let (url, variable) = match set(public_url) {
+        Some(url) => (url, "ATHENA_PUBLIC_URL"),
+        None => {
+            let addr = set(addr).unwrap_or_else(|| crate::http::DEFAULT_ADDR.into());
+            (format!("http://{addr}"), "ATHENA_ADDR")
+        }
+    };
+    let parsed = Url::parse(&url)
+        .map_err(|e| Error::Config(format!("{variable} `{url}` as a link: {e}")))?;
+    let unspecified = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_unspecified(),
+        Some(url::Host::Ipv6(ip)) => ip.is_unspecified(),
+        _ => false,
+    };
+    if !matches!(parsed.scheme(), "http" | "https") || unspecified {
+        return Err(Error::Config(format!(
+            "{variable} `{url}` cannot be opened from a phone or laptop; \
+             set ATHENA_PUBLIC_URL to the http(s) address users reach Athena at"
+        )));
+    }
+    Ok(parsed)
 }
 
 /// `ms` since the Unix epoch as an RFC 3339 UTC time, as OpenSandbox's
@@ -221,6 +274,8 @@ pub fn rfc3339(ms: i64) -> String {
 struct Lease {
     row: SandboxRow,
     execd: Execd,
+    /// The sandbox was created for this lease: nothing ran in it before.
+    fresh: bool,
     /// Tool calls on one session take turns: a bash session runs one
     /// command at a time, and two first calls must not both create a sandbox.
     _turn: OwnedMutexGuard<()>,
@@ -280,7 +335,7 @@ impl Sandboxes {
         let turn = self.turn(session_id).await;
         let expires_at = now_millis() + self.config.timeout.as_millis() as i64;
         let id = session_id.to_string();
-        let row = match self.stored(move |s| s.sandbox(&id)).await? {
+        let (row, fresh) = match self.stored(move |s| s.sandbox(&id)).await? {
             Some(mut row) => {
                 if self
                     .client
@@ -289,7 +344,7 @@ impl Sandboxes {
                 {
                     row.expires_at = expires_at;
                     self.save(&row).await?;
-                    row
+                    (row, false)
                 } else {
                     let (id, sandbox) = (row.session_id, row.sandbox_id);
                     self.stored(move |s| s.remove_sandbox(&id, &sandbox))
@@ -300,14 +355,22 @@ impl Sandboxes {
             None => self.create(session_id, expires_at).await?,
         };
         let execd = self.client.execd(&row.sandbox_id).await?;
+        if fresh {
+            // Here, not in `create`: it needs execd, and this lease already
+            // holds the session's turn, so it cannot take another lease.
+            self.restore_login(session_id, &execd).await;
+        }
         Ok(Lease {
             row,
             execd,
+            fresh,
             _turn: turn,
         })
     }
 
-    async fn create(&self, session_id: &str, expires_at: i64) -> Result<SandboxRow, Error> {
+    /// A new sandbox for the session, and whether it is ours: false when
+    /// another process recorded one first and that one is returned.
+    async fn create(&self, session_id: &str, expires_at: i64) -> Result<(SandboxRow, bool), Error> {
         let id = session_id.to_string();
         let owner = self
             .stored(move |s| s.session_owner(&id))
@@ -350,15 +413,17 @@ impl Sandboxes {
         };
         let new = row.clone();
         if self.stored(move |s| s.insert_sandbox(&new)).await? {
-            return Ok(row);
+            return Ok((row, true));
         }
         // Another process recorded a sandbox for this session first. Use
         // theirs, so the session keeps one sandbox, and drop ours.
         let _ = self.client.delete(&row.sandbox_id).await;
         let id = session_id.to_string();
-        self.stored(move |s| s.sandbox(&id))
+        let theirs = self
+            .stored(move |s| s.sandbox(&id))
             .await?
-            .ok_or_else(|| Error::Store("the session's sandbox row vanished".into()))
+            .ok_or_else(|| Error::Store("the session's sandbox row vanished".into()))?;
+        Ok((theirs, false))
     }
 
     /// Wait for a new sandbox to reach `Running`.
@@ -588,6 +653,52 @@ mod tests {
             let err = parse(url, key, "", timeout).unwrap_err();
             assert!(matches!(&err, Error::Config(m) if m.contains(variable)));
         }
+    }
+
+    #[test]
+    fn sign_in_links_point_at_the_public_url_else_where_serve_listens() {
+        let url = |public: Option<&str>, addr: Option<&str>| {
+            viewer_url(public.map(String::from), addr.map(String::from))
+        };
+        assert_eq!(
+            url(
+                Some(" https://athena.example/app "),
+                Some("100.1.2.3:18080")
+            )
+            .unwrap()
+            .as_str(),
+            "https://athena.example/app"
+        );
+        assert_eq!(
+            url(Some(""), Some("100.1.2.3:18080")).unwrap().as_str(),
+            "http://100.1.2.3:18080/"
+        );
+        assert_eq!(url(None, None).unwrap().as_str(), "http://127.0.0.1:8080/");
+        for (public, addr, variable) in [
+            (Some("ftp://athena.example"), None, "ATHENA_PUBLIC_URL"),
+            (Some("not a url"), None, "ATHENA_PUBLIC_URL"),
+            (None, Some("0.0.0.0:18080"), "ATHENA_ADDR"),
+            (None, Some("[::]:18080"), "ATHENA_ADDR"),
+        ] {
+            let err = url(public, addr).unwrap_err();
+            assert!(matches!(&err, Error::Config(m) if m.contains(variable)));
+        }
+    }
+
+    #[test]
+    fn the_viewer_url_is_only_checked_when_there_is_a_sandbox() {
+        let bad = || Some("0.0.0.0:1".to_string());
+        assert!(with_viewer(Ok(None), None, bad()).unwrap().is_none());
+        let unusable = parse("ftp://s", "", "", "");
+        assert!(matches!(
+            with_viewer(unusable, None, None),
+            Err(Error::Config(_))
+        ));
+        let config = || parse("http://s", "", "", "");
+        assert!(with_viewer(config(), None, bad()).is_err());
+        let public = Some("https://athena.example".to_string());
+        let config = with_viewer(config(), public, bad()).unwrap().unwrap();
+        assert_eq!(config.viewer_url.as_str(), "https://athena.example/");
     }
 
     #[test]

@@ -26,6 +26,7 @@ async fn server(turns: impl IntoIterator<Item = MockTurn>) -> String {
         athena::http::Hosts::Loopback,
         service,
         Arc::new(agent),
+        None,
         std::future::pending(),
     ));
     format!("http://{addr}")
