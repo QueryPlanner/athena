@@ -421,6 +421,7 @@ mod tests {
             crate::http::Hosts::Loopback,
             service,
             Arc::new(agent),
+            None,
             std::future::pending(),
         ));
         format!("http://{addr}/")

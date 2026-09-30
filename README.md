@@ -164,6 +164,7 @@ on the machine running athena. The template ships no host tool except `add`.
 | `run_code(language, code)` | a persistent Python interpreter (execd's Jupyter-backed code API) |
 | `read_file(path)` / `write_file(path, content)` | text files inside the sandbox; reads stop at 64 KiB |
 | `agent_browser(args)` | the whole agent-browser CLI, unrestricted: `args` are the arguments after `agent-browser`, run on the conversation's own browser. The description tells the model to read `skills get core` and `--help` first. Output is capped like `shell`'s; there is no confirmation list, so `eval` and `download` run. The model can pass its own `--session`, which starts a separate browser |
+| `browser_login_link(url)` | opens a sign-in page in the conversation's browser and returns a link for the user to sign in themselves (see "Signing in to websites") |
 | `view_image(path)` | shows the model a PNG, JPEG, GIF or WebP file from the sandbox |
 | `send_photo(path, caption?)` / `send_file(path, caption?)` | sends the user a sandbox file after the reply (Telegram only) |
 
@@ -207,6 +208,37 @@ plumbing:
   50 MB, Telegram's limits; at most 10 files a turn. Over HTTP and the CLI
   there is nowhere to send a file, and both tools tell the model so.
 
+**Signing in to websites.** The user signs in, never the model:
+
+1. When a site needs a sign-in, the agent calls `browser_login_link(url)`. It
+   loads the user's saved sign-ins into the conversation's browser, opens
+   `url`, and returns a link such as
+   `http://100.124.202.79:18080/browser/<token>`, which the agent sends in
+   its reply (Telegram or HTTP).
+2. The user opens it on any device on the tailnet. `athena serve` shows the
+   browser as a screenshot refreshed every second: tap to click, type into a
+   text box (with a "hide" switch for passwords), Enter, Tab, Backspace,
+   Escape, scroll and a URL bar. Each goes to the same agent-browser session
+   the agent drives, as `mouse`, `keyboard type`, `press`, `scroll` or `open`.
+3. **Done** runs `agent-browser state save` and keeps the result (cookies and
+   local storage) in `browser_states`, one per user. The user then tells the
+   agent in the chat that they are done, and the agent carries on in the
+   same browser.
+4. Every new sandbox of that user runs `state load` with it before its
+   first command, so sign-ins outlive sandboxes. When a saved sign-in has
+   expired, the agent sees the site's sign-in page and sends a new link.
+
+Links last an hour (`sandbox::login::LINK_TTL`) and live in `browser_links`,
+so the Telegram process makes them and the `serve` process answers them. A
+link opened after its sandbox expired reopens its start page in the new one.
+The link's base is `ATHENA_PUBLIC_URL`, else `http://$ATHENA_ADDR`. On the
+VM that is the tailnet address `ATHENA_ALLOWED_HOSTS` already lists, and
+both units read it from the same env file. `serve --addr` does not change
+the links; set `ATHENA_PUBLIC_URL` if users reach Athena at another
+address. The sign-in routes are in `src/http/viewer.rs`, the rest in
+`src/sandbox/login.rs`. What this does not protect against yet is under
+Known limits.
+
 **Configuration.** Without `OPEN_SANDBOX_URL` none of these tools exist and
 everything else works as before. Photos users send are still shown to the
 model. Other files are not downloaded; the model is told their name and
@@ -218,6 +250,7 @@ size, and that there is no sandbox.
 | `OPEN_SANDBOX_API_KEY` | unset | sent as `OPEN-SANDBOX-API-KEY` when set |
 | `ATHENA_SANDBOX_IMAGE` | `ghcr.io/queryplanner/athena-sandbox:latest` | image each sandbox runs |
 | `ATHENA_SANDBOX_TIMEOUT_SECS` | `1800` (min 60) | idle lifetime of a sandbox |
+| `ATHENA_PUBLIC_URL` | `http://$ATHENA_ADDR` | where sign-in links point; must be http(s), and required when `ATHENA_ADDR` is `0.0.0.0` or `[::]` |
 
 **The image** is `deploy/sandbox-image/Dockerfile`: Debian 13 slim, Chromium,
 a pinned and checksummed agent-browser release, Python with a Jupyter server,
@@ -788,5 +821,25 @@ log events never include prompt or reply text.
 - No timing beyond whole-turn wall clock. Rig reports no per-call latency;
   time-to-first-token and per-tool duration need Rig's hooks.
 - `provider_request_id` is often empty — OpenRouter does not always report one.
+- **Sign-in links are not secured yet.** The token in the link is the only
+  check: anyone who can reach `athena serve` with the link can drive that
+  browser, signed in as the user, for an hour. There is no Tailscale
+  identity check and links cannot be revoked. Spans name the route, not the
+  token.
+- Saved sign-ins are stored unencrypted in `browser_states` and loaded into
+  every sandbox of their user, where `shell`, `read_file` and
+  `agent_browser` can read or export them. A prompt injection can therefore
+  send a user's cookies anywhere. The state is one per user for every site,
+  and the last Done wins; a new link loads the latest state first, so
+  sign-ins made in other conversations are kept.
+- Text typed on the sign-in page reaches the sandbox as a shell command
+  line (`agent-browser keyboard type '<text>'`) through the OpenSandbox
+  proxy, unencrypted on the tailnet. It is not logged or put on spans.
+- The sign-in page and the agent can drive one browser at the same time:
+  `serve` and `telegram` are separate processes, and turns are serialised
+  only within one. Each page poll renews the sandbox and writes its row.
+- Headless Chromium on a server is refused by some sign-ins (Google's among
+  them) and challenged by others; the page cannot get past a CAPTCHA the
+  site shows.
 - `runs` rows are ordered by `(started_at, rowid)`. `VACUUM` may renumber
   rowids, so two runs started in the same millisecond can swap after one.

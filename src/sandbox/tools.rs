@@ -10,7 +10,7 @@
 //! execd has no `argv` mode.
 
 use super::shell::command_line;
-use super::{Error, Sandboxes};
+use super::{Error, Sandboxes, login};
 use crate::media::{self, Attachment, Kind, Outbox};
 use crate::runner::Conversation;
 use rig_agent::agent::{AgentBuilder, WithBuilderTools};
@@ -45,6 +45,7 @@ pub fn register(
         .tool(ReadFile(sandboxes.clone()))
         .tool(WriteFile(sandboxes.clone()))
         .tool(AgentBrowser(sandboxes.clone()))
+        .tool(BrowserLoginLink(sandboxes.clone()))
         .tool(ViewImage(sandboxes.clone()))
         .tool(SendPhoto(sandboxes.clone()))
         .tool(SendFile(sandboxes))
@@ -387,6 +388,70 @@ impl Tool for AgentBrowser {
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct LoginLinkArgs {
+    pub url: String,
+}
+
+/// `browser_login_link(url)`: a link for the user to sign in themselves.
+pub struct BrowserLoginLink(Arc<Sandboxes>);
+
+impl Tool for BrowserLoginLink {
+    const NAME: &'static str = "browser_login_link";
+    type Args = LoginLinkArgs;
+    type Output = String;
+    type Error = ToolExecutionError;
+
+    fn description(&self) -> String {
+        format!(
+            "When a website needs the user to sign in, open its sign-in page with this and \
+             send the user the link it returns. The link shows them this conversation's \
+             browser; they sign in there themselves and press Done, which saves the \
+             sign-in for all their future conversations. Then end your turn and wait for \
+             them to say they are done before continuing. Never ask the user for a \
+             password. The link works for {} minutes; if a site asks to sign in again \
+             later, send a new one.",
+            login::LINK_TTL.as_secs() / 60
+        )
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The http(s) sign-in page to open"}
+            },
+            "required": ["url"]
+        })
+    }
+
+    async fn call(
+        &self,
+        context: &mut ToolContext,
+        args: LoginLinkArgs,
+    ) -> Result<String, Self::Error> {
+        let url = web_url(&args.url).map_err(failed)?;
+        let session = session(context)?;
+        let link = self.0.login_link(&session, &url).await.map_err(failed)?;
+        Ok(format!(
+            "Send the user this link to sign in: {link}\n\
+             It opens {url} in this conversation's browser."
+        ))
+    }
+}
+
+/// An http or https URL with a host, as agent-browser should open it.
+pub fn web_url(url: &str) -> Result<String, Error> {
+    let parsed = url::Url::parse(url.trim())
+        .map_err(|e| Error::Invalid(format!("`{url}` is not a URL: {e}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+        return Err(Error::Invalid(format!(
+            "`{url}` is not an http or https URL"
+        )));
+    }
+    Ok(parsed.into())
+}
+
 /// `view_image(path)`: look at an image file in the sandbox.
 pub struct ViewImage(Arc<Sandboxes>);
 
@@ -615,6 +680,23 @@ mod tests {
             .to_vec();
         expected.extend(args.clone());
         assert_eq!(cli_arguments_as_the_shell_passes_them(&args), expected);
+    }
+
+    #[test]
+    fn only_http_urls_with_a_host_are_opened() {
+        assert_eq!(
+            web_url(" https://x.example/a ").unwrap(),
+            "https://x.example/a"
+        );
+        assert_eq!(web_url("http://x.example").unwrap(), "http://x.example/");
+        for bad in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "not a url",
+            "http://",
+        ] {
+            assert!(matches!(web_url(bad), Err(Error::Invalid(_))), "{bad}");
+        }
     }
 
     #[test]

@@ -41,6 +41,10 @@ struct Inner {
     bash: Mutex<HashSet<String>>,
     contexts: Mutex<HashSet<String>>,
     files: Mutex<HashMap<String, Vec<u8>>>,
+    /// Files commands write: a command containing the marker writes the
+    /// content to the quoted path right after it, as agent-browser does
+    /// for `'screenshot' '<path>'`.
+    writes: Mutex<HashMap<String, Vec<u8>>>,
     replies: Mutex<VecDeque<(StatusCode, String)>>,
     /// The next response to a request whose path ends with the key.
     faults: Mutex<HashMap<String, (StatusCode, String)>>,
@@ -150,6 +154,18 @@ impl FakeSandbox {
         *self.inner.on_create.lock().unwrap() = Some(Box::new(hook));
     }
 
+    /// Commands containing `marker` write `content` to the quoted path
+    /// after it; `None` stops that, as if agent-browser failed to write.
+    /// Used by `browser_login.rs`, not by every test binary including this.
+    #[allow(dead_code)]
+    pub fn writes_on(&self, marker: &str, content: Option<&[u8]>) {
+        let mut writes = self.inner.writes.lock().unwrap();
+        match content {
+            Some(content) => writes.insert(marker.to_string(), content.to_vec()),
+            None => writes.remove(marker),
+        };
+    }
+
     pub fn file(&self, path: &str) -> Option<Vec<u8>> {
         self.inner.files.lock().unwrap().get(path).cloned()
     }
@@ -175,6 +191,7 @@ pub fn config(url: &str) -> athena::sandbox::Config {
         memory: "1Gi".into(),
         startup_timeout: std::time::Duration::from_secs(5),
         startup_poll: std::time::Duration::from_millis(1),
+        viewer_url: url::Url::parse("http://athena.test:18080").unwrap(),
     }
 }
 
@@ -350,6 +367,18 @@ async fn execd(
     match (method, rest) {
         (Method::POST, ["command"]) => {
             let command = body["command"].as_str().unwrap();
+            let mut files = inner.files.lock().unwrap();
+            // `rm -f <path> && ...`, as Athena's viewer runs it.
+            if let Some(rest) = command.strip_prefix("rm -f ") {
+                files.remove(rest.split(' ').next().unwrap());
+            }
+            for (marker, content) in inner.writes.lock().unwrap().iter() {
+                if let Some((_, rest)) = command.split_once(marker.as_str()) {
+                    let path = rest.trim_start_matches('\'').split('\'').next().unwrap();
+                    files.insert(path.into(), content.clone());
+                }
+            }
+            drop(files);
             stream(command.to_string())
         }
         (Method::POST, ["session"]) => {

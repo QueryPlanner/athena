@@ -43,6 +43,7 @@ Rules for `serve` and `telegram`:
 | `OPEN_SANDBOX_API_KEY` | agent | optional; sent as the `OPEN-SANDBOX-API-KEY` header when set |
 | `ATHENA_SANDBOX_IMAGE` | agent | default `ghcr.io/queryplanner/athena-sandbox:latest` |
 | `ATHENA_SANDBOX_TIMEOUT_SECS` | agent | default `1800`, minimum 60 |
+| `ATHENA_PUBLIC_URL` | agent | base of sign-in links, e.g. `http://100.124.202.79:18080`; default `http://$ATHENA_ADDR` (so `serve` and `telegram` agree from the one env file). Must be http(s); required when `ATHENA_ADDR` is unspecified (`0.0.0.0`, `[::]`). |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | all | OTLP/HTTP base URL; on the VM OpenObserve, `http://<tailnet-ip>:5080/api/default` (`/v1/traces` and `/v1/logs` are appended). **Unset means no OTLP export.** |
 | `OTEL_EXPORTER_OTLP_HEADERS` | all | `Authorization=Basic%20<base64 of OpenObserve root email:password>`, written by `setup-host.sh` into the env file only |
 | `ATHENA_TELEMETRY_DIR` | all | e.g. `/var/lib/athena/<env>/telemetry`: daily `traces-<role>-YYYYMMDD.jsonl` and `logs-<role>-YYYYMMDD.jsonl`, `<role>` being the process (`serve`, `telegram`, `cli`), so every file has one writer. **Unset means no files.** With neither this nor the endpoint, telemetry is off and logs go to stderr only. |
@@ -53,6 +54,22 @@ Rules for `serve` and `telegram`:
 
 `GET /version` returns `{"version": "<ATHENA_VERSION or pkg-dev>"}`. Like `/health`,
 it needs no user header. Every other endpoint is unchanged.
+
+Sign-in pages (`src/http/viewer.rs`) take no user header; the `{token}` from
+`browser_links` is the credential, and the `Host` allowlist still applies.
+Unknown or expired tokens are `404`.
+
+| Route | Does |
+|---|---|
+| `GET /browser/{token}` | the HTML page |
+| `POST /browser/{token}/start` | opens the link's `url` if the browser shows `about:blank` |
+| `GET /browser/{token}/screen` | `image/png` of the page |
+| `POST /browser/{token}/click` `{"x","y"}` | `mouse move x y`, `mouse down`, `mouse up` |
+| `POST /browser/{token}/type` `{"text"}` | `keyboard type` (1 to 1000 chars) |
+| `POST /browser/{token}/press` `{"key"}` | `press` |
+| `POST /browser/{token}/scroll` `{"direction"}` | `scroll <dir> 400` |
+| `POST /browser/{token}/open` `{"url"}` | `open` (http or https) |
+| `POST /browser/{token}/done` | `state save`, stored for the session's owner; answers `{"saved_bytes"}` |
 
 ## Release artifact (GHCR via ORAS)
 
@@ -78,6 +95,9 @@ it needs no user header. Every other endpoint is unchanged.
 | Name | Value | Owner |
 |---|---|---|
 | Inbox in each sandbox | `/tmp/athena-inbox/<8 hex>-<safe name>` (`sandbox::INBOX_DIR`) | `Sandboxes::stage` |
+| Browser state in each sandbox | `/tmp/athena-browser-state.json` (`sandbox::login::STATE_PATH`), agent-browser `state save` JSON | `sandbox::login` |
+| Sign-in page screenshot | `/tmp/athena-viewer.png` (`sandbox::login::SCREEN_PATH`) | `Sandboxes::screen` |
+| Sign-in tables | `browser_links(token, session_id, url, expires_at)`, links valid 1 h; `browser_states(user_id, state, saved_at)`, one per user | `store.rs` migration 6 |
 | Bot API methods | `getFile`, file download `GET /file/bot<token>/<file_path>`, `sendPhoto`, `sendDocument` (multipart) | `telegram.rs` |
 | Download limit | 20 MB (`telegram::DOWNLOAD_LIMIT`) | Bot API |
 | Albums | collected by `(user, media_group_id)` until 2 s pass with no new item (`telegram::ALBUM_WAIT`), at most 10 items, one turn | `telegram.rs` |

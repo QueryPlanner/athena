@@ -897,6 +897,7 @@ async fn the_model_is_offered_every_sandbox_tool_only_with_a_server() {
         [
             "add",
             "agent_browser",
+            "browser_login_link",
             "read_file",
             "run_code",
             "send_file",
@@ -987,4 +988,49 @@ async fn a_tool_call_with_oversized_arguments_is_skipped() {
     assert!(out.contains("over the limit"), "{out}");
     // Never reached the sandbox.
     assert!(h.fake.requests().is_empty());
+}
+
+#[tokio::test]
+async fn browser_login_link_opens_the_page_and_returns_a_link_to_this_sessions_browser() {
+    let h = harness().await;
+    let s = h.session("s").await;
+    let out = h
+        .call(
+            &s,
+            "browser_login_link",
+            json!({"url": " https://github.com/login "}),
+        )
+        .await;
+    let link = out
+        .strip_prefix("Send the user this link to sign in: http://athena.test:18080/browser/")
+        .unwrap_or_else(|| panic!("{out}"));
+    let (token, rest) = link.split_once('\n').unwrap();
+    assert_eq!(token.len(), 32, "{out}");
+    assert_eq!(
+        rest,
+        "It opens https://github.com/login in this conversation's browser."
+    );
+    let sent = h.fake.requests_to("POST", "/command").pop().unwrap();
+    assert_eq!(
+        sent.body["command"],
+        format!(
+            "'agent-browser' '--session' '{s}' '--content-boundaries' 'open' 'https://github.com/login'"
+        )
+    );
+    // The token opens this session, at that page.
+    let link = h.sandboxes.linked(token).await.unwrap().unwrap();
+    assert_eq!(
+        (link.session_id, link.url),
+        (s.clone(), "https://github.com/login".into())
+    );
+
+    let out = h
+        .call(
+            &s,
+            "browser_login_link",
+            json!({"url": "file:///etc/passwd"}),
+        )
+        .await;
+    assert!(out.contains("not an http or https URL"), "{out}");
+    assert_eq!(h.fake.requests_to("POST", "/command").len(), 1);
 }

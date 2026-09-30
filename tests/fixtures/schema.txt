@@ -1,4 +1,18 @@
-user_version 5
+user_version 6
+
+table browser_links
+  token TEXT NOT NULL PK1
+  session_id TEXT NOT NULL
+  url TEXT NOT NULL
+  expires_at INTEGER NOT NULL
+  foreign key session_id REFERENCES sessions (id)
+  unique index (token) from pk
+
+table browser_states
+  user_id INTEGER NOT NULL PK1
+  state BLOB NOT NULL
+  saved_at INTEGER NOT NULL
+  foreign key user_id REFERENCES users (id)
 
 table messages
   session_id TEXT NOT NULL PK1

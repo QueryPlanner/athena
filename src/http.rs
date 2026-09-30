@@ -7,8 +7,12 @@
 //! replaces that extractor and nothing else. Until then the server must only
 //! listen where every client is trusted; README "Known limits" says why.
 //!
-//! The endpoints and their JSON are listed in README "HTTP API".
+//! The endpoints and their JSON are listed in README "HTTP API". The
+//! sign-in pages under `/browser/` are in [`viewer`].
 
+mod viewer;
+
+use crate::sandbox::Sandboxes;
 use crate::service::{
     self, RunRecord, Service, Session, SessionSummary, SessionUsage, Turn, TurnEvent, TurnStream,
     User,
@@ -71,10 +75,24 @@ struct App {
     service: Arc<Service>,
     agent: Arc<Agent>,
     hosts: Hosts,
+    /// The agent's sandboxes, for the sign-in pages; none without a
+    /// sandbox server.
+    sandboxes: Option<Arc<Sandboxes>>,
 }
 
 /// The API. `agent` must be built with `service.memory()`.
 pub fn router(service: Arc<Service>, agent: Arc<Agent>, hosts: Hosts) -> Router {
+    router_with(service, agent, hosts, None)
+}
+
+/// [`router`], with sign-in pages driving these sandboxes: the same ones
+/// the agent's tools use, so the user and the agent share each browser.
+pub fn router_with(
+    service: Arc<Service>,
+    agent: Arc<Agent>,
+    hosts: Hosts,
+    sandboxes: Option<Arc<Sandboxes>>,
+) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
@@ -82,11 +100,13 @@ pub fn router(service: Arc<Service>, agent: Arc<Agent>, hosts: Hosts) -> Router 
         .route("/sessions/{id}/messages", get(messages).post(send))
         .route("/sessions/{id}/messages/stream", post(send_stream))
         .route("/usage", get(usage))
+        .merge(viewer::routes())
         .layer(axum::middleware::from_fn(traced))
         .with_state(App {
             service,
             agent,
             hosts,
+            sandboxes,
         })
 }
 
@@ -98,11 +118,15 @@ pub async fn serve(
     hosts: Hosts,
     service: Arc<Service>,
     agent: Arc<Agent>,
+    sandboxes: Option<Arc<Sandboxes>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    axum::serve(listener, router(service.clone(), agent, hosts))
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    axum::serve(
+        listener,
+        router_with(service.clone(), agent, hosts, sandboxes),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
     service.idle().await;
     Ok(())
 }
@@ -116,6 +140,7 @@ pub async fn run<F: Future<Output = ()> + Send + 'static>(
     args: &[String],
     service: Arc<Service>,
     agent: Arc<Agent>,
+    sandboxes: Option<Arc<Sandboxes>>,
     interrupt: impl Fn() -> F,
 ) -> anyhow::Result<()> {
     let addr = addr(args, std::env::var("ATHENA_ADDR").ok())?;
@@ -126,7 +151,7 @@ pub async fn run<F: Future<Output = ()> + Send + 'static>(
     let local = listener.local_addr()?;
     let hosts = hosts_for(local, allowed);
     announce(local, &hosts, &mut std::io::stderr());
-    serve_until_interrupted(listener, hosts, service, agent, interrupt).await
+    serve_until_interrupted(listener, hosts, service, agent, sandboxes, interrupt).await
 }
 
 /// [`serve`] until the first interrupt, then shut down gracefully. A second
@@ -137,6 +162,7 @@ pub async fn serve_until_interrupted<F: Future<Output = ()> + Send + 'static>(
     hosts: Hosts,
     service: Arc<Service>,
     agent: Arc<Agent>,
+    sandboxes: Option<Arc<Sandboxes>>,
     interrupt: impl Fn() -> F,
 ) -> anyhow::Result<()> {
     let (stopping, stopped) = tokio::sync::oneshot::channel();
@@ -156,7 +182,7 @@ pub async fn serve_until_interrupted<F: Future<Output = ()> + Send + 'static>(
         interrupt().await;
     };
     tokio::select! {
-        served = serve(listener, hosts, service, agent, shutdown) => Ok(served?),
+        served = serve(listener, hosts, service, agent, sandboxes, shutdown) => Ok(served?),
         () = forced => bail!("interrupted twice; quit without waiting for the turns in flight"),
     }
 }
