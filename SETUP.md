@@ -133,6 +133,14 @@ in OpenObserve. An ingest-only OpenObserve user per environment would be
 tighter; setup-host.sh does not create one (not verified that OpenObserve's
 open-source edition supports it).
 
+Staging and prod export into the same OpenObserve organization, `default`
+(both env files hold the same endpoint), so OpenObserve shows one space. To
+look at one environment, filter on its environment label: traces on
+`service_deployment_environment_name`, logs on `deployment_environment_name`,
+set to `staging` or `prod`. A
+separate organization per environment would need `setup-host.sh` to create
+the organizations and their tokens; it does not.
+
 Everything is exported, always, with no switch: full prompts, the system
 prompt, replies and tool arguments and results are recorded on spans in
 staging and prod, and exported to OpenObserve and the JSONL files (kept 30

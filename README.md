@@ -694,6 +694,13 @@ background thread.
   `OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic%20<base64 of user:password>`
   (`%20` is the space; values are URL-decoded). The other standard
   `OTEL_EXPORTER_OTLP_*` variables (timeout, per-signal endpoints) work too.
+  Staging and prod both write to OpenObserve's `default` organization, so
+  you see one space. Telling them apart is a filter, not a separate place:
+  every record carries `deployment.environment.name` (`ATHENA_ENV`). In
+  OpenObserve that is the field `service_deployment_environment_name` on traces
+  and `deployment_environment_name` on logs, for example
+  `service_deployment_environment_name = 'staging'` in the traces search. If a
+  query finds nothing, check the stream's schema in the UI for the exact name.
 - **JSON Lines files** when `ATHENA_TELEMETRY_DIR` is set:
   `traces-<role>-YYYYMMDD.jsonl` and `logs-<role>-YYYYMMDD.jsonl`, where the
   role is the process (`serve`, `telegram` or `cli`) so each file has exactly
