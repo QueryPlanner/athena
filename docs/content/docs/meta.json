@@ -15,6 +15,7 @@
     "---Internals---",
     "architecture",
     "persistence",
+    "compaction",
     "usage-and-cost",
     "---Operate---",
     "deployment",

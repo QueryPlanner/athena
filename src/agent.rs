@@ -150,11 +150,24 @@ pub fn build_with(
     // only takes from the user.
     let model = media::Vision(client.completion_model(model));
     configure_all(
-        rig::agent::AgentBuilder::new(model).memory(memory),
+        rig::agent::AgentBuilder::new(model)
+            .memory(memory)
+            .additional_params(openrouter_params()),
         sandboxes,
         &Custom::from_env(),
         mcp,
     )
+}
+
+/// Request parameters every OpenRouter call carries.
+///
+/// OpenRouter's `context-compression` plugin cuts messages out of the middle
+/// of a prompt that does not fit, which can leave a tool result without its
+/// call. Athena summarizes instead (`compaction`), so the plugin is switched
+/// off. OpenRouter only enables it by itself for endpoints of 8 192 tokens or
+/// fewer; being explicit makes that independent of the model.
+pub fn openrouter_params() -> serde_json::Value {
+    serde_json::json!({"plugins": [{"id": "context-compression", "enabled": false}]})
 }
 
 /// The sandboxes the environment configures (`OPEN_SANDBOX_URL`), if any.

@@ -5,6 +5,7 @@
 //! `service::Service::send` and `send_stream` wrap the run with ownership,
 //! locking and telemetry.
 
+use crate::compaction::ContextHook;
 use crate::media::{File, MAX_IMAGES_PER_REQUEST, Outbox};
 use crate::store::{RunRecord, now_millis};
 use rig_agent::agent::{Agent, PromptResponse, StreamingResult};
@@ -128,10 +129,13 @@ impl Request {
 pub trait Run: Send + Sync {
     /// Run `request` in `conversation`, the session id. The agent's memory
     /// loads that conversation's history first and appends the turn after.
+    /// With a `context` hook the turn compacts the conversation when it
+    /// nears the model's window.
     fn run(
         &self,
         request: &Request,
         conversation: &str,
+        context: Option<ContextHook>,
     ) -> impl Future<Output = Result<PromptResponse, PromptError>> + Send;
 }
 
@@ -140,12 +144,16 @@ impl Run for Agent {
         &self,
         request: &Request,
         conversation: &str,
+        context: Option<ContextHook>,
     ) -> Result<PromptResponse, PromptError> {
-        self.prompt(request.message())
+        let mut turn = self
+            .prompt(request.message())
             .conversation(conversation)
-            .tool_context(tool_context(conversation, request.outbox.as_ref()))
-            .extended_details()
-            .await
+            .tool_context(tool_context(conversation, request.outbox.as_ref()));
+        if let Some(context) = context {
+            turn = turn.add_hook(context);
+        }
+        turn.extended_details().await
     }
 }
 
@@ -158,10 +166,12 @@ impl Run for Agent {
 pub trait RunStream: Send + Sync {
     /// Stream `prompt` in `conversation`. The memory loads the history when
     /// the future is polled and appends the turn before the final item.
+    /// `context` is as for [`Run::run`].
     fn stream(
         &self,
         prompt: &str,
         conversation: &str,
+        context: Option<ContextHook>,
     ) -> impl Future<Output = StreamingResult> + Send;
 }
 
@@ -170,11 +180,16 @@ impl RunStream for Agent {
         &self,
         prompt: &str,
         conversation: &str,
+        context: Option<ContextHook>,
     ) -> impl Future<Output = StreamingResult> + Send {
-        self.stream_prompt(prompt)
+        let mut turn = self
+            .stream_prompt(prompt)
             .conversation(conversation)
-            .tool_context(tool_context(conversation, None))
-            .into_future()
+            .tool_context(tool_context(conversation, None));
+        if let Some(context) = context {
+            turn = turn.add_hook(context);
+        }
+        turn.into_future()
     }
 }
 

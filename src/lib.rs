@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod bench;
 pub mod cli;
+pub mod compaction;
 pub mod custom;
 pub mod dotenv;
 pub mod eval;

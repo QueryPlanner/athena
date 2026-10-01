@@ -30,6 +30,13 @@ call 1  finish_reason=stop        in=145  out=5    <- model answers "42"
 Input grows between the two because the tool result re-enters context. That
 cost is invisible in `messages`, and it is the reason `runs` exists.
 
+## Compaction is a run too
+
+Each summary a [compaction](/docs/compaction) asks for is a run of its own,
+recorded with the summary model and no messages saved, so `usage` counts what
+it cost. It appears in the `runs` and `calls` columns of the session it
+belongs to. A summary that failed is a run with status `error`.
+
 ## Raw responses
 
 `runs.calls_json` keeps each call's raw provider response as opaque Rig

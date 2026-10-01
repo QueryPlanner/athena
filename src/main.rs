@@ -3,7 +3,8 @@
 use anyhow::Result;
 use athena::service::Service;
 use athena::{
-    agent, bench, cli, custom, dotenv, eval, http, ops, shutdown, store, telegram, telemetry,
+    agent, bench, cli, compaction, custom, dotenv, eval, http, ops, shutdown, store, telegram,
+    telemetry,
 };
 use std::sync::Arc;
 
@@ -48,7 +49,9 @@ async fn run(args: Vec<String>) -> Result<()> {
     if serving {
         ops::require_absolute_db()?;
     }
-    let service = Service::new(store::Store::open(&store::path())?, &model, cli::warn);
+    let compactor = compaction::from_env(&model)?;
+    let service = Service::new(store::Store::open(&store::path())?, &model, cli::warn)
+        .with_compactor(compactor);
     if serving {
         // Up front: a server without a key would fail every turn. One set
         // of sandboxes serves the agent and the sign-in pages.

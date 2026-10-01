@@ -15,6 +15,9 @@ works. A malformed `.env` stops athena before it touches the database.
 | `ATHENA_DB` | all | `agent.db`; `serve` and `telegram` require an absolute path | SQLite database file |
 | `ATHENA_VERSION` | `--version`, `GET /version` | `<crate version>-dev` | The deployed release |
 | `RUNS_STORE_RAW` | all | on | `0` drops raw provider responses from `runs.calls_json` |
+| `ATHENA_COMPACT_AT` | all | `0.8` | Compact a session once its context is above this share of the model's window, from 0.3 to 0.95; see [Compaction](/docs/compaction) |
+| `ATHENA_COMPACT_MODEL` | all | `AGENT_MODEL` | The model that writes the summaries |
+| `ATHENA_CONTEXT_TOKENS` | all | OpenRouter's `context_length` for the model, else 128000 | The model's context window in tokens, 8000 or more |
 | `ATHENA_ADDR` | `serve` | `127.0.0.1:8080` | Listen address; `--addr` wins over it |
 | `ATHENA_ALLOWED_HOSTS` | `serve` | unset | Comma list of `HOST` or `HOST:PORT` the API answers; see [HTTP API](/docs/http-api) |
 | `ATHENA_INSTRUCTIONS` | all | unset | File of instructions added to the system prompt; see [Instructions and skills](/docs/instructions-and-skills) |

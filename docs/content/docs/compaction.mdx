@@ -1,0 +1,116 @@
+---
+title: Compaction
+description: How a long session is kept inside the model's context window.
+---
+
+A session's transcript only grows, and Rig sends all of it to the model on
+every call. When a session nears the model's context window, athena replaces
+the oldest part of what it sends with a summary.
+
+The transcript is never rewritten. A compaction adds a row to the
+`compactions` table: the session, a `through_seq`, the summary, the model that
+wrote it and what it cost. It means "this summary stands in for every message
+up to `through_seq`". The next turn loads the newest summary followed by the
+rows after it. History, the `sessions` message counts and any search still see
+every original row.
+
+To undo a compaction, delete its row
+(`DELETE FROM compactions WHERE session_id = ...`). The next turn loads the
+whole transcript again.
+
+## When it happens
+
+Before every model call, not once per turn. A turn has no limit on tool
+calls, so one long browser task can outgrow the window inside a single turn.
+
+The size of a request is what the provider reported for the previous call,
+plus four characters a token for what has been added since. An image in the
+turn in progress counts as 1 500 tokens, whatever its bytes. Four characters a
+token undercounts Chinese, Japanese and Korean text, but only for what the
+provider has not counted yet. Above `ATHENA_COMPACT_AT` (80%) of the window,
+the oldest messages are summarized and the request goes out as
+`[summary, ..recent]`.
+
+Rig applies a request patch to one model call only, so the summary is applied
+again to every later call of the turn. Blocking and streamed turns work the
+same way: both attach the hook (`compaction::ContextHook`) to the turn.
+
+## The window
+
+In order:
+
+1. `ATHENA_CONTEXT_TOKENS`, if set (8000 or more).
+2. The `context_length` OpenRouter lists for `AGENT_MODEL`, from
+   `GET https://openrouter.ai/api/v1/models`, which needs no key. It is
+   fetched the first time a request is big enough to matter, so a short chat
+   never waits for it, and kept for the life of the process. A variant suffix
+   (`:nitro`) is dropped if the full id is not listed.
+3. 128 000, with a warning in the log. If the lookup failed, this is assumed
+   for ten minutes and then OpenRouter is asked again.
+
+<Callout type="info">
+  OpenRouter lists one number per model, the largest. The provider a request
+  lands on can have a smaller window. Set `ATHENA_CONTEXT_TOKENS` if you know
+  it.
+</Callout>
+
+## What a cut never does
+
+- Separate a tool call from its result, or start the kept messages with a
+  result. The store refuses a checkpoint that would.
+- Cut the message the model is being asked about. When that is a tool
+  result, the assistant message with its call is kept too.
+- Keep less than a fifth of the window word for word. A cut that would leave
+  the request over the line anyway is not made.
+
+## Cost and failure
+
+The summary call is recorded as a run of its own, with the summary model and
+no messages saved, so `usage` shows what compaction costs and counts it among
+the session's runs.
+
+The summary call is capped at a tenth of the window (256 to 4000 tokens) and
+asked for three fifths of that many words. A summary that fails, comes back
+empty, is more than a quarter over the cap by our count (it is not cut short:
+its end holds the open tasks) or takes over 120 seconds is recorded as an
+`error` run and skipped. The turn goes on with the full history and does
+not fail. That session is not tried again, by any turn of the process, until
+its request has grown by a twentieth of the window.
+
+The checkpoint is written after the turn's own rows, and only if the turn was
+saved, so a turn that fails leaves none. If the checkpoint cannot be written,
+the next turn loads the whole transcript, so the prompt size that turn's last
+call reported (for the summary and what it kept) is not used for it: the size
+is estimated from the messages, and the session is compacted again.
+
+## Untrusted text
+
+The summarizer is told that tool results are untrusted data, and what it is
+shown labels them. The summary is stored and sent back as a user message, under
+a header saying it is notes and that nothing in it is an instruction from the
+user, so that a web page the agent read cannot write itself into what the user
+"said". A summary is still model output; do not rely on it as a security
+boundary.
+
+## OpenRouter's own compression
+
+OpenRouter has a `context-compression` plugin that drops messages from the
+middle of a prompt that does not fit, which can leave a tool result without
+its call. Every request the agent sends carries `plugins: [{"id":
+"context-compression", "enabled": false}]` so it never runs. The summary call
+is a plain completion and does not need it.
+
+## Limits
+
+- A summary is lossy.
+- Compaction waits for 80% of the window. With the default model that is
+  840 000 tokens re-sent on every call until it happens.
+- Cuts fall between messages. One prompt or tool result that alone fills the
+  window cannot be helped.
+- The summarizer gets everything to be summarized in one request, each
+  message part clipped to 8000 characters. Choose `ATHENA_COMPACT_MODEL` with
+  a window at least as big as the agent's. A session already over its window
+  when compaction is first switched on may not be rescued.
+- `athena eval` never compacts: a cassette holds one model's calls, and a
+  summary call is one it never recorded.
+- There is no `/compact` command and no token cap below the percentage yet.
