@@ -1,6 +1,7 @@
 //! `agent::build_with`, which production uses, reads `ATHENA_INSTRUCTIONS` and
 //! `ATHENA_SKILLS_DIR` and puts them in the request the provider receives,
-//! next to the tools of an MCP server (`ATHENA_MCP_CONFIG` shape).
+//! next to the tools of an MCP server (`ATHENA_MCP_CONFIG` shape) and the
+//! parameter that switches OpenRouter's context compression off.
 //!
 //! This is the only test in its binary because it sets environment
 //! variables, which is sound only while no other thread reads them.
@@ -121,4 +122,10 @@ fn the_production_build_sends_the_environments_instructions_and_skills() {
     let mut sorted = tools.clone();
     sorted.sort();
     assert_eq!(sorted, ["add", "echo", "read_skill"], "{tools:?}");
+    // And OpenRouter's own context compression is off, in the same request.
+    assert_eq!(
+        body["plugins"],
+        json!([{"id": "context-compression", "enabled": false}]),
+        "{body}"
+    );
 }

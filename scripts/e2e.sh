@@ -68,11 +68,13 @@ contiguous() { # session id
 }
 
 # Every run starts right after the previous one ended, and the last run ends
-# on the last stored message.
+# on the last stored message. A compaction's summary call is a run that saved
+# no messages (last_seq < first_seq), so it is left out.
 runs_tile_transcript() { # session id
     q "WITH r AS (SELECT first_seq, last_seq,
                          LAG(last_seq) OVER (ORDER BY started_at, rowid) AS prev
-                  FROM runs WHERE session_id = '$1' AND status = 'ok')
+                  FROM runs WHERE session_id = '$1' AND status = 'ok'
+                                  AND last_seq >= first_seq)
        SELECT (SELECT COUNT(*) FROM r WHERE prev IS NOT NULL AND first_seq != prev + 1) = 0
           AND (SELECT MIN(first_seq) FROM r) = 0
           AND (SELECT MAX(last_seq) FROM r) =
@@ -466,6 +468,40 @@ expect "no session lacks an owner" \
     "$(q "SELECT COUNT(*) FROM sessions s LEFT JOIN users u ON u.id = s.user_id WHERE u.id IS NULL")" "0"
 if grep -q "$TG_SECRET" "$WORK/bot.log"; then fail "the bot token never reaches the log"; fi
 pass "the bot token never reaches the log"
+
+echo
+echo "-- 9. a session that nears the window is compacted --"
+# An 8 000-token window compacts above 4 000 tokens, keeps 1 600 word for word
+# and expects an 800-token summary. A prompt of this filler is about 1 100
+# tokens and the system prompt a few hundred, so the fourth turn crosses the line.
+rm -f "$ATHENA_DB" "$ATHENA_DB-wal" "$ATHENA_DB-shm"
+export ATHENA_CONTEXT_TOKENS=8000 ATHENA_COMPACT_AT=0.5
+filler=$(python3 -c "print('The quick brown fox jumps over the lazy dog. ' * 110)")
+athena packed "Remember this code word: MARLIN-4417. Reply with just OK. $filler" >/dev/null
+for _ in 2 3 4 5; do
+    athena packed "Reply with just OK. $filler" >/dev/null
+done
+PACKED=$(sid packed)
+[ "$(q "SELECT COUNT(*) FROM compactions WHERE session_id='$PACKED'")" -ge 1 ] ||
+    fail "a session over half of an 8 000-token window was compacted"
+pass "a session over half of an 8 000-token window was compacted"
+expect "no message was removed or rewritten" "$(messages_in "$PACKED")" "10"
+expect "seq numbers still contiguous" "$(contiguous "$PACKED")" "1"
+expect "a checkpoint points at a row that exists" \
+    "$(q "SELECT MAX(through_seq) < (SELECT MAX(seq) FROM messages WHERE session_id='$PACKED')
+          FROM compactions WHERE session_id='$PACKED'")" "1"
+expect "each summary call is a run that saved no messages" \
+    "$(q "SELECT COUNT(*) FROM runs WHERE session_id='$PACKED' AND last_seq < first_seq")" \
+    "$(q "SELECT COUNT(*) FROM runs WHERE session_id='$PACKED' AND model_calls = 1 AND last_seq < first_seq")"
+recalled=""
+for attempt in 1 2; do
+    reply=$(athena packed "What code word did I give you in my first message? Reply with just the code word.")
+    if echo "$reply" | grep -qi 'marlin-4417'; then recalled=yes; break; fi
+    echo "      reply on attempt $attempt: $reply"
+done
+[ -n "$recalled" ] || fail "a fact from before the compaction was recalled"
+pass "a fact from before the compaction was recalled"
+unset ATHENA_CONTEXT_TOKENS ATHENA_COMPACT_AT
 
 echo
 echo "All end-to-end checks passed."

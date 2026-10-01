@@ -47,7 +47,16 @@ description: What athena does not do yet. Read this before exposing it.
 
 ## Behaviour
 
-- Context grows forever, and every turn re-sends the whole history.
+- Compaction is a summary, so it is lossy, and it waits until the context is
+  at 80% of the model's window: with the default model that is 840 000 tokens
+  re-sent on every call until it happens. It cuts only between messages, so
+  one prompt or tool result that alone fills the window cannot be helped. A
+  session already over its window when compaction is switched on may not be
+  rescued, and a summary model with a smaller window than the agent's fails
+  on a big session (the turn goes on without compacting). The window is
+  OpenRouter's largest for the model, not the provider's. There is no
+  `/compact` command and no token cap below the percentage yet. See
+  [Compaction](/docs/compaction).
 - Turns on one session are serialized within a process. Across processes the
   second to finish is refused with `Conflict`.
 - Axum answers some malformed requests itself, outside the JSON error

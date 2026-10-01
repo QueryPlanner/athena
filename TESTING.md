@@ -132,6 +132,17 @@ image reaches the mock model. `screenshots_are(None)` turns that off. Agents
 in the sandbox tests wrap the mock model in `media::Vision`, as production
 wraps OpenRouter, so they check what the provider would be sent.
 
+Compaction is tested at two levels. `src/compaction/hook/tests.rs` drives the
+production agent through the service with two scripted models, one for the
+agent and one for the summaries, and a window of 10 000 tokens. What the
+provider "reports" for each call is scripted (`MockTurn::with_usage`), which is
+how a test says how full the context is, and the tests check what each request
+held (`labels`) and that no request has a tool result without its call
+(`assert_well_formed`). `tests/compaction.rs` sends the same turns through
+Rig's real OpenRouter client to a fake chat endpoint, blocking and streamed, to
+check what goes over the wire: the `plugins` parameter, and that the usage a
+real response carries is what compaction acts on.
+
 Concurrency tests must be deterministic. Park a turn inside a wrapping
 `ConversationMemory` (see `Gated` in `src/service.rs`) and wait on a
 condition, never on a sleep. A timeout is acceptable only as a guard that
@@ -272,6 +283,12 @@ assuming the code is wrong. The model may have refused or rephrased.
    retried once), and it never reaches the other user's sessions. The bot
    token never appears in the bot's log. Without a valid key the model-free
    checks still pass and the first turn check fails.
+
+9. Compaction: with `ATHENA_CONTEXT_TOKENS=8000` and `ATHENA_COMPACT_AT=0.5`,
+   five turns of about 1 100 tokens each compact the session. A checkpoint
+   points at a row that exists, no message is removed, each summary call is a
+   run that saved no messages, and a code word given in the first message is
+   still recalled after the compaction (retried once).
 
 ### Extending it
 

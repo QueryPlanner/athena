@@ -11,6 +11,7 @@ mod fake_api;
 mod fake_server;
 
 use athena::agent;
+use athena::compaction::ContextHook;
 use athena::media;
 use athena::runner::{Request, Run};
 use athena::sandbox::Sandboxes;
@@ -231,10 +232,11 @@ impl Run for Parked {
         &self,
         prompt: &Request,
         conversation: &str,
+        context: Option<ContextHook>,
     ) -> Result<PromptResponse, PromptError> {
         self.started.send(prompt.text.clone()).unwrap();
         self.gate.acquire().await.unwrap().forget();
-        self.inner.run(prompt, conversation).await
+        self.inner.run(prompt, conversation, context).await
     }
 }
 

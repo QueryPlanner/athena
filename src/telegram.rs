@@ -1226,7 +1226,9 @@ pub async fn main(model: &str) -> Result<()> {
     let config = Config::from_env()?;
     let client = agent::client()?;
     let store = Store::open(&store::path())?;
-    let service = Arc::new(Service::new(store.clone(), model, log_warning));
+    let compactor = crate::compaction::from_env(model)?;
+    let service =
+        Arc::new(Service::new(store.clone(), model, log_warning).with_compactor(compactor));
     let sandboxes = agent::sandboxes_from_env(&store)?;
     let mcp = agent::connect_mcp(&log_warning).await;
     let agent = agent::build_with(&client, model, service.memory(), sandboxes.clone(), &mcp);
@@ -1247,6 +1249,7 @@ pub async fn main(model: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compaction::ContextHook;
     use rig_agent::agent::{Agent, AgentBuilder};
     use rig_core::test_utils::{MockCompletionModel, MockTurn};
     use tokio::sync::{Semaphore, mpsc};
@@ -1964,10 +1967,11 @@ mod tests {
             &self,
             prompt: &Request,
             conversation: &str,
+            context: Option<ContextHook>,
         ) -> Result<rig_agent::agent::PromptResponse, rig_agent::completion::PromptError> {
             self.started.send(()).unwrap();
             self.gate.acquire().await.unwrap().forget();
-            self.inner.run(prompt, conversation).await
+            self.inner.run(prompt, conversation, context).await
         }
     }
 
@@ -2053,6 +2057,7 @@ mod tests {
             &self,
             _: &Request,
             _: &str,
+            _: Option<ContextHook>,
         ) -> Result<rig_agent::agent::PromptResponse, rig_agent::completion::PromptError> {
             panic!("the agent blew up")
         }
@@ -2244,12 +2249,13 @@ mod tests {
             &self,
             request: &Request,
             conversation: &str,
+            context: Option<ContextHook>,
         ) -> Result<rig_agent::agent::PromptResponse, rig_agent::completion::PromptError> {
             let outbox = request.outbox.as_ref().unwrap();
             for attachment in &self.attachments {
                 outbox.push(attachment.clone()).unwrap();
             }
-            self.inner.run(request, conversation).await
+            self.inner.run(request, conversation, context).await
         }
     }
 
