@@ -157,6 +157,8 @@ Unknown or expired tokens are `404`.
 | Sign-in page screenshot | `/tmp/athena-viewer.png` (`sandbox::login::SCREEN_PATH`) | `Sandboxes::screen` |
 | Sign-in tables | `browser_links(token, session_id, url, expires_at)`, links valid 1 h; `browser_states(user_id, state, saved_at)`, one per user | `store.rs` migration 6 |
 | Bot API methods | `getFile`, file download `GET /file/bot<token>/<file_path>`, `sendPhoto`, `sendDocument` (multipart) | `telegram.rs` |
+| Reply format | `sendMessage` with plain `text` and `entities` (UTF-16 offsets), no `parse_mode`; model Markdown rendered by `telegram::render::render`; a chunk answered "Bad Request" is resent as plain text without entities | `telegram/render.rs`, `telegram.rs` |
+| Message limit | 4096 UTF-16 units after parsing (`telegram::MESSAGE_LIMIT`), at most 8 messages (`telegram::MAX_CHUNKS`) | Bot API |
 | Download limit | 20 MB (`telegram::DOWNLOAD_LIMIT`) | Bot API |
 | Albums | collected by `(user, media_group_id)` until 2 s pass with no new item (`telegram::ALBUM_WAIT`), at most 10 items, one turn | `telegram.rs` |
 | Upload limits | photo 10 MB, document 50 MB, caption 1024 chars, 10 files a turn | `sandbox::tools`, `media::MAX_ATTACHMENTS` |

@@ -885,3 +885,198 @@ async fn an_albums_photos_reach_the_model_in_one_turn() {
         logged.lock().unwrap()
     );
 }
+
+/// The entities of a recorded `sendMessage`, as `(type, offset, length)`.
+fn entities(call: &fake_api::Call) -> Vec<(String, u64, u64)> {
+    call.body["entities"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .map(|e| {
+                    (
+                        e["type"].as_str().unwrap().to_string(),
+                        e["offset"].as_u64().unwrap(),
+                        e["length"].as_u64().unwrap(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn entity(kind: &str, offset: u64, length: u64) -> (String, u64, u64) {
+    (kind.to_string(), offset, length)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_markdown_reply_reaches_the_bot_api_as_text_with_entities() {
+    let tmp = TempDb::new();
+    let api = FakeApi::start().await;
+    let reply = "# Plan\n\n**Bold** \u{1F600} and `code`, see [docs](https://example.com/a).\n\n\
+                 ```rust\nfn main() {}\n```\n\n2 * 3 and snake_case stay as written.";
+    let (app, logged) = app(&tmp, |s| mock_agent(s, [MockTurn::text(reply)]).0);
+    let running = run(&api, app).await;
+
+    api.push(text_from(21, "plan it"));
+    let replies = api.messages_to(21, 1).await;
+    running.stop().await.unwrap();
+
+    assert_eq!(
+        replies,
+        [
+            "Plan\n\nBold \u{1F600} and code, see docs.\n\nfn main() {}\n\n\
+             2 * 3 and snake_case stay as written."
+        ]
+    );
+    let sent = &api.calls_to("sendMessage")[0];
+    // The text goes as it is, with no parse mode: Telegram parses nothing.
+    assert!(sent.body.get("parse_mode").is_none());
+    // Offsets count UTF-16 units: the emoji is two of them.
+    assert_eq!(
+        entities(sent),
+        [
+            entity("bold", 0, 4),
+            entity("bold", 6, 4),
+            entity("code", 18, 4),
+            entity("text_link", 28, 4),
+            entity("pre", 35, 12),
+        ]
+    );
+    assert_eq!(sent.body["entities"][3]["url"], "https://example.com/a");
+    assert_eq!(sent.body["entities"][4]["language"], "rust");
+    assert!(logged.lock().unwrap().is_empty(), "{logged:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_telegram_refuses_to_format_is_sent_again_as_plain_text() {
+    let tmp = TempDb::new();
+    let api = FakeApi::start().await;
+    api.fail_next(
+        "sendMessage",
+        json!({"ok": false, "error_code": 400,
+               "description": "Bad Request: can't parse entities: Can't find end of Bold entity"}),
+    );
+    let (app, logged) = app(&tmp, |s| {
+        mock_agent(s, [MockTurn::text("**Hello** there")]).0
+    });
+    let running = run(&api, app).await;
+
+    api.push(text_from(22, "hi"));
+    api.messages_to(22, 2).await;
+    running.stop().await.unwrap();
+
+    let sends = api.calls_to("sendMessage");
+    assert_eq!(sends.len(), 2);
+    assert_eq!(entities(&sends[0]), [entity("bold", 0, 5)]);
+    // The same words, markup already gone, and no entities this time.
+    assert_eq!(sends[1].text(), "Hello there");
+    assert!(sends[1].body.get("entities").is_none());
+    let logged = logged.lock().unwrap().clone();
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert!(
+        logged[0].starts_with("sending formatted text failed, sending it as plain text: "),
+        "{logged:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blocked_bot_does_not_resend_formatted_text() {
+    let tmp = TempDb::new();
+    let api = FakeApi::start().await;
+    api.fail_next(
+        "sendMessage",
+        json!({"ok": false, "error_code": 403,
+               "description": "Forbidden: bot was blocked by the user"}),
+    );
+    let (app, logged) = app(&tmp, |s| mock_agent(s, [MockTurn::text("**Hello**")]).0);
+    let running = run(&api, app).await;
+
+    api.push(text_from(23, "hi"));
+    api.wait_for("the send", |calls| {
+        calls.iter().any(|c| c.method == "sendMessage")
+    })
+    .await;
+    running.stop().await.unwrap();
+
+    assert_eq!(api.calls_to("sendMessage").len(), 1);
+    let logged = logged.lock().unwrap().clone();
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert!(
+        logged[0].starts_with("sending a message failed: "),
+        "{logged:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_reply_with_a_code_block_across_the_cut_is_sent_in_valid_messages() {
+    let tmp = TempDb::new();
+    let api = FakeApi::start().await;
+    let code: Vec<String> = (0..260)
+        .map(|i| format!("let value_{i} = compute({i}, \"item\");"))
+        .collect();
+    let code = code.join("\n");
+    let reply = format!(
+        "Here is the code.\n\n```rust\n{code}\n```\n\n**That** is all, {}.",
+        "and then some words ".repeat(40)
+    );
+    assert!(reply.len() > 10_000);
+    let (app, logged) = app(&tmp, |s| mock_agent(s, [MockTurn::text(reply)]).0);
+    let running = run(&api, app).await;
+
+    api.push(text_from(24, "long please"));
+    api.wait_for("the whole reply", |calls| {
+        let sends = calls.iter().filter(|c| c.method == "sendMessage");
+        sends.filter(|c| c.text().ends_with("some words .")).count() == 1
+    })
+    .await;
+    running.stop().await.unwrap();
+
+    // The fake refuses messages that break Telegram's entity rules or
+    // exceed 4096 units. None was refused, so none was sent again.
+    let sends = api.calls_to("sendMessage");
+    assert!(sends.len() >= 3, "{}", sends.len());
+    assert!(logged.lock().unwrap().is_empty(), "{logged:?}");
+    let pre: Vec<String> = sends
+        .iter()
+        .flat_map(|call| {
+            let text: Vec<u16> = call.text().encode_utf16().collect();
+            entities(call)
+                .into_iter()
+                .filter(|e| e.0 == "pre")
+                .map(move |(_, at, len)| {
+                    String::from_utf16(&text[at as usize..(at + len) as usize]).unwrap()
+                })
+        })
+        .collect();
+    assert!(pre.len() >= 2, "the block continues in the next message");
+    assert_eq!(pre.join("\n"), code);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bad_request_teloxide_has_no_name_for_also_resends_the_text_plain() {
+    let tmp = TempDb::new();
+    let api = FakeApi::start().await;
+    api.fail_next(
+        "sendMessage",
+        json!({"ok": false, "error_code": 400,
+               "description": "Bad Request: entity beginning at 3 is not allowed"}),
+    );
+    let (app, logged) = app(&tmp, |s| mock_agent(s, [MockTurn::text("*Hello* there")]).0);
+    let running = run(&api, app).await;
+
+    api.push(text_from(25, "hi"));
+    api.messages_to(25, 2).await;
+    running.stop().await.unwrap();
+
+    let sends = api.calls_to("sendMessage");
+    assert_eq!(sends.len(), 2);
+    assert_eq!(entities(&sends[0]), [entity("italic", 0, 5)]);
+    assert_eq!(sends[1].text(), "Hello there");
+    assert!(sends[1].body.get("entities").is_none());
+    let logged = logged.lock().unwrap().clone();
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert!(
+        logged[0].starts_with("sending formatted text failed, sending it as plain text: "),
+        "{logged:?}"
+    );
+}

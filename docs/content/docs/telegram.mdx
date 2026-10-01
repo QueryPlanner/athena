@@ -43,9 +43,18 @@ other text is a prompt for the current session.
 ## Behaviour
 
 - While the model works the bot shows "typing...".
-- A reply over Telegram's 4096-character limit is split at a line break near
-  the limit if there is one, else at a space, never inside a character. At
-  most 8 messages, then a note that the rest is in the transcript.
+- The model's Markdown is rendered for Telegram: bold, italic,
+  strikethrough, `code`, fenced code with its language, links, blockquotes,
+  headings (bold), bullet and numbered lists, and tables (an aligned grid in
+  a code block). The bot sends plain text plus formatting entities, never a
+  parse mode, so a stray `*` or `_` stays as written and cannot make Telegram
+  refuse a message. If Telegram answers "Bad Request" to a formatted
+  message, that message is sent again as plain text.
+- A reply over Telegram's 4096-character limit is split at a blank line near
+  the limit if there is one, else a line break, else a space, never inside a
+  character. A code block or style that crosses the cut is closed and
+  reopened in the next message. At most 8 messages, then a note that the
+  rest is in the transcript.
 - A 429 from Telegram is retried after the delay it asks for.
 - Each turn runs in its own task, so a slow model never holds up another
   user. One user gets one turn at a time: a message that arrives while their
