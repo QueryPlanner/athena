@@ -99,6 +99,8 @@ async fn in_process(
 ) -> Result<Observation> {
     let service = Service::new(Store::open_in_memory()?, model_name, crate::cli::warn);
     let builder = AgentBuilder::new(model).memory(service.memory());
+    // No sandbox and no MCP servers, on purpose: an eval is hermetic, so it
+    // starts no process and reaches no host. Tests here fake their tools.
     let agent = agent::configure_custom(builder, None, custom);
     let user = service.user("eval", user).await?;
     let session = service.create_session(&user, &case.eval_case_id).await?;

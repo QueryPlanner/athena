@@ -18,7 +18,8 @@ pub fn configure(builder: AgentBuilder) -> Agent {
 ```
 
 The template ships one host tool, `add`, plus sandbox and browser tools when
-`OPEN_SANDBOX_URL` is set (see the README), and the default model
+`OPEN_SANDBOX_URL` is set (see the README), the tools of any [MCP servers](/docs/mcp)
+you list, and the default model
 `openai/gpt-6-luna`. `AGENT_MODEL` overrides the model at runtime.
 
 To change the prompt or add know-how without editing Rust, use an

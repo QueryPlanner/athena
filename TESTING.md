@@ -79,6 +79,18 @@ a "no API key" test would find one and call the provider.
   `MockStreamEvent::final_response`: without it Rig treats the turn as
   truncated and fails it.
 
+`tests/mcp.rs` runs real MCP servers. The stdio one is
+`tests/mcp/fixture.rs`, a small program declared as the `athena-mcp-fixture`
+bin in `Cargo.toml` (the way Cargo gives an integration test the path of a
+built program: `env!("CARGO_BIN_EXE_athena-mcp-fixture")`). Its flags make it
+crash, hang or refuse the handshake; its tools echo, sleep, die, return a big
+result, an image or its own environment. The HTTP one is a few lines of axum
+in the test. Tests start the servers through `Mcp::start` with an explicit
+environment lookup, so they never touch the process environment, and check
+that a process is gone (and not a zombie) with `kill(pid, 0)`. The fixture
+leaves with `_exit` so that, under coverage, it drops no profile file into
+the directory the tests ran from.
+
 `tests/telemetry.rs` installs the tracing layers for one thread with
 exporters that keep what they are sent, runs real turns through the router
 and the service, and checks the spans, their nesting and the log records.

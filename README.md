@@ -190,7 +190,8 @@ and waits for turns in flight to reply.
 
 Tools that touch a computer run in a sandbox on an
 [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) server, never
-on the machine running athena. The template ships no host tool except `add`.
+on the machine running athena. The template ships no host tool except `add`
+and the tools of the MCP servers you list (see "Tools from MCP servers").
 
 | Tool | What it does |
 |---|---|
@@ -324,6 +325,97 @@ machines can reach. The only guard is the prompt's rule to ask before
 signing in. Sandboxes are not deleted
 when a session is (there is no session delete yet); they expire after the
 timeout.
+
+## Tools from MCP servers
+
+`ATHENA_MCP_CONFIG` names a JSON file listing [MCP](https://modelcontextprotocol.io)
+servers, in the `mcpServers` shape Claude Code and Claude Desktop use. Their
+tools join the agent's own, in any language, without rebuilding athena. Unset
+means no MCP tools; athena looks in no default place, so a file in the working
+directory cannot add tools to an agent that did not ask.
+
+```json
+{
+  "mcpServers": {
+    "files": {
+      "command": "mcp-server-files",
+      "args": ["--root", "/srv/notes"],
+      "env": {"API_TOKEN": "${FILES_TOKEN}"}
+    },
+    "wiki": {
+      "url": "https://wiki.example/mcp",
+      "headers": {"Authorization": "Bearer ${WIKI_TOKEN}"},
+      "timeoutSecs": 30
+    }
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `command`, `args`, `env` | a stdio server: a child process of athena |
+| `url`, `headers` | a streamable-HTTP server (an http or https address). The legacy SSE transport is refused |
+| `timeoutSecs` | how long one tool call may take; default 120. A call that runs over returns an error the model sees |
+| `startupTimeoutSecs` | how long the server may take to start, handshake and list its tools; default 60 (`npx` and `uvx` fetch on first use) |
+| `disabled` | `true` leaves the server out, as in Claude Desktop |
+| `type` | optional: `stdio`, `http` or `streamable-http`, which must match the entry |
+
+Other fields are ignored.
+
+**Secrets stay out of the file.** `${VAR}` and `${VAR:-default}` in `args`,
+`env` values and `headers` values are read from athena's environment, which
+`.env` or the VM's env file fills; `$${` is a literal `${`, and a default
+ends at the first `}`. A variable that is unset and has no default skips that
+server, with a warning that names the variable. Values are never logged. `url`
+is not expanded: put keys in `headers`, and use https, since headers go out as
+written. Messages that name a URL show only its scheme, host and port. Prefer
+`env` to `args`: arguments show in `ps`.
+
+**A stdio server runs on the host, for every user.** It has athena's user's
+permissions and does not run in the sandbox, so the rule "everything runs in a
+sandbox" holds only while `mcp.json` lists none. One connection, with the
+credentials in its `env` and `headers`, serves every user and session of the
+process: anyone who may talk to athena may use these tools. List only servers
+you trust. A stdio server gets its declared `env` plus `PATH` and `HOME` from
+athena, not the rest of the environment (athena's own keys among it), so
+`TMPDIR`, `LANG`, proxy and certificate settings must be declared too if it
+needs them. Its stderr goes to athena's. When athena stops it closes each
+server's stdin, waits a few seconds, then kills and reaps the process it
+started; a turn still running that needs a server gets an error, because
+servers stop with athena. A program that process starts itself (the one behind
+an `npx` wrapper) is not tracked, and if athena is killed outright a server is
+expected to exit when its stdin closes.
+
+**Startup.** `athena eval` connects no server, as it uses no sandbox: evals
+start no process. Servers connect at startup, together, and `serve` listens only
+after they have. One that cannot start, handshake or list its tools is a
+warning (`warning: mcp server ...` on the CLI, a `warn` log line for `serve`
+and `telegram`) and its tools are missing; athena runs without them. The CLI
+connects only when a command runs a turn. A server that dies later fails its
+tool calls until athena restarts: there is no reconnect.
+
+**Names and shapes.** A tool keeps the name its server gave it: Rig cannot
+rename an MCP tool. A tool whose name an athena tool has (`add`, `read_skill` and the
+sandbox tools, whether or not they are set up) or a server earlier in name
+order has is skipped with a warning; the official filesystem server's
+`read_file` and `write_file` are lost this way. So is a tool a model provider
+would refuse, which fails every request: a name of more than 64 characters or
+with characters other than letters, digits, `_` and `-`, or an input schema
+that is not of type object. A server's tools past the first 100 are skipped,
+and a description is cut to 4 KiB.
+
+**Limits.** What a server sends is untrusted data, like a web page: its
+descriptions as much as its results. `ToolPolicy` (`src/policy.rs`) applies as
+to every tool: arguments over 128 KiB are not sent, an MCP tool's text results
+are cut to 64 KiB in all: blocks are kept in order until the budget is spent
+(an image or an empty block counts as one byte), the rest are left out, and
+one note says so. At most 4 images are kept, none over 3.75 MB. Other images
+reach the model as images, as screenshots do. A reply is read whole into
+memory before the cut.
+
+The code is `src/mcp.rs`; `tests/mcp.rs` runs a tiny stdio server built in
+`tests/mcp/fixture.rs`, so the tests start real child processes and need no
+other runtime.
 
 ## Users and sessions
 
@@ -890,5 +982,11 @@ log events never include prompt or reply text.
 - Headless Chromium on a server is refused by some sign-ins (Google's among
   them) and challenged by others; the page cannot get past a CAPTCHA the
   site shows.
+- A stdio MCP server listed in `ATHENA_MCP_CONFIG` runs on the host with
+  athena's permissions, outside the sandbox, and one connection serves every
+  user. Anything that can write that file or its environment variables
+  chooses what runs. Tokens passed as `args` show in `ps`; put them in `env`.
+  A server that dies after startup stays dead until athena restarts, and a
+  name clash costs the later tool (see "Tools from MCP servers").
 - `runs` rows are ordered by `(started_at, rowid)`. `VACUUM` may renumber
   rowids, so two runs started in the same millisecond can swap after one.

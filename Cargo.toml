@@ -5,6 +5,14 @@ edition = "2024"
 # `cargo run` means the agent; deploy-gate runs only on the VM.
 default-run = "athena"
 
+# A tiny stdio MCP server for tests/mcp.rs. It is a bin because that is how
+# Cargo hands an integration test the path of a built program.
+[[bin]]
+name = "athena-mcp-fixture"
+path = "tests/mcp/fixture.rs"
+test = false
+doc = false
+
 [dependencies]
 anyhow = "1.0.104"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "matched-path", "tokio"] }
@@ -20,8 +28,12 @@ regex = "1.13.1"
 # The same version and features teloxide already builds, so no new code is compiled.
 # Used by the sandbox client, evals and bench.
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
-rig-agent = { version = "0.42.0", features = ["derive"] }
+rig-agent = { version = "0.42.0", features = ["derive", "rmcp"] }
 rig-core = "0.42.0"
+# MCP client for mcp.json servers. Rig needs major 2. Two transports: stdio
+# (child process) and streamable HTTP, whose reqwest 0.13 is already built for
+# OpenTelemetry and Rig, so it adds one small crate (sse-stream).
+rmcp = { version = "2", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 rusqlite = { version = "0.40.2", features = ["backup", "bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
