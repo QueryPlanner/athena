@@ -16,7 +16,7 @@ fn args(list: &[&str]) -> Vec<String> {
 }
 
 /// An agent factory that fails the test if the CLI ever calls it.
-fn no_agent() -> anyhow::Result<Agent> {
+async fn no_agent() -> anyhow::Result<Agent> {
     anyhow::bail!("this command must not build an agent")
 }
 
@@ -30,7 +30,7 @@ async fn try_cli(
     cli::run(
         &args(list),
         service,
-        || Ok(agent),
+        async || Ok(agent),
         input.as_bytes(),
         &mut out,
     )
@@ -266,7 +266,7 @@ async fn a_closed_output_is_an_error_not_silently_dropped() {
         let result = cli::run(
             &args(list),
             &service,
-            || Ok(agent),
+            async || Ok(agent),
             input.as_bytes(),
             &mut out,
         )

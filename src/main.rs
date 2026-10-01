@@ -52,18 +52,29 @@ async fn run(args: Vec<String>) -> Result<()> {
     if serving {
         // Up front: a server without a key would fail every turn. One set
         // of sandboxes serves the agent and the sign-in pages.
-        let (agent, sandboxes) = agent::build(&agent::client()?, &model, service.memory())?;
+        let client = agent::client()?;
+        // Before the MCP servers connect, which can take a while: a signal
+        // then waits for the server to be up instead of killing it half-way.
         let stop = shutdown::listen()?;
+        let mcp = agent::connect_mcp(&cli::warn).await;
+        let (agent, sandboxes) = agent::build(&client, &model, service.memory(), &mcp)?;
         let (service, agent) = (Arc::new(service), Arc::new(agent));
-        return http::run(&args[1..], service, agent, sandboxes, stop).await;
+        let result = http::run(&args[1..], service, agent, sandboxes, stop).await;
+        mcp.shutdown().await;
+        return result;
     }
-    let make_agent = || Ok(agent::build(&agent::client()?, &model, service.memory())?.0);
-    cli::run(
+    // Only a command that runs a turn connects the MCP servers.
+    let mcp = tokio::sync::OnceCell::new();
+    let make_agent =
+        || agent::build_on_demand(agent::client, &model, service.memory(), &mcp, &cli::warn);
+    let result = cli::run(
         &args,
         &service,
         make_agent,
         std::io::stdin().lock(),
         &mut std::io::stdout(),
     )
-    .await
+    .await;
+    agent::shutdown_on_demand(mcp).await;
+    result
 }

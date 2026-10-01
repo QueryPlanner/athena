@@ -25,6 +25,11 @@ description: What athena does not do yet. Read this before exposing it.
   browser for an hour. Saved sign-ins are stored unencrypted and loaded into
   every sandbox of their user, where the agent's tools can read them.
 
+- A stdio MCP server in `ATHENA_MCP_CONFIG` runs on the host with athena's
+  permissions, outside the sandbox, and one connection serves every user.
+  Whoever can write that file, or the environment it reads, chooses what
+  runs. See [MCP servers](/docs/mcp).
+
 ## Durability
 
 - A crash mid-turn loses that turn, and so does a second Ctrl-C while

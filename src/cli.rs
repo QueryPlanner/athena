@@ -81,7 +81,7 @@ fn parse_user(spec: &str) -> Result<(&str, &str)> {
 pub async fn run<R: Run>(
     args: &[String],
     service: &Service,
-    make_agent: impl FnOnce() -> Result<R>,
+    make_agent: impl AsyncFnOnce() -> Result<R>,
     input: impl BufRead,
     out: &mut impl Write,
 ) -> Result<()> {
@@ -122,7 +122,7 @@ pub async fn run<R: Run>(
     };
 
     // Before any write: a missing API key must leave the database untouched.
-    let agent = make_agent()?;
+    let agent = make_agent().await?;
     let user = service.user(transport, external_id).await?;
     let (name, prompt) = session;
     let session = service.open_session(&user, name).await?;
