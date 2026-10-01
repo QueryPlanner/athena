@@ -1,5 +1,6 @@
 //! The only file you edit when making a new agent.
 
+use crate::custom::Custom;
 use crate::media;
 use crate::policy::ToolPolicy;
 use crate::sandbox::{self, Sandboxes};
@@ -99,9 +100,10 @@ pub fn build_with(
     // Vision: tools return images (screenshots) that OpenRouter's chat API
     // only takes from the user.
     let model = media::Vision(client.completion_model(model));
-    configure_with(
+    configure_custom(
         rig::agent::AgentBuilder::new(model).memory(memory),
         sandboxes,
+        &Custom::from_env(),
     )
 }
 
@@ -128,17 +130,29 @@ pub fn configure_with(
     builder: rig::agent::AgentBuilder,
     sandboxes: Option<Arc<Sandboxes>>,
 ) -> rig::agent::Agent {
+    configure_custom(builder, sandboxes, &Custom::default())
+}
+
+/// [`configure_with`], plus the owner's instructions and skills
+/// (`ATHENA_INSTRUCTIONS`, `ATHENA_SKILLS_DIR`: see [`crate::custom`]).
+/// [`build_with`] passes what the environment holds; tests pass their own.
+pub fn configure_custom(
+    builder: rig::agent::AgentBuilder,
+    sandboxes: Option<Arc<Sandboxes>>,
+    custom: &Custom,
+) -> rig::agent::Agent {
     let builder = builder
         .name(NAME)
         // Always: every prompt, system prompt, reply and tool call goes on
         // spans, so the telemetry sinks export all of it.
         .record_content_telemetry(true)
-        .preamble(PREAMBLE)
+        .preamble(&custom.preamble(PREAMBLE))
         .tool(Add)
         .add_hook(ToolPolicy::default())
         // No limit on model calls per reply, nor on tool calls (`policy.rs`):
         // a task takes as many steps as it needs.
         .default_max_turns(usize::MAX);
+    let builder = custom.register(builder);
     match sandboxes {
         Some(sandboxes) => sandbox::tools::register(builder, sandboxes).build(),
         None => builder.build(),

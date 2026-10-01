@@ -7,6 +7,7 @@
 use super::case::EvalCase;
 use super::cassette::{Cassette, RecordingModel, ReplayModel};
 use crate::agent;
+use crate::custom::Custom;
 use crate::service::Service;
 use crate::store::Store;
 use anyhow::{Context, Result};
@@ -85,15 +86,20 @@ fn finish_reasons(calls_json: &str) -> Vec<String> {
 }
 
 /// Run `case` through the production agent in front of `model`, with a fresh
-/// in-memory database, as the user `eval:<user>`.
+/// in-memory database, as the user `eval:<user>`. `custom` is the owner's
+/// instructions and skills, the same ones the CLI, HTTP and Telegram agents
+/// get (`agent::build_with`): without them an eval would grade a different
+/// agent from the one that runs.
 async fn in_process(
     case: &EvalCase,
     model: impl CompletionModel + 'static,
     model_name: &str,
     user: &str,
+    custom: &Custom,
 ) -> Result<Observation> {
     let service = Service::new(Store::open_in_memory()?, model_name, crate::cli::warn);
-    let agent = agent::configure(AgentBuilder::new(model).memory(service.memory()));
+    let builder = AgentBuilder::new(model).memory(service.memory());
+    let agent = agent::configure_custom(builder, None, custom);
     let user = service.user("eval", user).await?;
     let session = service.create_session(&user, &case.eval_case_id).await?;
     let mut obs = Observation {
@@ -127,7 +133,16 @@ async fn in_process(
 
 /// Replay `case` from its cassette. A missing or foreign cassette fails the
 /// sample, not the run.
-pub async fn replay(case: &EvalCase, user: &str) -> Result<Observation> {
+///
+/// With `custom` set, the requests the agent sends differ from the ones that
+/// were recorded (a longer system prompt, an extra `read_skill` tool), but
+/// the replayed replies are the recorded ones: the model is not asked again.
+/// Replay compares only the last message and that every tool a recorded
+/// reply calls is still offered (`cassette`), so instructions never cause
+/// drift. A cassette recorded with skills calls `read_skill`, so replaying it
+/// needs the same skills configured, or it reports drift. Re-record a case
+/// after changing instructions or skills to see what the model does with them.
+pub async fn replay(case: &EvalCase, user: &str, custom: &Custom) -> Result<Observation> {
     let cassette = match Cassette::read(&case.cassette_path()) {
         Ok(c) if c.eval_case_id == case.eval_case_id => c,
         Ok(c) => {
@@ -140,20 +155,22 @@ pub async fn replay(case: &EvalCase, user: &str) -> Result<Observation> {
         Err(e) => return Ok(Observation::failed(format!("{e:#}"))),
     };
     let model = ReplayModel::new(&cassette);
-    let mut obs = in_process(case, model.clone(), &cassette.model, user).await?;
+    let mut obs = in_process(case, model.clone(), &cassette.model, user, custom).await?;
     obs.drift = model.drift();
     Ok(obs)
 }
 
-/// Run `case` against a real model, recording what it said.
+/// Run `case` against a real model, recording what it said, with the agent
+/// `custom` configures.
 pub async fn record<M: CompletionModel + Clone + 'static>(
     case: &EvalCase,
     model: M,
     model_name: &str,
     user: &str,
+    custom: &Custom,
 ) -> Result<(Cassette, Observation)> {
     let recorder = RecordingModel::new(model);
-    let obs = in_process(case, recorder.clone(), model_name, user).await?;
+    let obs = in_process(case, recorder.clone(), model_name, user, custom).await?;
     let cassette = Cassette {
         eval_case_id: case.eval_case_id.clone(),
         model: model_name.to_string(),
@@ -346,9 +363,15 @@ mod tests {
     async fn recording_then_replaying_reproduces_the_trajectory_without_drift() {
         let dir = temp_dir();
         let case = case(&dir, "add", &["add 21 and 21"]);
-        let (cassette, live) = record(&case, MockCompletionModel::new(add_turns()), "m", "u")
-            .await
-            .unwrap();
+        let (cassette, live) = record(
+            &case,
+            MockCompletionModel::new(add_turns()),
+            "m",
+            "u",
+            &Custom::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(live.error, None);
         assert_eq!(live.replies, ["42"]);
         assert_eq!(cassette.interactions.len(), 2);
@@ -356,7 +379,7 @@ mod tests {
         assert_eq!(cassette.interactions[1].input, ["tool add: 42.0"]);
         cassette.write(&case.cassette_path()).unwrap();
 
-        let replayed = replay(&case, "u").await.unwrap();
+        let replayed = replay(&case, "u", &Custom::default()).await.unwrap();
         assert_eq!((replayed.error, replayed.drift), (None, None));
         assert_eq!(replayed.replies, ["42"]);
         assert_eq!(
@@ -374,10 +397,94 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Instructions and one skill, loaded as the CLI edge would load them.
+    fn custom_in(dir: &crate::custom::testing::TempDir) -> Custom {
+        let instructions = dir.write("instructions.md", "Call the user Boss.");
+        dir.skill("house-style", "How we write.", "Be terse.");
+        let config = crate::custom::Config {
+            instructions: Some(instructions),
+            skills_dir: Some(dir.join("skills")),
+        };
+        let (custom, warnings) = Custom::load(&config);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        custom
+    }
+
+    /// The system message (as text) and tool names of the first request `model` saw.
+    fn first_request(model: &MockCompletionModel) -> (String, Vec<String>) {
+        let request = model.requests().remove(0);
+        // The system prompt is the first message; Debug escapes its newlines.
+        let prompt = format!("{:?}", request.chat_history[0]);
+        let tools = request.tools.iter().map(|t| t.name.clone()).collect();
+        (prompt, tools)
+    }
+
+    #[tokio::test]
+    async fn recording_and_replaying_run_the_agent_the_owner_configured() {
+        let files = crate::custom::testing::TempDir::new();
+        let custom = custom_in(&files);
+        let dir = temp_dir();
+        let case = case(&dir, "add", &["add 21 and 21"]);
+
+        let model = MockCompletionModel::new(add_turns());
+        let (cassette, live) = record(&case, model.clone(), "m", "u", &custom)
+            .await
+            .unwrap();
+        assert_eq!(live.error, None);
+        let (prompt, tools) = first_request(&model);
+        assert!(prompt.starts_with("System"), "{prompt}");
+        assert!(prompt.contains("## Custom instructions"), "{prompt}");
+        assert!(prompt.contains("Call the user Boss."), "{prompt}");
+        assert!(prompt.contains("- house-style: How we write."), "{prompt}");
+        assert!(tools.contains(&"read_skill".into()) && tools.contains(&"add".into()));
+        cassette.write(&case.cassette_path()).unwrap();
+
+        // Replay builds the same customised agent, and the recorded replies
+        // match it without drift.
+        let replayed = replay(&case, "u", &custom).await.unwrap();
+        assert_eq!((replayed.error, replayed.drift), (None, None));
+
+        // Without customization the same cassette still replays.
+        let plain = replay(&case, "u", &Custom::default()).await.unwrap();
+        assert_eq!((plain.error, plain.drift), (None, None));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cassette_that_calls_read_skill_drifts_without_the_skill() {
+        let files = crate::custom::testing::TempDir::new();
+        let custom = custom_in(&files);
+        let dir = temp_dir();
+        let case = case(&dir, "skilled", &["write a note"]);
+        let turns = vec![
+            MockTurn::tool_call("call_1", "read_skill", json!({"name": "house-style"})),
+            MockTurn::text("Shipped: a note"),
+        ];
+        let (cassette, live) = record(&case, MockCompletionModel::new(turns), "m", "u", &custom)
+            .await
+            .unwrap();
+        assert_eq!(live.error, None);
+        assert_eq!(
+            cassette.interactions[1].input,
+            ["tool read_skill: Be terse."]
+        );
+        cassette.write(&case.cassette_path()).unwrap();
+
+        let with = replay(&case, "u", &custom).await.unwrap();
+        assert_eq!((with.error, with.drift), (None, None));
+        assert_eq!(with.replies, ["Shipped: a note"]);
+        let without = replay(&case, "u", &Custom::default()).await.unwrap();
+        assert!(without.error.unwrap().contains("trajectory drift"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn a_changed_case_drifts_and_a_missing_or_foreign_cassette_fails() {
         let dir = temp_dir();
-        let missing = replay(&case(&dir, "none", &["hi"]), "u").await.unwrap();
+        let none = Custom::default();
+        let missing = replay(&case(&dir, "none", &["hi"]), "u", &none)
+            .await
+            .unwrap();
         assert!(missing.error.unwrap().contains("athena eval record"));
 
         let text =
@@ -393,14 +500,14 @@ mod tests {
         // The case gained a second turn since it was recorded.
         let two = case(&dir, "two", &["first", "second"]);
         recorded.write(&two.cassette_path()).unwrap();
-        let drifted = replay(&two, "u").await.unwrap();
+        let drifted = replay(&two, "u", &none).await.unwrap();
         assert_eq!(drifted.replies, ["ok"]);
         assert!(drifted.error.unwrap().contains("trajectory drift"));
         assert!(drifted.drift.unwrap().contains("was not recorded"));
 
         let foreign = case(&dir, "foreign", &["first"]);
         recorded.write(&foreign.cassette_path()).unwrap();
-        let err = replay(&foreign, "u").await.unwrap().error.unwrap();
+        let err = replay(&foreign, "u", &none).await.unwrap().error.unwrap();
         assert!(err.contains("is the cassette of `two`"), "{err}");
         std::fs::remove_dir_all(dir).unwrap();
     }

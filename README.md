@@ -30,6 +30,38 @@ to know where conversations are stored.
 Everything else — users, sessions, storage, the turn loop, the CLI — stays
 as is.
 
+## Instructions and skills
+
+To change how the agent behaves without editing Rust, point two optional
+settings at files:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ATHENA_INSTRUCTIONS` | unset | Path of a text file (at most 16 KiB). Its text is added to the system prompt after the built-in preamble. |
+| `ATHENA_SKILLS_DIR` | unset | Path of a directory of [Agent Skills](https://agentskills.io/specification): `<name>/SKILL.md`, each with `name` and `description` front matter. |
+
+Skills are listed in the system prompt by name and description, and the
+model calls the `read_skill` tool to load one when a task matches. A skill
+you write for Claude Code or Codex works here, as far as `SKILL.md` goes:
+only that file is read, never a skill's `scripts/`, `references/` or
+`assets/`.
+
+Both are read once, when the agent starts; restart to pick up edits. Nothing
+here stops the agent from starting. A missing path, an unreadable file or an
+invalid skill is a warning in the log and is left out. Limits: a skill
+file is at most 64 KiB, the skills listing at most 16 KiB, and at most 64
+skills load (skills past a limit are not loaded). The spec's `name` and
+`description` rules are enforced, and a symlink that leads out of the skills
+directory is refused. See
+[Instructions and skills](docs/content/docs/instructions-and-skills.mdx) for
+the details.
+
+Treat both like code. The model follows them with the authority of its own
+preamble, so a skill from someone else is instructions you have chosen to
+run. They are local files only: Athena has no skill registry and fetches
+nothing. They are part of the system prompt, which telemetry exports with
+every other prompt (see Observability), so put no secrets in them.
+
 ## Run
 
     cp .env.example .env                     # then fill in OPENROUTER_API_KEY
@@ -78,6 +110,8 @@ set it), else the crate version with `-dev`.
 | `RUNS_STORE_RAW` | all | on | `0` drops raw provider responses from `runs.calls_json` |
 | `ATHENA_ADDR` | `serve` | `127.0.0.1:8080` | Listen address; `--addr` wins over it |
 | `ATHENA_ALLOWED_HOSTS` | `serve` | unset | Comma list of `HOST` or `HOST:PORT` the API answers; see HTTP API |
+| `ATHENA_INSTRUCTIONS` | all | unset | File of instructions added to the system prompt; see Instructions and skills |
+| `ATHENA_SKILLS_DIR` | all | unset | Directory of Agent Skills; see Instructions and skills |
 | `TELEGRAM_BOT_TOKEN` | `telegram` | none, required | Bot token from @BotFather |
 | `TELEGRAM_API_URL` | `telegram` | `https://api.telegram.org` | Bot API server; the tests point it at a fake one |
 
@@ -338,6 +372,8 @@ Caddy or Tailscale settings, and never overwrites a file holding secrets.
     src/sandbox.rs     per-session OpenSandbox sandboxes; sandbox/ has the
                        HTTP client, stream parser, quoting and the tools
     src/policy.rs      the tool-call argument-size hook
+    src/custom.rs      the owner's instructions file and skills; custom/ has
+                       the front matter parser and the skills and read_skill
     src/media.rs       images and files: the provider adapter, the outbox,
                        stripping images from transcripts
     src/cli.rs         the CLI transport: arguments, output, REPL
