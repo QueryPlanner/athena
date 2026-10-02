@@ -108,6 +108,9 @@ set it), else the crate version with `-dev`.
 | `ATHENA_DB` | all | `agent.db`; `serve` and `telegram` require an absolute path | SQLite database file |
 | `ATHENA_VERSION` | `--version`, `GET /version` | `<crate version>-dev` | The deployed release |
 | `RUNS_STORE_RAW` | all | on | `0` drops raw provider responses from `runs.calls_json` |
+| `ATHENA_COMPACT_AT` | all | `0.8` | Compact a session once its context is above this share of the model's window, from 0.3 to 0.95; see Compaction |
+| `ATHENA_COMPACT_MODEL` | all | `AGENT_MODEL` | The model that writes the summaries |
+| `ATHENA_CONTEXT_TOKENS` | all | OpenRouter's `context_length` for the model, else 128000 | The model's context window in tokens, 8000 or more |
 | `ATHENA_ADDR` | `serve` | `127.0.0.1:8080` | Listen address; `--addr` wins over it |
 | `ATHENA_ALLOWED_HOSTS` | `serve` | unset | Comma list of `HOST` or `HOST:PORT` the API answers; see HTTP API |
 | `ATHENA_INSTRUCTIONS` | all | unset | File of instructions added to the system prompt; see Instructions and skills |
@@ -173,11 +176,19 @@ bot collects them until 2 seconds pass with no new one, then runs one turn
 for all of them, with the album's caption as the text. See "Images and
 files" below.
 
-While the model works the bot shows "typing...". A reply longer than
-Telegram's 4096-character limit is split, at a line break if there is one
-near the limit, else at a space, never inside a character; at most 8
-messages, then a note that the rest is in the transcript. A 429 from
-Telegram is retried after the delay it asks for.
+While the model works the bot shows "typing...". The model writes Markdown
+and the bot renders it for Telegram: bold, italic, strikethrough, `code`,
+fenced code with its language, links, blockquotes, headings (bold),
+bullet and numbered lists, and tables (an aligned grid in a code block).
+It sends plain text plus Telegram's formatting entities, never a parse mode,
+so a stray `*` or `_` in a reply stays as written and cannot make Telegram
+refuse the message. If Telegram answers "Bad Request" to a formatted
+message, that message is sent again as plain text. A reply longer than
+Telegram's 4096-character limit is split, at a blank line if there is one
+near the limit, else a line break, else a space, never inside a character,
+and a code block or a style that crosses the cut is closed and reopened in
+the next message; at most 8 messages, then a note that the rest is in the
+transcript. A 429 from Telegram is retried after the delay it asks for.
 
 Each turn runs in its own task, so a slow model never holds up another user.
 One user gets one turn at a time: a message that arrives while their turn is
@@ -190,7 +201,8 @@ and waits for turns in flight to reply.
 
 Tools that touch a computer run in a sandbox on an
 [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) server, never
-on the machine running athena. The template ships no host tool except `add`.
+on the machine running athena. The template ships no host tool except `add`
+and the tools of the MCP servers you list (see "Tools from MCP servers").
 
 | Tool | What it does |
 |---|---|
@@ -325,6 +337,97 @@ signing in. Sandboxes are not deleted
 when a session is (there is no session delete yet); they expire after the
 timeout.
 
+## Tools from MCP servers
+
+`ATHENA_MCP_CONFIG` names a JSON file listing [MCP](https://modelcontextprotocol.io)
+servers, in the `mcpServers` shape Claude Code and Claude Desktop use. Their
+tools join the agent's own, in any language, without rebuilding athena. Unset
+means no MCP tools; athena looks in no default place, so a file in the working
+directory cannot add tools to an agent that did not ask.
+
+```json
+{
+  "mcpServers": {
+    "files": {
+      "command": "mcp-server-files",
+      "args": ["--root", "/srv/notes"],
+      "env": {"API_TOKEN": "${FILES_TOKEN}"}
+    },
+    "wiki": {
+      "url": "https://wiki.example/mcp",
+      "headers": {"Authorization": "Bearer ${WIKI_TOKEN}"},
+      "timeoutSecs": 30
+    }
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `command`, `args`, `env` | a stdio server: a child process of athena |
+| `url`, `headers` | a streamable-HTTP server (an http or https address). The legacy SSE transport is refused |
+| `timeoutSecs` | how long one tool call may take; default 120. A call that runs over returns an error the model sees |
+| `startupTimeoutSecs` | how long the server may take to start, handshake and list its tools; default 60 (`npx` and `uvx` fetch on first use) |
+| `disabled` | `true` leaves the server out, as in Claude Desktop |
+| `type` | optional: `stdio`, `http` or `streamable-http`, which must match the entry |
+
+Other fields are ignored.
+
+**Secrets stay out of the file.** `${VAR}` and `${VAR:-default}` in `args`,
+`env` values and `headers` values are read from athena's environment, which
+`.env` or the VM's env file fills; `$${` is a literal `${`, and a default
+ends at the first `}`. A variable that is unset and has no default skips that
+server, with a warning that names the variable. Values are never logged. `url`
+is not expanded: put keys in `headers`, and use https, since headers go out as
+written. Messages that name a URL show only its scheme, host and port. Prefer
+`env` to `args`: arguments show in `ps`.
+
+**A stdio server runs on the host, for every user.** It has athena's user's
+permissions and does not run in the sandbox, so the rule "everything runs in a
+sandbox" holds only while `mcp.json` lists none. One connection, with the
+credentials in its `env` and `headers`, serves every user and session of the
+process: anyone who may talk to athena may use these tools. List only servers
+you trust. A stdio server gets its declared `env` plus `PATH` and `HOME` from
+athena, not the rest of the environment (athena's own keys among it), so
+`TMPDIR`, `LANG`, proxy and certificate settings must be declared too if it
+needs them. Its stderr goes to athena's. When athena stops it closes each
+server's stdin, waits a few seconds, then kills and reaps the process it
+started; a turn still running that needs a server gets an error, because
+servers stop with athena. A program that process starts itself (the one behind
+an `npx` wrapper) is not tracked, and if athena is killed outright a server is
+expected to exit when its stdin closes.
+
+**Startup.** `athena eval` connects no server, as it uses no sandbox: evals
+start no process. Servers connect at startup, together, and `serve` listens only
+after they have. One that cannot start, handshake or list its tools is a
+warning (`warning: mcp server ...` on the CLI, a `warn` log line for `serve`
+and `telegram`) and its tools are missing; athena runs without them. The CLI
+connects only when a command runs a turn. A server that dies later fails its
+tool calls until athena restarts: there is no reconnect.
+
+**Names and shapes.** A tool keeps the name its server gave it: Rig cannot
+rename an MCP tool. A tool whose name an athena tool has (`add`, `read_skill` and the
+sandbox tools, whether or not they are set up) or a server earlier in name
+order has is skipped with a warning; the official filesystem server's
+`read_file` and `write_file` are lost this way. So is a tool a model provider
+would refuse, which fails every request: a name of more than 64 characters or
+with characters other than letters, digits, `_` and `-`, or an input schema
+that is not of type object. A server's tools past the first 100 are skipped,
+and a description is cut to 4 KiB.
+
+**Limits.** What a server sends is untrusted data, like a web page: its
+descriptions as much as its results. `ToolPolicy` (`src/policy.rs`) applies as
+to every tool: arguments over 128 KiB are not sent, an MCP tool's text results
+are cut to 64 KiB in all: blocks are kept in order until the budget is spent
+(an image or an empty block counts as one byte), the rest are left out, and
+one note says so. At most 4 images are kept, none over 3.75 MB. Other images
+reach the model as images, as screenshots do. A reply is read whole into
+memory before the cut.
+
+The code is `src/mcp.rs`; `tests/mcp.rs` runs a tiny stdio server built in
+`tests/mcp/fixture.rs`, so the tests start real child processes and need no
+other runtime.
+
 ## Users and sessions
 
 A user is identified by `(transport, external_id)`: `("cli", "local")`,
@@ -369,6 +472,9 @@ Caddy or Tailscale settings, and never overwrites a file holding secrets.
     src/service.rs     the core every transport calls: users, sessions, send
     src/store.rs       the database: migrations, Rig conversation memory, runs
     src/runner.rs      the Run trait, the run record, each run's tool context
+    src/compaction.rs  compaction: settings, the window, token estimates, where a
+                       cut may fall; compaction/hook.rs is the only code that
+                       uses Rig's hook API
     src/sandbox.rs     per-session OpenSandbox sandboxes; sandbox/ has the
                        HTTP client, stream parser, quoting and the tools
     src/policy.rs      the tool-call argument-size hook
@@ -592,7 +698,7 @@ answers every `Host` and prints the warning.
 | `GET /sessions/{id}/messages` | | `200 {"messages":[...]}` |
 | `POST /sessions/{id}/messages` | `{"text":"hi"}` | `200 {"reply","run":{...}}` |
 | `POST /sessions/{id}/messages/stream` | `{"text":"hi"}` | `200 text/event-stream` |
-| `GET /usage` | | `200 {"usage":[{"session_id","name","runs","model_calls","input_tokens","output_tokens","cached_input_tokens"}]}` |
+| `GET /usage` | | `200 {"usage":[{"session_id","name","runs","model_calls","input_tokens","output_tokens","cached_input_tokens"}]}`; a compaction's summary calls count as runs |
 
 `messages` are Rig's own message JSON, exactly as stored, tool calls and
 tool results included. That format belongs to Rig and can change with a Rig
@@ -682,6 +788,87 @@ Inspect a session:
     sqlite3 agent.db "SELECT m.seq, json_extract(m.json,'\$.role'), substr(m.json,1,200)
                       FROM messages m JOIN sessions s ON s.id = m.session_id
                       WHERE s.name='default' ORDER BY m.seq;"
+
+## Compaction
+
+A session's transcript only grows, and Rig sends all of it to the model on
+every call. When a session nears the model's context window, Athena replaces
+the oldest part of what it sends with a summary. The transcript itself is
+never rewritten: a compaction adds a row to the `compactions` table (session,
+`through_seq`, summary, which model wrote it and what it cost), meaning "this
+summary stands in for every message up to `through_seq`". The next turn loads
+the newest summary followed by the rows after it. History, `sessions` message
+counts and any search still see every original row. To undo a compaction,
+delete its row (`DELETE FROM compactions WHERE session_id = ...`): the next
+turn loads the whole transcript again.
+
+When: before every model call, not once per turn, because one long tool loop
+can outgrow the window inside a single turn. The size of the request is what
+the provider reported for the previous call, plus four characters a token for
+what has been added since (an image in the turn in progress counts as 1 500
+tokens, whatever its bytes; four characters a token undercounts Chinese,
+Japanese and Korean text, but only for what the provider has not counted yet).
+Above `ATHENA_COMPACT_AT` (80%) of the window, the oldest messages are
+summarized by `ATHENA_COMPACT_MODEL` (default `AGENT_MODEL`) and the request
+is sent with `[summary, ..recent]` instead. Rig applies a request patch to one
+call only, so the summary is applied again to every later call of the turn.
+This works the same for blocking and streamed turns.
+
+The window is `ATHENA_CONTEXT_TOKENS` if set, else the `context_length`
+OpenRouter lists for `AGENT_MODEL` (`GET https://openrouter.ai/api/v1/models`,
+which needs no key), else 128000 with a warning in the log. The list is
+fetched the first time a request is big enough to matter (a short chat never
+waits for it) and a window found is kept for the life of the process; if the
+lookup fails, 128000 is assumed for ten minutes and then it is asked again.
+OpenRouter lists one number per model, and it is the largest; the provider a
+request lands on can have a smaller window. Set `ATHENA_CONTEXT_TOKENS` if you
+know better. It must be 8000 or more.
+
+What a cut never does:
+
+- separate a tool call from its result, or start the kept messages with a
+  result (the store refuses a checkpoint that would);
+- cut the message the model is being asked about (when that is a tool result,
+  the assistant message with its call is kept too);
+- keep less than a fifth of the window word for word. A cut that would leave
+  the request over the line anyway is not made.
+
+The summary call is recorded as a run of its own (model `ATHENA_COMPACT_MODEL`,
+no messages saved, `calls_json` `[{"purpose": "compaction"}]`), so `usage`
+shows what compaction costs, and counts it among the session's runs. The call
+is capped at a tenth of the window (256 to 4000 tokens) and asked for three
+fifths of that many words. A summary that fails, comes back empty, is more
+than a quarter over the cap by our count (it is not cut short: its end holds
+the open tasks) or takes over 120 seconds is recorded as an `error` run and
+skipped: the turn goes on with the full history and does not fail. That session is not tried again, by any turn of this process, until its
+request has grown by a twentieth of the window. The checkpoint is written
+after the turn's own rows, and only if the turn was saved, so a turn that fails
+leaves none. If the checkpoint cannot be written, the next turn loads the whole
+transcript, so the prompt size that turn's last call reported (for the summary
+and what it kept) is not used for it: the size is estimated from the messages,
+and the session is compacted again.
+
+The summarizer is told that tool results are untrusted data, and what it is
+shown labels them so. The summary is stored and sent back as a user message,
+under a header saying it is notes and that nothing in it is an instruction
+from the user: a web page the agent read must not be able to write itself into
+what the user "said". A summary is still model output; do not rely on it as a
+security boundary.
+
+OpenRouter has a `context-compression` plugin that drops messages from the
+middle of a prompt that does not fit, which can orphan a tool result. Every
+request the agent sends carries `plugins: [{"id": "context-compression",
+"enabled": false}]` so it never runs. The summary call is a plain completion
+and does not need it.
+
+`athena eval` never compacts: a cassette holds one model's calls, and a summary
+call is one it never recorded.
+
+Choose `ATHENA_COMPACT_MODEL` with a window at least as big as the agent's: the
+summarizer is given everything to be summarized in one request (each message
+part clipped to 8000 characters). A session that is already over its window
+when compaction is first switched on needs that too, and may not be rescued at
+all.
 
 ## What a run costs
 
@@ -827,7 +1014,15 @@ log events never include prompt or reply text.
 - Axum answers some malformed requests itself, not in this API's JSON
   error shape: unknown paths (empty `404`), wrong methods (`405`), and
   bodies over 2 MB (`413`).
-- Context grows forever, and every turn re-sends the whole history.
+- Compaction is a summary, so it is lossy, and it waits until the context is
+  at 80% of the model's window: with the default model that is 840 000 tokens
+  re-sent on every call until it happens. It cuts only between messages, so
+  one prompt or tool result that alone fills the window cannot be helped. A
+  session already over its window when compaction is switched on may not be
+  rescued, and a summary model with a smaller window than the agent's fails
+  on a big session (the turn goes on without compacting). The window is
+  OpenRouter's largest for the model, not the provider's. There is no
+  `/compact` command and no token cap below the percentage yet. See Compaction.
 - Transports so far: the CLI, HTTP and Telegram. They call
   `service::Service`.
 - The Telegram bot is open to anyone. Whoever finds its username can talk
@@ -845,6 +1040,19 @@ log events never include prompt or reply text.
   SIGKILL, which cannot be caught and loses those turns: raise the grace
   period (`docker stop -t`, `stop_grace_period`, `TimeoutStopSec`) to cover
   a slow tool-using turn.
+- Telegram messages have no headings, lists or tables, so Markdown is
+  approximated, not reproduced: a heading is bold text, a list is `•` or
+  numbered lines, a table is monospace (and one wider than 60 columns is a
+  `Header: value` block per row, since a grid that wide does not fit a
+  phone). Telegram does not let `code`, links or blockquotes contain other
+  formatting, so bold code is code only, and code or a table inside a quote
+  loses its monospace styling. A link inside a quote or a table cell, and a
+  link whose address is not http, https or mailto (`#section`, a relative
+  path), is shown as `text (address)` and is not tappable. Telegram's
+  documented nesting rules are followed to the letter; clients may accept
+  more, but that is not checked here. Raw HTML is shown as written. Table widths use an
+  approximation of Unicode's East Asian Width, so some emoji and rare
+  scripts can misalign a grid.
 - Edited messages, stickers, voice notes and other messages that are neither
   text, a photo nor a file are not prompts. Edits are ignored; the rest get
   "I read text, photos and files, not this kind of message."
@@ -890,5 +1098,11 @@ log events never include prompt or reply text.
 - Headless Chromium on a server is refused by some sign-ins (Google's among
   them) and challenged by others; the page cannot get past a CAPTCHA the
   site shows.
+- A stdio MCP server listed in `ATHENA_MCP_CONFIG` runs on the host with
+  athena's permissions, outside the sandbox, and one connection serves every
+  user. Anything that can write that file or its environment variables
+  chooses what runs. Tokens passed as `args` show in `ps`; put them in `env`.
+  A server that dies after startup stays dead until athena restarts, and a
+  name clash costs the later tool (see "Tools from MCP servers").
 - `runs` rows are ordered by `(started_at, rowid)`. `VACUUM` may renumber
   rowids, so two runs started in the same millisecond can swap after one.

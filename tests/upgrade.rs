@@ -25,6 +25,7 @@ const V2_RUN_TELEMETRY: &str = include_str!("fixtures/v2_run_telemetry.sql");
 const V3_USERS_SESSIONS: &str = include_str!("fixtures/v3_users_sessions.sql");
 const V4_SELECTED_SESSIONS: &str = include_str!("fixtures/v4_selected_sessions.sql");
 const V5_SANDBOXES: &str = include_str!("fixtures/v5_sandboxes.sql");
+const V6_BROWSER_SIGNIN: &str = include_str!("fixtures/v6_browser_signin.sql");
 
 /// Every row of a table, every column, in rowid order, as SQLite holds it.
 fn dump(db: &Connection, table: &str) -> Vec<Vec<Value>> {
@@ -315,6 +316,83 @@ async fn a_database_at_schema_5_gains_sign_in_tables_without_changing_a_row() {
         assert_eq!(&new[..old.len()], &old[..], "{table}");
     }
     assert_eq!(runs(&db, &notes.id), [run_row(0, 1, 1, "ok")]);
+}
+
+/// The upgrade this build adds: schema version 6, with a sign-in link and a
+/// saved browser state. Migration 7 only adds `compactions`; every existing
+/// row of every table must survive it, a turn must still work, and a
+/// checkpoint recorded for a migrated session must be what the next turn
+/// loads in place of the rows it covers.
+#[tokio::test]
+async fn a_database_at_schema_6_gains_compactions_without_changing_a_row() {
+    const TABLES: [&str; 8] = [
+        "messages",
+        "runs",
+        "users",
+        "sessions",
+        "selected_sessions",
+        "sandboxes",
+        "browser_links",
+        "browser_states",
+    ];
+    let tmp = from_fixture(V6_BROWSER_SIGNIN);
+    let before: Vec<Vec<Vec<Value>>> = {
+        let db = tmp.raw();
+        assert_eq!(user_version(&db), 6);
+        TABLES.iter().map(|t| dump(&db, t)).collect()
+    };
+    let sizes: Vec<usize> = before.iter().map(Vec::len).collect();
+    assert_eq!(sizes, [14, 3, 3, 6, 1, 1, 1, 1]);
+
+    let (service, _) = tmp.service();
+    let db = tmp.raw();
+
+    assert_eq!(user_version(&db), store::SCHEMA_VERSION as i64);
+    let after: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
+    assert_eq!(after, before);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM compactions"), 0);
+
+    // A turn in an existing session appends, as before.
+    let store = tmp.open();
+    let user = service.user("telegram", "111111").await.unwrap();
+    let notes = store.selected_session(&user).unwrap().unwrap();
+    let (agent, _) = mock_agent(&service, [MockTurn::text("noted")]);
+    service
+        .send(&agent, &user, &notes.id, "hello")
+        .await
+        .unwrap();
+    let now: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
+    for ((table, old), new) in TABLES.iter().zip(&before).zip(&now) {
+        assert_eq!(&new[..old.len()], &old[..], "{table}");
+    }
+    assert_eq!(runs(&db, &notes.id), [run_row(0, 1, 1, "ok")]);
+
+    // A checkpoint over the first eight of the migrated session's twelve rows.
+    db.execute(
+        "INSERT INTO compactions VALUES ('testsess', 7, 'SUMMARY of eight rows', 'm', 0, 0, 0)",
+        [],
+    )
+    .unwrap();
+    let cli = cli_user(&service).await;
+    let (agent, model) = mock_agent(&service, [MockTurn::text("42")]);
+    service
+        .send(&agent, &cli, "testsess", "and the result?")
+        .await
+        .unwrap();
+
+    // The model saw the preamble, the summary, rows 8 to 11 and the prompt.
+    let seen = &model.requests()[0].chat_history;
+    assert_eq!(seen.len(), 1 + 1 + 4 + 1);
+    let summary = seen[1].rag_text().unwrap();
+    assert!(summary.ends_with("SUMMARY of eight rows"), "{summary}");
+    // Every original row is still there and still shown by history; the
+    // turn's rows came after them.
+    assert_eq!(service.history(&cli, "testsess").await.unwrap().len(), 14);
+    assert_eq!(&dump(&db, "messages")[..14], &before[0][..]);
+    assert_eq!(
+        runs(&db, "testsess").last().unwrap(),
+        &run_row(12, 13, 1, "ok")
+    );
 }
 
 #[test]

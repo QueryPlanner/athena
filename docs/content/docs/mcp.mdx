@@ -1,0 +1,122 @@
+---
+title: MCP servers
+description: Add tools from any MCP server, in any language, with a JSON file.
+---
+
+Set `ATHENA_MCP_CONFIG` to the path of a JSON file that lists
+[MCP](https://modelcontextprotocol.io) servers. athena connects to each at
+startup and gives the model their tools next to its own. The file uses the
+`mcpServers` shape of Claude Code and Claude Desktop, so an entry written for
+one of them usually works here.
+
+Unset means no MCP tools. athena looks in no default place: a file in the
+working directory cannot add tools to an agent that did not ask for them.
+
+```json
+{
+  "mcpServers": {
+    "files": {
+      "command": "mcp-server-files",
+      "args": ["--root", "/srv/notes"],
+      "env": { "API_TOKEN": "${FILES_TOKEN}" }
+    },
+    "wiki": {
+      "url": "https://wiki.example/mcp",
+      "headers": { "Authorization": "Bearer ${WIKI_TOKEN}" },
+      "timeoutSecs": 30
+    }
+  }
+}
+```
+
+## Fields
+
+| Field | Meaning |
+|---|---|
+| `command`, `args`, `env` | A stdio server: athena starts it as a child process |
+| `url`, `headers` | A streamable-HTTP server, at an http or https address. The older SSE transport is refused |
+| `timeoutSecs` | How long one tool call may take. Default 120. A call that runs over returns an error the model sees |
+| `startupTimeoutSecs` | How long the server may take to start, handshake and list its tools. Default 60, so `npx` and `uvx` can fetch a package on first use |
+| `disabled` | `true` leaves the server out, as in Claude Desktop |
+| `type` | Optional: `stdio`, `http` or `streamable-http`, matching the entry |
+
+Other fields are ignored.
+
+## Secrets
+
+Keep tokens out of the file. `${VAR}` and `${VAR:-default}` in `args`, `env`
+values and `headers` values are read from athena's environment, which `.env`
+or the VM's env file fills.
+
+- A variable that is unset and has no default skips that server, with a
+  warning that names the variable. athena never passes a literal `${VAR}`.
+- `$${` is a literal `${`. A default ends at the first `}`.
+- Values are never logged, only names.
+- `url` is not expanded. Put keys in `headers`, and use https: headers go out
+  as written. A message that names a URL shows only its scheme, host and port.
+- Prefer `env` to `args`: arguments show up in `ps`.
+
+## What runs where
+
+<Callout type="warn">
+  A stdio server runs on the host, as athena's user. It is not in the
+  sandbox, and one connection, with the credentials in its `env` and
+  `headers`, serves every user and session: anyone who may talk to athena may
+  use these tools. List only servers you trust, and protect the file and the
+  environment it reads: whoever can write them chooses what runs.
+</Callout>
+
+- A stdio server gets its declared `env` plus `PATH` and `HOME` from athena.
+  It does not inherit the rest of the environment, which holds athena's own
+  keys. If it needs `TMPDIR`, `LANG`, a proxy or a certificate setting,
+  declare it in `env`. Its stderr goes to athena's.
+- When athena stops it closes each server's stdin, waits a few seconds, then
+  kills and reaps the process it started. Servers stop with athena, so a turn
+  still running that needs one gets an error.
+- A program a server starts itself, such as the one behind an `npx` wrapper,
+  is not tracked. If athena is killed outright, a server is expected to exit
+  when its stdin closes.
+- What a server sends is untrusted data, like a web page: its tool
+  descriptions as much as its results. The system prompt already tells the
+  model not to follow instructions in pages and files.
+
+## Startup and failure
+
+`athena eval` does not connect MCP servers (nor a sandbox): evals are
+hermetic and start no process. They do get the instructions and skills.
+
+Servers connect together, at the start of `serve` and `telegram` (`serve`
+listens only after they have) and when the CLI first needs an agent. A server
+that cannot start, handshake or list its tools produces a warning and its
+tools are missing. athena runs without them. A server that dies later fails
+its tool calls until athena restarts; there is no reconnect.
+
+## Names and limits
+
+A tool keeps the name its server gave it, because Rig cannot rename an MCP
+tool. When a name is already taken by one of athena's tools (`add`, `read_skill` and the
+sandbox tools, whether or not they are set up) or by a server earlier in
+name order, the later tool is skipped with a warning. The official filesystem
+server's `read_file` and `write_file` are lost this way.
+
+A tool a model provider would refuse is skipped too, because it would fail
+every request: a name over 64 characters or with characters other than
+letters, digits, `_` and `-`, or an input schema that is not of type object.
+A server's tools past the first 100 are skipped, and a description is cut to
+4 KiB.
+
+The tool policy applies to MCP tools like any other. A call whose arguments
+are over 128 KiB is not sent, and the model is told why. An MCP tool's text
+result is cut to 64 KiB in all: blocks are kept in order until the budget is
+spent (an image or an empty block counts as one byte), the rest are left out,
+and one note says so. At most 4 images are kept, none over 3.75 MB. Other
+images reach the model as images. A reply is read whole into memory before
+the cut.
+
+## Tests
+
+`tests/mcp.rs` starts real child processes. The server is a small program,
+`tests/mcp/fixture.rs`, so the tests need no other runtime. They cover the
+model calling a tool, a crashing, missing, hanging or failing server, a
+timeout, `${VAR}` expansion and a skipped server, the child's environment,
+name clashes, the tool policy, process cleanup and an HTTP server.

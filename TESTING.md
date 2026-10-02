@@ -79,6 +79,18 @@ a "no API key" test would find one and call the provider.
   `MockStreamEvent::final_response`: without it Rig treats the turn as
   truncated and fails it.
 
+`tests/mcp.rs` runs real MCP servers. The stdio one is
+`tests/mcp/fixture.rs`, a small program declared as the `athena-mcp-fixture`
+bin in `Cargo.toml` (the way Cargo gives an integration test the path of a
+built program: `env!("CARGO_BIN_EXE_athena-mcp-fixture")`). Its flags make it
+crash, hang or refuse the handshake; its tools echo, sleep, die, return a big
+result, an image or its own environment. The HTTP one is a few lines of axum
+in the test. Tests start the servers through `Mcp::start` with an explicit
+environment lookup, so they never touch the process environment, and check
+that a process is gone (and not a zombie) with `kill(pid, 0)`. The fixture
+leaves with `_exit` so that, under coverage, it drops no profile file into
+the directory the tests ran from.
+
 `tests/telemetry.rs` installs the tracing layers for one thread with
 exporters that keep what they are sent, runs real turns through the router
 and the service, and checks the spans, their nesting and the log records.
@@ -110,8 +122,17 @@ downloadable (`getFile`, then `/file/bot<token>/<path>`), and
 `media_from(user, ("photo", photo_sizes(id, size)), caption)` sends it.
 Uploads (`sendPhoto`, `sendDocument`) are multipart; the fake records each
 file part as `{"file_name", "bytes"}`, resolving teloxide's `attach://`
-references. The decision logic in `src/telegram.rs` is unit-tested through
-the `Chat` trait with a recording chat, so most cases need no server.
+references. The fake refuses a `sendMessage` the real Bot API would refuse,
+with a 400 "can't parse entities": text over 4096 UTF-16 units, an entity
+that is empty, out of range or ends in whitespace, or entities that overlap
+without nesting or nest where Telegram forbids it. A formatting bug
+therefore shows as a plain-text resend, which the tests assert did not
+happen. `api.messages_to` returns texts; read `Call::body["entities"]` for
+the formatting. The decision logic in `src/telegram.rs` is unit-tested
+through the `Chat` trait with a recording chat, so most cases need no
+server, and `src/telegram/render.rs` is pure and tested on its own: fixtures
+per construct, plus every short combination of Markdown pieces checked
+against Telegram's entity rules.
 
 `tests/sandbox/fake_server.rs` does not run commands, with one exception:
 a command containing `'screenshot' '--annotate' '<path>'` writes a small PNG
@@ -119,6 +140,17 @@ a command containing `'screenshot' '--annotate' '<path>'` writes a small PNG
 image reaches the mock model. `screenshots_are(None)` turns that off. Agents
 in the sandbox tests wrap the mock model in `media::Vision`, as production
 wraps OpenRouter, so they check what the provider would be sent.
+
+Compaction is tested at two levels. `src/compaction/hook/tests.rs` drives the
+production agent through the service with two scripted models, one for the
+agent and one for the summaries, and a window of 10 000 tokens. What the
+provider "reports" for each call is scripted (`MockTurn::with_usage`), which is
+how a test says how full the context is, and the tests check what each request
+held (`labels`) and that no request has a tool result without its call
+(`assert_well_formed`). `tests/compaction.rs` sends the same turns through
+Rig's real OpenRouter client to a fake chat endpoint, blocking and streamed, to
+check what goes over the wire: the `plugins` parameter, and that the usage a
+real response carries is what compaction acts on.
 
 Concurrency tests must be deterministic. Park a turn inside a wrapping
 `ConversationMemory` (see `Gated` in `src/service.rs`) and wait on a
@@ -261,6 +293,12 @@ assuming the code is wrong. The model may have refused or rephrased.
    token never appears in the bot's log. Without a valid key the model-free
    checks still pass and the first turn check fails.
 
+9. Compaction: with `ATHENA_CONTEXT_TOKENS=8000` and `ATHENA_COMPACT_AT=0.5`,
+   five turns of about 1 100 tokens each compact the session. A checkpoint
+   points at a row that exists, no message is removed, each summary call is a
+   run that saved no messages, and a code word given in the first message is
+   still recalled after the compaction (retried once).
+
 ### Extending it
 
 Every feature PR adds a numbered section for what it introduces, such as the
@@ -303,6 +341,13 @@ throwaway database.
 8. Ask for something long (`Write 6000 words about rivers.`): it arrives in
    several messages, none cut mid-word unless a word is longer than a
    message.
+   8a. Ask for formatting (`Reply with a heading, bold and italic text, a
+   bullet list, a Python code block, a table and a link.`): the heading and
+   bold are bold, the code block is monospace with a copy button, the table
+   is an aligned monospace grid, the link is tappable, and no `**` or `#`
+   shows. Then ask for a 300-line code block: it continues in a second
+   message, monospace in both. This is the one check no fake can make: it
+   shows how real clients render the entities.
 9. Press Ctrl-C, start the bot again, send `/sessions`: `default` is still
    marked. `/usage` lists both sessions.
 10. Add the bot to a group and send a message there: the bot says nothing,

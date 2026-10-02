@@ -31,6 +31,8 @@
 //! - Files the turn's tools send (`send_photo`, `send_file`) follow the
 //!   reply. A photo Telegram refuses is sent again as a file.
 
+pub mod render;
+
 use crate::agent;
 use crate::media::{self, Attachment, File, Kind, Outbox};
 use crate::runner::{Request, Run};
@@ -40,18 +42,21 @@ use crate::shutdown;
 use crate::store::{self, Store};
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
+use render::Chunk;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::future::Future;
+use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use teloxide::dispatching::{DefaultKey, Dispatcher, ShutdownToken, UpdateFilterExt};
 use teloxide::net::Download;
+use teloxide::payloads::SendMessageSetters;
 use teloxide::prelude::{Requester, Update};
 use teloxide::requests::HasPayload;
-use teloxide::types::{BotCommand, ChatAction, ChatId, FileId, InputFile, Message};
+use teloxide::types::{BotCommand, ChatAction, ChatId, FileId, InputFile, Message, MessageEntity};
 use teloxide::update_listeners::Polling;
-use teloxide::{Bot, RequestError, dptree};
+use teloxide::{ApiError, Bot, RequestError, dptree};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -253,23 +258,34 @@ pub fn free_name(taken: &[String]) -> String {
 
 /// Break `text` into messages of at most `limit` UTF-16 code units.
 ///
-/// Cuts at the last line break in the second half of the window, else at the
-/// last whitespace there, else at the last character that fits: never inside
-/// a UTF-8 character, though a hard cut can separate the parts of a
-/// multi-codepoint emoji. The line break or space cut at is dropped.
-/// Chunks that are only whitespace, which Telegram refuses, are skipped.
-/// `limit` must be at least 2, the size of the widest character.
+/// Cuts at the last blank line in the second half of the window, else at the
+/// last line break there, else at the last whitespace there, else at the
+/// last character that fits: never inside a UTF-8 character, though a hard
+/// cut can separate the parts of a multi-codepoint emoji. The break or space
+/// cut at is dropped. Chunks that are only whitespace, which Telegram
+/// refuses, are skipped. `limit` must be at least 2, the size of the widest
+/// character.
 pub fn split(text: &str, limit: usize) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut rest = text;
-    while utf16_len(rest) > limit {
+    split_ranges(text, limit)
+        .into_iter()
+        .map(|range| text[range].to_string())
+        .collect()
+}
+
+/// [`split`], as the byte ranges of `text` the messages are made of. The
+/// renderer cuts the entities of a formatted reply at the same places.
+fn split_ranges(text: &str, limit: usize) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut at = 0;
+    while utf16_len(&text[at..]) > limit {
+        let rest = &text[at..];
         let fits = fit(rest, limit);
         let (end, next) = break_at(&rest[..fits], fits / 2).unwrap_or((fits, fits));
-        keep(&mut chunks, &rest[..end]);
-        rest = &rest[next..];
+        keep(&mut ranges, text, at..at + end);
+        at += next;
     }
-    keep(&mut chunks, rest);
-    chunks
+    keep(&mut ranges, text, at..text.len());
+    ranges
 }
 
 fn utf16_len(s: &str) -> usize {
@@ -290,15 +306,20 @@ fn fit(s: &str, limit: usize) -> usize {
     end.max(s.chars().next().map_or(0, char::len_utf8))
 }
 
-/// Where to cut `window`: (end of this chunk, start of the next), at a line
-/// break or whitespace no earlier than byte `min`.
+/// Where to cut `window`: (end of this chunk, start of the next), at a blank
+/// line, a line break or whitespace no earlier than byte `min`, in that
+/// order of preference.
 fn break_at(window: &str, min: usize) -> Option<(usize, usize)> {
     let usable = |i: usize| i > 0 && i >= min;
+    let blank = window
+        .rfind("\n\n")
+        .filter(|&i| usable(i))
+        .map(|i| (i, i + 2));
     let newline = window
         .rfind('\n')
         .filter(|&i| usable(i))
         .map(|i| (i, i + 1));
-    newline.or_else(|| {
+    blank.or(newline).or_else(|| {
         window
             .char_indices()
             .rev()
@@ -307,24 +328,25 @@ fn break_at(window: &str, min: usize) -> Option<(usize, usize)> {
     })
 }
 
-fn keep(chunks: &mut Vec<String>, chunk: &str) {
-    if !chunk.trim().is_empty() {
-        chunks.push(chunk.to_string());
+fn keep(ranges: &mut Vec<Range<usize>>, text: &str, range: Range<usize>) {
+    if !text[range.clone()].trim().is_empty() {
+        ranges.push(range);
     }
 }
 
-/// The messages a reply is sent as: split to fit, at most [`MAX_CHUNKS`].
-pub fn chunks(reply: &str) -> Vec<String> {
-    let mut parts = split(reply, MESSAGE_LIMIT);
+/// The messages a reply is sent as: the model's Markdown rendered and split
+/// to fit, at most [`MAX_CHUNKS`].
+pub fn chunks(reply: &str) -> Vec<Chunk> {
+    let mut parts = render::render(reply);
     if parts.is_empty() {
-        return vec!["(The model sent an empty reply.)".into()];
+        return vec![Chunk::plain("(The model sent an empty reply.)")];
     }
     if parts.len() > MAX_CHUNKS {
         let dropped = parts.len() - (MAX_CHUNKS - 1);
         parts.truncate(MAX_CHUNKS - 1);
-        parts.push(format!(
+        parts.push(Chunk::plain(format!(
             "(Reply cut short: {dropped} more messages not sent. The whole reply is saved in this session.)"
-        ));
+        )));
     }
     parts
 }
@@ -372,6 +394,13 @@ pub trait Chat: Clone + Send + Sync + 'static {
     fn typing(&self) -> impl Future<Output = Result<()>> + Send;
     /// Send one message, at most [`MESSAGE_LIMIT`] long.
     fn say(&self, text: &str) -> impl Future<Output = Result<()>> + Send;
+    /// Send one message formatted by `entities`. Telegram answering that it
+    /// cannot apply them is a [`Refused`] error.
+    fn say_formatted(
+        &self,
+        text: &str,
+        entities: &[MessageEntity],
+    ) -> impl Future<Output = Result<()>> + Send;
     /// Download a file the user sent; fail past `limit` bytes.
     fn download(&self, id: &str, limit: usize) -> impl Future<Output = Result<Vec<u8>>> + Send;
     /// Send the user a file, as a photo or a document.
@@ -925,7 +954,7 @@ impl<R: Run + 'static> Telegram<R> {
             }
         };
         for chunk in chunks(&reply) {
-            if !say(&chat, &self.log, &chunk).await {
+            if !say_chunk(&chat, &self.log, &chunk).await {
                 break;
             }
         }
@@ -995,6 +1024,28 @@ async fn say<C: Chat>(chat: &C, log: &Log, text: &str) -> bool {
     sent.is_ok()
 }
 
+/// Send one chunk of a reply with its formatting. If Telegram refuses the
+/// formatting, the same text is sent without it: a reply must never be lost
+/// to a formatting error. Returns whether the text was sent.
+async fn say_chunk<C: Chat>(chat: &C, log: &Log, chunk: &Chunk) -> bool {
+    if chunk.entities.is_empty() {
+        return say(chat, log, &chunk.text).await;
+    }
+    match chat.say_formatted(&chunk.text, &chunk.entities).await {
+        Ok(()) => true,
+        Err(e) if e.is::<Refused>() => {
+            log(&format!(
+                "sending formatted text failed, sending it as plain text: {e:#}"
+            ));
+            say(chat, log, &chunk.text).await
+        }
+        Err(e) => {
+            log(&format!("sending a message failed: {e:#}"));
+            false
+        }
+    }
+}
+
 async fn typing<C: Chat>(chat: &C, log: &Log) {
     if let Err(e) = chat.typing().await {
         log(&format!("sending the typing indicator failed: {e:#}"));
@@ -1028,6 +1079,17 @@ impl Chat for TelegramChat {
 
     async fn say(&self, text: &str) -> Result<()> {
         retrying(SEND_ATTEMPTS, || self.bot.send_message(self.chat, text)).await?;
+        Ok(())
+    }
+
+    async fn say_formatted(&self, text: &str, entities: &[MessageEntity]) -> Result<()> {
+        retrying(SEND_ATTEMPTS, || {
+            self.bot
+                .send_message(self.chat, text)
+                .entities(entities.to_vec())
+        })
+        .await
+        .map_err(bad_request)?;
         Ok(())
     }
 
@@ -1078,6 +1140,21 @@ impl Chat for TelegramChat {
 fn refused(e: RequestError) -> anyhow::Error {
     match e {
         RequestError::Api(api) => Refused(api.to_string()).into(),
+        other => other.into(),
+    }
+}
+
+/// A failed formatted send, as [`Refused`] when Telegram says it cannot
+/// parse the entities, or answers a "Bad Request" teloxide has no name for:
+/// sending the text again without formatting may work. Any other failure (a
+/// block, a timeout, a server error, a chat that does not exist) would fail
+/// the same way again.
+fn bad_request(e: RequestError) -> anyhow::Error {
+    match e {
+        RequestError::Api(ApiError::CantParseEntities(why)) => Refused(why).into(),
+        RequestError::Api(ApiError::Unknown(why)) if why.starts_with("Bad Request") => {
+            Refused(why).into()
+        }
         other => other.into(),
     }
 }
@@ -1226,9 +1303,12 @@ pub async fn main(model: &str) -> Result<()> {
     let config = Config::from_env()?;
     let client = agent::client()?;
     let store = Store::open(&store::path())?;
-    let service = Arc::new(Service::new(store.clone(), model, log_warning));
+    let compactor = crate::compaction::from_env(model)?;
+    let service =
+        Arc::new(Service::new(store.clone(), model, log_warning).with_compactor(compactor));
     let sandboxes = agent::sandboxes_from_env(&store)?;
-    let agent = agent::build_with(&client, model, service.memory(), sandboxes.clone());
+    let mcp = agent::connect_mcp(&log_warning).await;
+    let agent = agent::build_with(&client, model, service.memory(), sandboxes.clone(), &mcp);
     let app =
         Arc::new(Telegram::new(service, store, agent, Arc::new(log_warning)).sandboxes(sandboxes));
     let bot = config.bot();
@@ -1238,12 +1318,15 @@ pub async fn main(model: &str) -> Result<()> {
         transport = TRANSPORT,
         "polling for messages; Ctrl-C or SIGTERM stops"
     );
-    serve(&mut dispatcher, bot, &app).await
+    let result = serve(&mut dispatcher, bot, &app).await;
+    mcp.shutdown().await;
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compaction::ContextHook;
     use rig_agent::agent::{Agent, AgentBuilder};
     use rig_core::test_utils::{MockCompletionModel, MockTurn};
     use tokio::sync::{Semaphore, mpsc};
@@ -1380,6 +1463,15 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_line_is_preferred_to_a_later_line_break() {
+        let text = "aaaa aaaa aaaa\n\nbbbb\ncccc dddd";
+        assert_eq!(split(text, 24), ["aaaa aaaa aaaa", "bbbb\ncccc dddd"]);
+        // Only in the first half of the window, it does not count.
+        let early = "aa\n\nbbbbbbbbbb cccc dddd";
+        assert_eq!(split(early, 16), ["aa\n\nbbbbbbbbbb", "cccc dddd"]);
+    }
+
+    #[test]
     fn without_a_late_line_break_it_cuts_at_whitespace() {
         // The only line break is in the first half of the window.
         let text = "ab\ncdefghij klmnop qrs";
@@ -1432,16 +1524,21 @@ mod tests {
 
     #[test]
     fn a_reply_is_capped_at_max_chunks_with_a_note() {
-        assert_eq!(chunks("hi"), ["hi"]);
-        assert_eq!(chunks(" \n"), ["(The model sent an empty reply.)"]);
+        assert_eq!(chunks("hi"), [Chunk::plain("hi")]);
+        assert_eq!(
+            chunks(" \n"),
+            [Chunk::plain("(The model sent an empty reply.)")]
+        );
         let huge = "x".repeat(MESSAGE_LIMIT * 10);
         let parts = chunks(&huge);
         assert_eq!(parts.len(), MAX_CHUNKS);
         let note = &parts[MAX_CHUNKS - 1];
-        assert!(note.starts_with("(Reply cut short: 3 more"), "{note}");
+        let cut_short = note.text.starts_with("(Reply cut short: 3 more");
+        assert!(cut_short, "{note:?}");
+        assert!(note.entities.is_empty());
         let exactly = "x".repeat(MESSAGE_LIMIT * MAX_CHUNKS);
         assert_eq!(chunks(&exactly).len(), MAX_CHUNKS);
-        assert!(!chunks(&exactly).last().unwrap().starts_with('('));
+        assert!(!chunks(&exactly).last().unwrap().text.starts_with('('));
     }
 
     #[test]
@@ -1513,6 +1610,8 @@ mod tests {
     enum Event {
         Typing,
         Say(String),
+        /// A message sent with formatting: its text and entities.
+        Formatted(String, Vec<MessageEntity>),
         /// A file sent, or tried: its name, kind and caption.
         Sent(String, Kind, Option<String>),
     }
@@ -1535,6 +1634,18 @@ mod tests {
         files: Arc<std::collections::HashMap<String, Vec<u8>>>,
         /// Sending a photo fails, as Telegram refuses some.
         refuse_photos: bool,
+        /// Sending formatted text fails with an error of this kind.
+        formatting: Formatting,
+    }
+
+    /// How a [`Recorder`] answers a message with entities.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Formatting {
+        Accepted,
+        /// Telegram says "Bad Request": the entities are refused.
+        Refused,
+        /// The send fails some other way, as a block or a timeout does.
+        Broken,
     }
 
     impl Chat for Recorder {
@@ -1552,6 +1663,18 @@ mod tests {
                 bail!("blocked by the user");
             }
             Ok(())
+        }
+
+        async fn say_formatted(&self, text: &str, entities: &[MessageEntity]) -> Result<()> {
+            let event = Event::Formatted(text.to_string(), entities.to_vec());
+            self.events.send(event).unwrap();
+            match self.formatting {
+                Formatting::Accepted => Ok(()),
+                Formatting::Refused => {
+                    Err(Refused("Bad Request: can't parse entities".into()).into())
+                }
+                Formatting::Broken => bail!("connection reset"),
+            }
         }
 
         async fn download(&self, id: &str, _limit: usize) -> Result<Vec<u8>> {
@@ -1581,6 +1704,7 @@ mod tests {
                 fail: false,
                 files: Arc::default(),
                 refuse_photos: false,
+                formatting: Formatting::Accepted,
             },
             rx,
         )
@@ -1921,6 +2045,78 @@ mod tests {
         );
     }
 
+    /// What `chat` was asked to do while the bot handled `hi` as user 1.
+    async fn events_for(h: &Harness<Agent>, chat: Recorder, mut rx: EventRx) -> Vec<Event> {
+        h.app.handle(chat, from(1, "hi")).await;
+        h.app.finish().await;
+        let mut seen = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            seen.push(e);
+        }
+        seen
+    }
+
+    type EventRx = mpsc::UnboundedReceiver<Event>;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_markdown_reply_is_sent_as_text_with_entities() {
+        let h = harness(vec![MockTurn::text("**Hi** 😀 `there`\n\nplain")]);
+        let (chat, rx) = recorder();
+
+        let seen = events_for(&h, chat, rx).await;
+
+        let entities = vec![MessageEntity::bold(0, 2), MessageEntity::code(6, 5)];
+        assert_eq!(
+            seen,
+            [
+                Event::Typing,
+                Event::Formatted("Hi 😀 there\n\nplain".into(), entities)
+            ]
+        );
+        assert!(h.logged().is_empty(), "{:?}", h.logged());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn formatting_telegram_refuses_is_sent_again_as_plain_text() {
+        let h = harness(vec![MockTurn::text("**Hi** there")]);
+        let (mut chat, rx) = recorder();
+        chat.formatting = Formatting::Refused;
+
+        let seen = events_for(&h, chat, rx).await;
+
+        // The text, with the markup already gone, arrives without entities.
+        let entities = vec![MessageEntity::bold(0, 2)];
+        assert_eq!(
+            seen,
+            [
+                Event::Typing,
+                Event::Formatted("Hi there".into(), entities),
+                said("Hi there")
+            ]
+        );
+        let logged = h.logged();
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert!(
+            logged[0].starts_with("sending formatted text failed"),
+            "{logged:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn another_failure_to_send_formatted_text_is_not_sent_again() {
+        let long = format!("**{}**\n\n{}", "a".repeat(4000), "b".repeat(4000));
+        let h = harness(vec![MockTurn::text(long)]);
+        let (mut chat, rx) = recorder();
+        chat.formatting = Formatting::Broken;
+
+        let seen = events_for(&h, chat, rx).await;
+
+        // One attempt at the first chunk, no plain copy, none at the second.
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(matches!(seen[1], Event::Formatted(..)));
+        assert_eq!(h.logged(), ["sending a message failed: connection reset"]);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn failed_sends_are_logged_and_stop_the_remaining_chunks() {
         let long = format!("{}\n{}", "a".repeat(4000), "b".repeat(4000));
@@ -1961,10 +2157,11 @@ mod tests {
             &self,
             prompt: &Request,
             conversation: &str,
+            context: Option<ContextHook>,
         ) -> Result<rig_agent::agent::PromptResponse, rig_agent::completion::PromptError> {
             self.started.send(()).unwrap();
             self.gate.acquire().await.unwrap().forget();
-            self.inner.run(prompt, conversation).await
+            self.inner.run(prompt, conversation, context).await
         }
     }
 
@@ -2050,6 +2247,7 @@ mod tests {
             &self,
             _: &Request,
             _: &str,
+            _: Option<ContextHook>,
         ) -> Result<rig_agent::agent::PromptResponse, rig_agent::completion::PromptError> {
             panic!("the agent blew up")
         }
@@ -2241,12 +2439,13 @@ mod tests {
             &self,
             request: &Request,
             conversation: &str,
+            context: Option<ContextHook>,
         ) -> Result<rig_agent::agent::PromptResponse, rig_agent::completion::PromptError> {
             let outbox = request.outbox.as_ref().unwrap();
             for attachment in &self.attachments {
                 outbox.push(attachment.clone()).unwrap();
             }
-            self.inner.run(request, conversation).await
+            self.inner.run(request, conversation, context).await
         }
     }
 

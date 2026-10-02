@@ -16,6 +16,11 @@ Each row is opaque Rig JSON. Rig's `Message` already encodes tool calls and
 results, and keeping it opaque means a Rig upgrade does not need a schema
 change.
 
+A session that has been compacted loads differently: the newest summary in
+the `compactions` table, then the rows after the last one it covers. The rows
+themselves stay, and `history` returns all of them. See
+[Compaction](/docs/compaction).
+
 ## Unsaved transcripts are errors
 
 Rig treats a failed append as a warning and returns the reply anyway. The

@@ -41,16 +41,57 @@ Rules for `serve` and `telegram`:
 | `OPENROUTER_API_KEY`, `AGENT_MODEL`, `RUNS_STORE_RAW`, `TELEGRAM_BOT_TOKEN` | existing | unchanged |
 | `ATHENA_INSTRUCTIONS` | agent | optional path of a text file (at most 16 KiB, `custom::MAX_INSTRUCTIONS_BYTES`), appended to the base preamble after `## Custom instructions`. Unset or unusable means none (a warning is logged). |
 | `ATHENA_SKILLS_DIR` | agent | optional path of a directory of Agent Skills (`<name>/SKILL.md`, https://agentskills.io/specification), loaded once at startup. Each valid skill is listed in the preamble after `## Skills`, and `read_skill(name)` is registered when at least one loads. Invalid skills are skipped with a warning. Limits: 64 KiB per `SKILL.md`, 64 skills, 16 KiB of listing, 256 directory entries of any kind examined, the scan stopping there; which ones past that is up to the file system (`custom::skills`). |
+| `ATHENA_COMPACT_AT` | all | compact a session above this share of the model's context window; 0.3 to 0.95, default `0.8` |
+| `ATHENA_COMPACT_MODEL` | all | model id that writes compaction summaries; default `AGENT_MODEL` |
+| `ATHENA_CONTEXT_TOKENS` | all | the agent model's context window in tokens (8000 or more). Unset: OpenRouter's `context_length` for `AGENT_MODEL`, else 128000 |
 | `OPEN_SANDBOX_URL` | agent | e.g. `http://100.118.54.67:9090`. **Unset means the sandbox tools are not registered** (dev and tests keep working). |
 | `OPEN_SANDBOX_API_KEY` | agent | optional; sent as the `OPEN-SANDBOX-API-KEY` header when set |
 | `ATHENA_SANDBOX_IMAGE` | agent | default `ghcr.io/queryplanner/athena-sandbox:latest` |
 | `ATHENA_SANDBOX_TIMEOUT_SECS` | agent | default `1800`, minimum 60 |
 | `ATHENA_PUBLIC_URL` | agent | base of sign-in links, e.g. `http://100.124.202.79:18080`; default `http://$ATHENA_ADDR` (so `serve` and `telegram` agree from the one env file). Must be http(s); required when `ATHENA_ADDR` is unspecified (`0.0.0.0`, `[::]`). |
+| `ATHENA_MCP_CONFIG` | agent | path of an `mcp.json` (section "MCP servers"). **Unset means no MCP tools**, and no default path is searched. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | all | OTLP/HTTP base URL; on the VM OpenObserve, `http://<tailnet-ip>:5080/api/default` (`/v1/traces` and `/v1/logs` are appended). **Unset means no OTLP export.** |
 | `OTEL_EXPORTER_OTLP_HEADERS` | all | `Authorization=Basic%20<base64 of OpenObserve root email:password>`, written by `setup-host.sh` into the env file only |
 | `ATHENA_TELEMETRY_DIR` | all | e.g. `/var/lib/athena/<env>/telemetry`: daily `traces-<role>-YYYYMMDD.jsonl` and `logs-<role>-YYYYMMDD.jsonl`, `<role>` being the process (`serve`, `telegram`, `cli`), so every file has one writer. **Unset means no files.** With neither this nor the endpoint, telemetry is off and logs go to stderr only. |
 | `ATHENA_TELEMETRY_RETENTION_DAYS` | all | default `30`; files of older days are deleted |
 | `OTEL_SERVICE_NAME` | all | default `athena` |
+
+## MCP servers
+
+`ATHENA_MCP_CONFIG` names a JSON file, `{"mcpServers": {NAME: ENTRY}}`, the shape
+Claude Code and Claude Desktop use (`src/mcp.rs`).
+
+| Entry field | Meaning |
+|---|---|
+| `command`, `args`, `env` | stdio server, a child process on the host (not in the sandbox) |
+| `url`, `headers` | streamable-HTTP server (legacy SSE is refused) |
+| `type` | optional `stdio`, `http` or `streamable-http`; must match the entry |
+| `disabled` | `true` leaves the server out |
+| `timeoutSecs` | per tool call, default 120 |
+| `startupTimeoutSecs` | start, handshake and tool listing, default 60 |
+
+- `${VAR}` and `${VAR:-default}` are expanded in `args`, `env` values and
+  `headers` values from athena's environment, never in `url`; `$${` is a literal
+  `${`. An unset variable without a default skips that server with a warning
+  naming the variable. No value is logged, and warnings show a URL as scheme,
+  host and port only.
+- A stdio child's environment is its `env` plus `PATH` and `HOME` from athena.
+- Servers connect at startup (`serve`, `telegram`) or on the CLI's first turn.
+  A server that fails is a warning; its tools are missing.
+- One connection per server serves every user and session of the process.
+- A tool keeps its server's name. A name that a built-in tool
+  (`agent::reserved_tool_names`: `add`, `read_skill`, the sandbox tools) or an earlier server (name order) has, that
+  is not 1 to 64 of `[A-Za-z0-9_-]`, or an input schema that is not of type
+  object, is skipped with a warning, as are a server's tools past the first
+  `MAX_TOOLS_PER_SERVER`. Descriptions are cut to `MAX_DESCRIPTION_BYTES`.
+- `ToolPolicy` (`src/policy.rs`) applies by tool name: arguments over
+  `MAX_ARGUMENT_BYTES` are not sent, MCP tools' results are cut to
+  `MAX_RESULT_BYTES` in all (blocks kept in order, an image or empty block costs
+  1 byte, the rest dropped, one notice appended), and at most
+  `media::MAX_IMAGES_PER_REQUEST` images are kept, none over `media::MAX_IMAGE_BYTES`.
+- Rust API: `agent::connect_mcp(warn) -> Mcp`, `agent::build(.., &Mcp)`,
+  `agent::build_with(.., &Mcp)`, `agent::configure_with_mcp(.., &Mcp)`, then
+  `Mcp::shutdown().await` when the process ends.
 
 ## HTTP
 
@@ -74,6 +115,19 @@ Unknown or expired tokens are `404`.
 | `GET /browser/{token}/controls` | `snapshot -i --json`, as `{"controls": [{"ref": "e4", "name", "kind"}]}` in page order; `kind` is `username`, `password`, `code`, `text` or `button` |
 | `POST /browser/{token}/submit` `{"fills": [{"ref", "text"}], "click"}` | `fill @ref text` for each (at most 20, 1000 chars each), then `click @ref`, as one command |
 | `POST /browser/{token}/done` | `state save`, stored for the session's owner; answers `{"saved_bytes"}` |
+
+## Compaction
+
+| Name | Value | Owner |
+|---|---|---|
+| Table | `compactions(session_id, through_seq, summary, model, input_tokens, output_tokens, created_at)`, primary key `(session_id, through_seq)`; the summary stands in for every `messages` row of the session up to and including `through_seq`; the newest is the highest `through_seq`; rows are never deleted or edited | `store.rs` migration 7 |
+| Loading | a turn loads the newest summary (one user message) then the rows after its `through_seq`; `Store::load` (history) returns every row | `store::SqliteMemory` |
+| Checkpoint rule | `through_seq` must name a row that exists, and the row after it must not be a tool result (`Store::save_checkpoint` refuses otherwise); a checkpoint not newer than the newest is ignored | `store.rs` |
+| Summary runs | a `runs` row per summary call: `model` is `ATHENA_COMPACT_MODEL`, `last_seq = first_seq - 1` (no messages; so is a turn that failed, so the discriminator is `calls_json`), `calls_json` is `[{"purpose": "compaction"}]`, status `error` when the call failed. They count in `runs` in `usage` and `GET /usage`. A reader that wants turns only filters `calls_json` or `last_seq >= first_seq AND model_calls > 0` | `compaction::SummaryRun` |
+| Window source | `GET https://openrouter.ai/api/v1/models` (no key): `data[].id`, `data[].context_length` (the model's largest, not the smallest provider's); fetched on first use by a request of at least 6000 tokens, kept for the process; a failed lookup assumes 128000 for 10 minutes; 5 s timeout | `compaction::Compactor::window` |
+| Request parameter | every request the agent sends to OpenRouter carries `plugins: [{"id": "context-compression", "enabled": false}]`; the summary call does not | `agent::openrouter_params` |
+| Summary limits | summarizer sees each message part clipped to 8000 characters, tool results labelled untrusted; 120 s timeout; the call's `max_tokens` is a tenth of the window (256 to 4000) and a summary over that by a quarter (4 chars a token) is rejected like a failed one; a failed or useless attempt holds the session off until the request is a twentieth of the window bigger; kept verbatim: at least a fifth of the window | `compaction` |
+| Summary message | one user message: a header saying these are notes and no instruction from the user, then the summary | `compaction::summary_message` |
 
 ## Release artifact (GHCR via ORAS)
 
@@ -103,6 +157,8 @@ Unknown or expired tokens are `404`.
 | Sign-in page screenshot | `/tmp/athena-viewer.png` (`sandbox::login::SCREEN_PATH`) | `Sandboxes::screen` |
 | Sign-in tables | `browser_links(token, session_id, url, expires_at)`, links valid 1 h; `browser_states(user_id, state, saved_at)`, one per user | `store.rs` migration 6 |
 | Bot API methods | `getFile`, file download `GET /file/bot<token>/<file_path>`, `sendPhoto`, `sendDocument` (multipart) | `telegram.rs` |
+| Reply format | `sendMessage` with plain `text` and `entities` (UTF-16 offsets), no `parse_mode`; model Markdown rendered by `telegram::render::render`; a chunk answered "Bad Request" is resent as plain text without entities | `telegram/render.rs`, `telegram.rs` |
+| Message limit | 4096 UTF-16 units after parsing (`telegram::MESSAGE_LIMIT`), at most 8 messages (`telegram::MAX_CHUNKS`) | Bot API |
 | Download limit | 20 MB (`telegram::DOWNLOAD_LIMIT`) | Bot API |
 | Albums | collected by `(user, media_group_id)` until 2 s pass with no new item (`telegram::ALBUM_WAIT`), at most 10 items, one turn | `telegram.rs` |
 | Upload limits | photo 10 MB, document 50 MB, caption 1024 chars, 10 files a turn | `sandbox::tools`, `media::MAX_ATTACHMENTS` |

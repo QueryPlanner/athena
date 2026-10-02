@@ -45,7 +45,7 @@ This is DNS-rebinding protection for a private address, not authentication.
 | `GET /sessions/{id}/messages` | | `200 {"messages":[...]}` |
 | `POST /sessions/{id}/messages` | `{"text":"hi"}` | `200 {"reply","run":{...}}` |
 | `POST /sessions/{id}/messages/stream` | `{"text":"hi"}` | `200 text/event-stream` |
-| `GET /usage` | | `200 {"usage":[...]}` |
+| `GET /usage` | | `200 {"usage":[...]}`; a [compaction](/docs/compaction)'s summary calls count as runs |
 
 `messages` are Rig's own message JSON, exactly as stored, tool calls and
 tool results included. That format belongs to Rig and can change with a Rig
