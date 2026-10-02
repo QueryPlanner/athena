@@ -14,7 +14,7 @@
 //! outside this file goes through it, so the choice of handle (one connection
 //! behind a mutex, see the README) can change here without touching callers.
 
-use crate::media;
+use crate::{compaction, media};
 use anyhow::{Context, Result, bail};
 use rig_agent::prelude::Message;
 use rig_core::memory::{ConversationMemory, MemoryError};
@@ -125,6 +125,20 @@ pub struct SandboxRow {
     pub expires_at: i64,
 }
 
+/// A compaction: a summary standing in for every message of a session up to
+/// and including `through_seq`. The messages themselves stay in `messages`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub through_seq: i64,
+    pub summary: String,
+    /// The model that wrote the summary.
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    /// Milliseconds since the Unix epoch.
+    pub created_at: i64,
+}
+
 /// Why an append wrote nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppendError {
@@ -164,6 +178,12 @@ fn storage(e: impl std::fmt::Display) -> AppendError {
 pub struct Receipt {
     /// The seq the turn's first message will get, as the load saw it.
     pub loaded_next: Option<i64>,
+    /// The seq of each message the load returned, in order. After a
+    /// compaction the first is the summary, which has the seq of the last
+    /// message it covers.
+    pub loaded: Vec<i64>,
+    /// Whether the first loaded message is a compaction's summary.
+    pub loaded_summary: bool,
     /// The seq range the append wrote, or why it wrote nothing.
     pub appended: Option<std::result::Result<(i64, i64), AppendError>>,
 }
@@ -341,6 +361,21 @@ const MIGRATIONS: &[&str] = &[
          state    BLOB NOT NULL,
          saved_at INTEGER NOT NULL
      );",
+    // 7: compactions. A row says that `summary` stands in for every message
+    // of the session up to and including `through_seq`; the messages are
+    // not touched. A session loads its newest checkpoint (the highest
+    // `through_seq`) followed by the rows after it. The key stops two
+    // processes that compact the same range from both writing it.
+    "CREATE TABLE compactions (
+         session_id    TEXT NOT NULL REFERENCES sessions (id),
+         through_seq   INTEGER NOT NULL,
+         summary       TEXT NOT NULL,
+         model         TEXT NOT NULL,
+         input_tokens  INTEGER NOT NULL DEFAULT 0,
+         output_tokens INTEGER NOT NULL DEFAULT 0,
+         created_at    INTEGER NOT NULL,
+         PRIMARY KEY (session_id, through_seq)
+     );",
 ];
 
 /// The schema version this build writes.
@@ -397,6 +432,18 @@ const EXPECTED_COLUMNS: &[(&str, &[&str])] = &[
         &["token", "session_id", "url", "expires_at"],
     ),
     ("browser_states", &["user_id", "state", "saved_at"]),
+    (
+        "compactions",
+        &[
+            "session_id",
+            "through_seq",
+            "summary",
+            "model",
+            "input_tokens",
+            "output_tokens",
+            "created_at",
+        ],
+    ),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -500,6 +547,64 @@ fn read_history(db: &Connection, session_id: &str) -> Result<Vec<Message>> {
     let mut q = db.prepare("SELECT json FROM messages WHERE session_id=?1 ORDER BY seq")?;
     let rows = q.query_map([session_id], |r| r.get::<_, String>(0))?;
     rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
+}
+
+/// The transcript a turn starts from: the newest compaction's summary, if
+/// there is one, then every message after it.
+struct Visible {
+    messages: Vec<Message>,
+    /// The seq of each message. The summary has the seq of the last message
+    /// it stands for.
+    seqs: Vec<i64>,
+    summarized: bool,
+}
+
+fn newest_checkpoint(db: &Connection, session_id: &str) -> rusqlite::Result<Option<Checkpoint>> {
+    db.query_row(
+        "SELECT through_seq, summary, model, input_tokens, output_tokens, created_at
+         FROM compactions WHERE session_id = ?1
+         ORDER BY through_seq DESC LIMIT 1",
+        [session_id],
+        |r| {
+            Ok(Checkpoint {
+                through_seq: r.get(0)?,
+                summary: r.get(1)?,
+                model: r.get(2)?,
+                input_tokens: r.get(3)?,
+                output_tokens: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        },
+    )
+    .optional()
+}
+
+fn read_visible(db: &Connection, session_id: &str) -> Result<Visible> {
+    let checkpoint = newest_checkpoint(db, session_id)?;
+    let mut visible = Visible {
+        messages: Vec::new(),
+        seqs: Vec::new(),
+        summarized: checkpoint.is_some(),
+    };
+    let mut after = -1;
+    if let Some(checkpoint) = checkpoint {
+        visible
+            .messages
+            .push(compaction::summary_message(&checkpoint.summary));
+        visible.seqs.push(checkpoint.through_seq);
+        after = checkpoint.through_seq;
+    }
+    let sql = "SELECT seq, json FROM messages WHERE session_id = ?1 AND seq > ?2 ORDER BY seq";
+    let mut q = db.prepare(sql)?;
+    let rows = q.query_map(rusqlite::params![session_id, after], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (seq, json) = row?;
+        visible.messages.push(serde_json::from_str(&json)?);
+        visible.seqs.push(seq);
+    }
+    Ok(visible)
 }
 
 fn next_seq_in(db: &Connection, session_id: &str) -> rusqlite::Result<i64> {
@@ -882,6 +987,102 @@ impl Store {
         Ok(next_seq_in(&self.db(), session_id)?)
     }
 
+    /// Record that `checkpoint.summary` stands in for the session's messages
+    /// up to `checkpoint.through_seq`. Returns whether it was written: a
+    /// checkpoint that is not newer than the session's newest (another
+    /// process got there first) changes nothing. One that points at a message
+    /// the session does not have is an error.
+    pub(crate) fn save_checkpoint(
+        &self,
+        session_id: &str,
+        checkpoint: &Checkpoint,
+    ) -> Result<bool> {
+        let db = self.db();
+        let tx = Transaction::new_unchecked(&db, TransactionBehavior::Immediate)?;
+        let next = next_seq_in(&tx, session_id)?;
+        if !(0..next).contains(&checkpoint.through_seq) {
+            bail!(
+                "a checkpoint through seq {} does not fit a session whose next seq is {next}",
+                checkpoint.through_seq
+            );
+        }
+        // The first message the session loads after the summary must not be
+        // a tool result: its call would be hidden, and a provider refuses
+        // that on every turn. Nothing deletes a checkpoint, so this is the
+        // only place to stop it.
+        let first_kept = tx
+            .query_row(
+                "SELECT json FROM messages WHERE session_id = ?1 AND seq = ?2",
+                rusqlite::params![session_id, checkpoint.through_seq + 1],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(json) = first_kept
+            && !compaction::may_start_the_kept(&serde_json::from_str(&json)?)
+        {
+            bail!(
+                "a checkpoint through seq {} would leave a tool result without its call",
+                checkpoint.through_seq
+            );
+        }
+        let newest = newest_checkpoint(&tx, session_id)?;
+        if newest.is_some_and(|n| n.through_seq >= checkpoint.through_seq) {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO compactions (
+                 session_id, through_seq, summary, model, input_tokens, output_tokens, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                session_id,
+                checkpoint.through_seq,
+                checkpoint.summary,
+                checkpoint.model,
+                checkpoint.input_tokens,
+                checkpoint.output_tokens,
+                checkpoint.created_at,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The prompt tokens the provider reported for the last model call of
+    /// the session's newest run that saved messages, which is how big the
+    /// session's context was when that run ended. `None` if no run reported
+    /// any. Compaction runs append nothing and are skipped.
+    ///
+    /// Also `None` when that run compacted (a summary call that succeeded
+    /// began while it ran) but no checkpoint was saved since it began: its
+    /// last call was sent with the summary, but the next load is the whole
+    /// transcript, which that number is far too small for.
+    pub(crate) fn last_prompt_tokens(&self, session_id: &str) -> Result<Option<u64>> {
+        let newest: Option<(Option<i64>, bool)> = self
+            .db()
+            .query_row(
+                "SELECT json_extract(r.calls_json, '$[#-1].usage.input_tokens'),
+                        EXISTS (SELECT 1 FROM runs s
+                                WHERE s.session_id = r.session_id AND s.status = 'ok'
+                                      AND s.last_seq < s.first_seq
+                                      AND s.started_at BETWEEN r.started_at AND r.ended_at
+                                      AND json_extract(s.calls_json, '$[0].purpose') = 'compaction')
+                        AND NOT EXISTS (SELECT 1 FROM compactions c
+                                        WHERE c.session_id = r.session_id
+                                              AND c.created_at >= r.started_at)
+                 FROM runs r
+                 WHERE r.session_id = ?1 AND r.status = 'ok' AND r.last_seq >= r.first_seq
+                       AND r.model_calls > 0
+                 ORDER BY r.started_at DESC, r.rowid DESC LIMIT 1",
+                [session_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(newest
+            .filter(|(_, unsaved)| !unsaved)
+            .and_then(|(tokens, _)| tokens)
+            .and_then(|t| u64::try_from(t).ok()))
+    }
+
     /// Add `messages` after the session's last row, in one transaction.
     ///
     /// With `expected_next`, refuses to write unless the next seq is still
@@ -988,6 +1189,15 @@ impl Store {
             .unwrap_or_default()
     }
 
+    /// What the memory has done so far this turn, leaving it in place. Call
+    /// with the session lock held.
+    pub(crate) fn peek_receipt(&self, session_id: &str) -> Receipt {
+        lock(&self.inner.receipts)
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     fn note(&self, session_id: &str, f: impl FnOnce(&mut Receipt)) {
         f(lock(&self.inner.receipts)
             .entry(session_id.to_string())
@@ -997,16 +1207,20 @@ impl Store {
     fn load_for_turn(&self, session_id: &str) -> Result<Vec<Message>> {
         // One read transaction, so the history and the next seq describe the
         // same moment even if another process is appending.
-        let (history, next) = {
+        let (visible, next) = {
             let db = self.db();
             let tx = db.unchecked_transaction()?;
             (
-                read_history(&tx, session_id)?,
+                read_visible(&tx, session_id)?,
                 next_seq_in(&tx, session_id)?,
             )
         };
-        self.note(session_id, |r| r.loaded_next = Some(next));
-        Ok(history)
+        self.note(session_id, |r| {
+            r.loaded_next = Some(next);
+            r.loaded = visible.seqs;
+            r.loaded_summary = visible.summarized;
+        });
+        Ok(visible.messages)
     }
 
     fn append_for_turn(
@@ -1154,6 +1368,7 @@ mod tests {
             [
                 "browser_links",
                 "browser_states",
+                "compactions",
                 "messages",
                 "runs",
                 "sandboxes",
@@ -1741,12 +1956,332 @@ mod tests {
             store.take_receipt(&id),
             Receipt {
                 loaded_next: Some(1),
+                loaded: vec![0],
+                loaded_summary: false,
                 appended: Some(Ok((1, 2))),
             }
         );
         // Taken, not copied: the next turn starts clean.
         assert_eq!(store.take_receipt(&id), Receipt::default());
         assert_eq!(store.load(&id).unwrap().len(), 3);
+    }
+
+    fn checkpoint(through_seq: i64, summary: &str) -> Checkpoint {
+        Checkpoint {
+            through_seq,
+            summary: summary.into(),
+            model: "test/summarizer".into(),
+            input_tokens: 50,
+            output_tokens: 7,
+            created_at: 3_000,
+        }
+    }
+
+    /// `n` messages, `m0` to `m{n-1}`, saved as seqs 0 to n-1.
+    fn with_messages(n: usize) -> (Store, String) {
+        let (store, _, id) = with_session();
+        let messages: Vec<Message> = (0..n).map(|i| Message::user(format!("m{i}"))).collect();
+        store.append(&id, None, &messages).unwrap();
+        (store, id)
+    }
+
+    #[tokio::test]
+    async fn a_checkpointed_session_loads_its_summary_and_the_rows_after_it() {
+        let (store, id) = with_messages(6);
+        assert!(
+            store
+                .save_checkpoint(&id, &checkpoint(3, "so far"))
+                .unwrap()
+        );
+        store.begin_turn(&id);
+
+        let loaded = store.memory().load(&id).await.unwrap();
+
+        assert_eq!(
+            loaded,
+            [
+                compaction::summary_message("so far"),
+                Message::user("m4"),
+                Message::user("m5"),
+            ]
+        );
+        // The summary has the seq of the last message it stands for, and the
+        // conflict check still compares against the database's next seq.
+        let receipt = store.peek_receipt(&id);
+        assert_eq!(receipt.loaded, [3, 4, 5]);
+        assert!(receipt.loaded_summary);
+        assert_eq!(receipt.loaded_next, Some(6));
+        // Peeking leaves it for the turn's end.
+        assert_eq!(store.take_receipt(&id), receipt);
+    }
+
+    #[tokio::test]
+    async fn a_compaction_hides_nothing_from_history_and_the_next_append() {
+        let (store, id) = with_messages(4);
+        store.save_checkpoint(&id, &checkpoint(2, "s")).unwrap();
+        let memory = store.memory();
+        store.begin_turn(&id);
+
+        memory.load(&id).await.unwrap();
+        memory
+            .append(&id, vec![Message::user("new")])
+            .await
+            .unwrap();
+
+        // Every original row is still there, and the new one follows them.
+        let history = store.load(&id).unwrap();
+        assert_eq!(history.len(), 5);
+        assert_eq!(history[0], Message::user("m0"));
+        assert_eq!(store.next_seq(&id).unwrap(), 5);
+        assert_eq!(store.take_receipt(&id).appended, Some(Ok((4, 4))));
+    }
+
+    #[tokio::test]
+    async fn the_newest_checkpoint_wins_and_an_unsummarized_session_has_none() {
+        let (store, id) = with_messages(5);
+        store.begin_turn(&id);
+        store.memory().load(&id).await.unwrap();
+        let before = store.take_receipt(&id);
+        assert_eq!(before.loaded, [0, 1, 2, 3, 4]);
+        assert!(!before.loaded_summary);
+
+        assert!(store.save_checkpoint(&id, &checkpoint(1, "first")).unwrap());
+        assert!(
+            store
+                .save_checkpoint(&id, &checkpoint(3, "second"))
+                .unwrap()
+        );
+        store.begin_turn(&id);
+        let loaded = store.memory().load(&id).await.unwrap();
+
+        assert_eq!(
+            loaded,
+            [compaction::summary_message("second"), Message::user("m4")]
+        );
+        assert_eq!(
+            newest_checkpoint(&store.db(), &id).unwrap(),
+            Some(checkpoint(3, "second"))
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_that_is_not_newer_changes_nothing() {
+        let (store, id) = with_messages(5);
+        assert!(store.save_checkpoint(&id, &checkpoint(3, "mine")).unwrap());
+
+        // Another process got to the same range, or a later one, first.
+        assert!(
+            !store
+                .save_checkpoint(&id, &checkpoint(3, "theirs"))
+                .unwrap()
+        );
+        assert!(!store.save_checkpoint(&id, &checkpoint(2, "older")).unwrap());
+
+        let db = store.db();
+        let rows: i64 = db
+            .query_row("SELECT COUNT(*) FROM compactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(
+            newest_checkpoint(&db, &id).unwrap().unwrap().summary,
+            "mine"
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_must_point_at_a_message_the_session_has() {
+        let (store, id) = with_messages(3);
+
+        for through_seq in [3, 40, -1] {
+            let err = store
+                .save_checkpoint(&id, &checkpoint(through_seq, "x"))
+                .unwrap_err();
+            assert!(err.to_string().contains("does not fit"), "{err}");
+        }
+        let err = store
+            .save_checkpoint("no-such-session", &checkpoint(0, "x"))
+            .unwrap_err();
+        assert!(err.to_string().contains("does not fit"), "{err}");
+        assert!(store.save_checkpoint(&id, &checkpoint(2, "x")).unwrap());
+    }
+
+    #[test]
+    fn a_checkpoint_may_not_hide_a_tool_call_from_its_result() {
+        let (store, _, id) = with_session();
+        let call = Message::Assistant {
+            id: None,
+            content: vec![rig_core::message::AssistantContent::tool_call(
+                "c1",
+                "add",
+                serde_json::json!({}),
+            )],
+        };
+        let messages = [
+            Message::user("add"),
+            call,
+            Message::tool_result("c1", "add", "3"),
+            Message::assistant("3"),
+        ];
+        store.append(&id, None, &messages).unwrap();
+
+        // Through the call, the first row the session loads would be its result.
+        let err = store.save_checkpoint(&id, &checkpoint(1, "x")).unwrap_err();
+        assert!(err.to_string().contains("without its call"), "{err}");
+        // Before the call, or after the result, is fine.
+        assert!(store.save_checkpoint(&id, &checkpoint(0, "x")).unwrap());
+        assert!(store.save_checkpoint(&id, &checkpoint(2, "y")).unwrap());
+    }
+
+    #[test]
+    fn a_checkpoint_before_a_row_that_is_not_a_message_is_refused() {
+        let (store, id) = with_messages(3);
+        store
+            .db()
+            .execute("INSERT INTO messages VALUES (?1, 3, 'not json')", [&id])
+            .unwrap();
+
+        assert!(store.save_checkpoint(&id, &checkpoint(2, "x")).is_err());
+        // The rows before it are fine to summarize.
+        assert!(store.save_checkpoint(&id, &checkpoint(1, "x")).unwrap());
+    }
+
+    #[test]
+    fn a_checkpoint_cannot_name_a_session_that_does_not_exist() {
+        let store = store();
+        let err = store
+            .db()
+            .execute(
+                "INSERT INTO compactions VALUES ('nope', 0, 's', 'm', 0, 0, 0)",
+                [],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("FOREIGN KEY"), "{err}");
+    }
+
+    fn run_with_calls(store: &Store, id: &str, run_id: &str, tweak: impl FnOnce(&mut RunRecord)) {
+        let mut run = run_record(run_id, id);
+        tweak(&mut run);
+        store.save_run(&run).unwrap();
+    }
+
+    #[test]
+    fn the_last_prompt_size_is_the_last_call_of_the_newest_run_that_saved_messages() {
+        let (store, _, id) = with_session();
+        assert_eq!(store.last_prompt_tokens(&id).unwrap(), None);
+
+        let calls = |sizes: &[u64]| {
+            let calls: Vec<_> = sizes
+                .iter()
+                .map(|n| serde_json::json!({"call_index": 0, "usage": {"input_tokens": n}}))
+                .collect();
+            serde_json::Value::Array(calls).to_string()
+        };
+        run_with_calls(&store, &id, "old", |r| r.calls_json = calls(&[10, 20]));
+        assert_eq!(store.last_prompt_tokens(&id).unwrap(), Some(20));
+
+        run_with_calls(&store, &id, "new", |r| {
+            r.started_at = 5_000;
+            r.calls_json = calls(&[100, 300, 700]);
+        });
+        // None of these says how big the session's context is: a run that
+        // failed, one that saved nothing (a compaction's summary), one
+        // that made no calls.
+        run_with_calls(&store, &id, "failed", |r| {
+            r.started_at = 6_000;
+            r.status = "error".into();
+            r.calls_json = calls(&[5]);
+        });
+        run_with_calls(&store, &id, "summary", |r| {
+            r.started_at = 7_000;
+            (r.first_seq, r.last_seq) = (4, 3);
+            r.calls_json = calls(&[9]);
+        });
+        run_with_calls(&store, &id, "nothing", |r| {
+            r.started_at = 8_000;
+            r.model_calls = 0;
+        });
+
+        assert_eq!(store.last_prompt_tokens(&id).unwrap(), Some(700));
+    }
+
+    #[test]
+    fn a_run_that_compacted_without_a_checkpoint_does_not_say_how_big_the_session_is() {
+        let (store, _, id) = with_session();
+        let calls = r#"[{"call_index": 0, "usage": {"input_tokens": 700}}]"#;
+        let summary_calls = r#"[{"purpose": "compaction"}]"#;
+        // A turn from 1 000 to 2 000 ms whose summary call began at 1 500: the
+        // 700 tokens its last call reported were for the summary and what it
+        // kept, not for the whole transcript.
+        run_with_calls(&store, &id, "turn", |r| r.calls_json = calls.into());
+        run_with_calls(&store, &id, "summary", |r| {
+            (r.started_at, r.ended_at) = (1_500, 1_600);
+            (r.first_seq, r.last_seq) = (0, -1);
+            r.calls_json = summary_calls.into();
+        });
+
+        // Nothing was saved for the summary, so the next load is the whole
+        // transcript and that number is no guide to it.
+        assert_eq!(store.last_prompt_tokens(&id).unwrap(), None);
+
+        // Once a checkpoint from that turn exists, the next load is the
+        // summary and the rows after it, which the number does describe.
+        store
+            .append(&id, None, &[Message::user("a"), Message::user("b")])
+            .unwrap();
+        let mut saved = checkpoint(0, "s");
+        saved.created_at = 1_500;
+        store.save_checkpoint(&id, &saved).unwrap();
+        assert_eq!(store.last_prompt_tokens(&id).unwrap(), Some(700));
+    }
+
+    #[test]
+    fn a_failed_summary_or_one_from_another_turn_leaves_the_prompt_size_alone() {
+        let (store, _, id) = with_session();
+        let calls = r#"[{"call_index": 0, "usage": {"input_tokens": 700}}]"#;
+        let summary_calls = r#"[{"purpose": "compaction"}]"#;
+        run_with_calls(&store, &id, "turn", |r| {
+            (r.started_at, r.ended_at) = (1_000, 2_000);
+            r.calls_json = calls.into();
+        });
+        // A summary that failed changed nothing the turn sent.
+        run_with_calls(&store, &id, "failed", |r| {
+            (r.started_at, r.ended_at) = (1_500, 1_600);
+            (r.first_seq, r.last_seq) = (0, -1);
+            r.status = "error".into();
+            r.calls_json = summary_calls.into();
+        });
+        // Nor did one from before the turn began or after it ended.
+        for (name, at) in [("before", 500), ("after", 2_500)] {
+            run_with_calls(&store, &id, name, |r| {
+                (r.started_at, r.ended_at) = (at, at + 100);
+                (r.first_seq, r.last_seq) = (0, -1);
+                r.calls_json = summary_calls.into();
+            });
+        }
+
+        assert_eq!(store.last_prompt_tokens(&id).unwrap(), Some(700));
+    }
+
+    #[test]
+    fn a_run_without_usage_says_nothing_about_the_prompt_size() {
+        let (store, _, id) = with_session();
+        run_with_calls(&store, &id, "r", |r| {
+            r.calls_json = r#"[{"call_index": 0}]"#.into();
+        });
+        assert_eq!(store.last_prompt_tokens(&id).unwrap(), None);
+
+        run_with_calls(&store, &id, "later", |r| {
+            r.started_at = 2_000;
+            r.calls_json = "[]".into();
+        });
+        assert_eq!(store.last_prompt_tokens(&id).unwrap(), None);
+    }
+
+    #[test]
+    fn the_prompt_size_of_a_session_with_no_runs_table_is_an_error() {
+        let (store, _, id) = with_session();
+        store.db().execute_batch("DROP TABLE runs").unwrap();
+        assert!(store.last_prompt_tokens(&id).is_err());
     }
 
     #[tokio::test]

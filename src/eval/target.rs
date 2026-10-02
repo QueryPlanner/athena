@@ -97,6 +97,8 @@ async fn in_process(
     user: &str,
     custom: &Custom,
 ) -> Result<Observation> {
+    // No compactor, on purpose: a cassette holds one model's calls, and a
+    // summary call would be one it never recorded. Evals do not compact.
     let service = Service::new(Store::open_in_memory()?, model_name, crate::cli::warn);
     let builder = AgentBuilder::new(model).memory(service.memory());
     // No sandbox and no MCP servers, on purpose: an eval is hermetic, so it

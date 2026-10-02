@@ -282,16 +282,30 @@ async fn a_closed_output_is_an_error_not_silently_dropped() {
 /// developer's shell. `env_remove` rather than `env_clear`, which would also
 /// drop the coverage profiler's variables.
 fn athena_in(dir: &WorkDir, db: Option<&TempDb>, list: &[&str]) -> std::process::Output {
+    athena_with(dir, db, list, &[])
+}
+
+/// [`athena_in`] with some variables set.
+fn athena_with(
+    dir: &WorkDir,
+    db: Option<&TempDb>,
+    list: &[&str],
+    vars: &[(&str, &str)],
+) -> std::process::Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_athena"));
     cmd.args(list)
         .current_dir(dir.path())
         .env_remove("ATHENA_DB")
         .env_remove("ATHENA_VERSION")
         .env_remove("OPENROUTER_API_KEY")
-        .env_remove("AGENT_MODEL");
+        .env_remove("AGENT_MODEL")
+        .env_remove("ATHENA_COMPACT_AT")
+        .env_remove("ATHENA_COMPACT_MODEL")
+        .env_remove("ATHENA_CONTEXT_TOKENS");
     if let Some(db) = db {
         cmd.env("ATHENA_DB", db.path());
     }
+    cmd.envs(vars.iter().copied());
     cmd.output().unwrap()
 }
 
@@ -325,6 +339,29 @@ fn the_binary_creates_a_migrated_database_on_first_use() {
         user_version(&tmp.raw()),
         athena::store::SCHEMA_VERSION as i64
     );
+}
+
+#[test]
+fn the_binary_refuses_a_compaction_setting_that_cannot_work() {
+    let tmp = TempDb::new();
+
+    for (var, value) in [
+        ("ATHENA_COMPACT_AT", "1.5"),
+        ("ATHENA_CONTEXT_TOKENS", "lots"),
+    ] {
+        let out = athena_with(&WorkDir::new(), Some(&tmp), &["sessions"], &[(var, value)]);
+
+        assert!(!out.status.success(), "{var}: {out:?}");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains(var) && stderr.contains(value), "{stderr}");
+    }
+    // Valid ones are fine.
+    let ok = [
+        ("ATHENA_COMPACT_AT", "0.5"),
+        ("ATHENA_CONTEXT_TOKENS", "200000"),
+    ];
+    let out = athena_with(&WorkDir::new(), Some(&tmp), &["sessions"], &ok);
+    assert!(out.status.success(), "{out:?}");
 }
 
 #[test]

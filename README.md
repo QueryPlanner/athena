@@ -108,6 +108,9 @@ set it), else the crate version with `-dev`.
 | `ATHENA_DB` | all | `agent.db`; `serve` and `telegram` require an absolute path | SQLite database file |
 | `ATHENA_VERSION` | `--version`, `GET /version` | `<crate version>-dev` | The deployed release |
 | `RUNS_STORE_RAW` | all | on | `0` drops raw provider responses from `runs.calls_json` |
+| `ATHENA_COMPACT_AT` | all | `0.8` | Compact a session once its context is above this share of the model's window, from 0.3 to 0.95; see Compaction |
+| `ATHENA_COMPACT_MODEL` | all | `AGENT_MODEL` | The model that writes the summaries |
+| `ATHENA_CONTEXT_TOKENS` | all | OpenRouter's `context_length` for the model, else 128000 | The model's context window in tokens, 8000 or more |
 | `ATHENA_ADDR` | `serve` | `127.0.0.1:8080` | Listen address; `--addr` wins over it |
 | `ATHENA_ALLOWED_HOSTS` | `serve` | unset | Comma list of `HOST` or `HOST:PORT` the API answers; see HTTP API |
 | `ATHENA_INSTRUCTIONS` | all | unset | File of instructions added to the system prompt; see Instructions and skills |
@@ -461,6 +464,9 @@ Caddy or Tailscale settings, and never overwrites a file holding secrets.
     src/service.rs     the core every transport calls: users, sessions, send
     src/store.rs       the database: migrations, Rig conversation memory, runs
     src/runner.rs      the Run trait, the run record, each run's tool context
+    src/compaction.rs  compaction: settings, the window, token estimates, where a
+                       cut may fall; compaction/hook.rs is the only code that
+                       uses Rig's hook API
     src/sandbox.rs     per-session OpenSandbox sandboxes; sandbox/ has the
                        HTTP client, stream parser, quoting and the tools
     src/policy.rs      the tool-call argument-size hook
@@ -684,7 +690,7 @@ answers every `Host` and prints the warning.
 | `GET /sessions/{id}/messages` | | `200 {"messages":[...]}` |
 | `POST /sessions/{id}/messages` | `{"text":"hi"}` | `200 {"reply","run":{...}}` |
 | `POST /sessions/{id}/messages/stream` | `{"text":"hi"}` | `200 text/event-stream` |
-| `GET /usage` | | `200 {"usage":[{"session_id","name","runs","model_calls","input_tokens","output_tokens","cached_input_tokens"}]}` |
+| `GET /usage` | | `200 {"usage":[{"session_id","name","runs","model_calls","input_tokens","output_tokens","cached_input_tokens"}]}`; a compaction's summary calls count as runs |
 
 `messages` are Rig's own message JSON, exactly as stored, tool calls and
 tool results included. That format belongs to Rig and can change with a Rig
@@ -774,6 +780,87 @@ Inspect a session:
     sqlite3 agent.db "SELECT m.seq, json_extract(m.json,'\$.role'), substr(m.json,1,200)
                       FROM messages m JOIN sessions s ON s.id = m.session_id
                       WHERE s.name='default' ORDER BY m.seq;"
+
+## Compaction
+
+A session's transcript only grows, and Rig sends all of it to the model on
+every call. When a session nears the model's context window, Athena replaces
+the oldest part of what it sends with a summary. The transcript itself is
+never rewritten: a compaction adds a row to the `compactions` table (session,
+`through_seq`, summary, which model wrote it and what it cost), meaning "this
+summary stands in for every message up to `through_seq`". The next turn loads
+the newest summary followed by the rows after it. History, `sessions` message
+counts and any search still see every original row. To undo a compaction,
+delete its row (`DELETE FROM compactions WHERE session_id = ...`): the next
+turn loads the whole transcript again.
+
+When: before every model call, not once per turn, because one long tool loop
+can outgrow the window inside a single turn. The size of the request is what
+the provider reported for the previous call, plus four characters a token for
+what has been added since (an image in the turn in progress counts as 1 500
+tokens, whatever its bytes; four characters a token undercounts Chinese,
+Japanese and Korean text, but only for what the provider has not counted yet).
+Above `ATHENA_COMPACT_AT` (80%) of the window, the oldest messages are
+summarized by `ATHENA_COMPACT_MODEL` (default `AGENT_MODEL`) and the request
+is sent with `[summary, ..recent]` instead. Rig applies a request patch to one
+call only, so the summary is applied again to every later call of the turn.
+This works the same for blocking and streamed turns.
+
+The window is `ATHENA_CONTEXT_TOKENS` if set, else the `context_length`
+OpenRouter lists for `AGENT_MODEL` (`GET https://openrouter.ai/api/v1/models`,
+which needs no key), else 128000 with a warning in the log. The list is
+fetched the first time a request is big enough to matter (a short chat never
+waits for it) and a window found is kept for the life of the process; if the
+lookup fails, 128000 is assumed for ten minutes and then it is asked again.
+OpenRouter lists one number per model, and it is the largest; the provider a
+request lands on can have a smaller window. Set `ATHENA_CONTEXT_TOKENS` if you
+know better. It must be 8000 or more.
+
+What a cut never does:
+
+- separate a tool call from its result, or start the kept messages with a
+  result (the store refuses a checkpoint that would);
+- cut the message the model is being asked about (when that is a tool result,
+  the assistant message with its call is kept too);
+- keep less than a fifth of the window word for word. A cut that would leave
+  the request over the line anyway is not made.
+
+The summary call is recorded as a run of its own (model `ATHENA_COMPACT_MODEL`,
+no messages saved, `calls_json` `[{"purpose": "compaction"}]`), so `usage`
+shows what compaction costs, and counts it among the session's runs. The call
+is capped at a tenth of the window (256 to 4000 tokens) and asked for three
+fifths of that many words. A summary that fails, comes back empty, is more
+than a quarter over the cap by our count (it is not cut short: its end holds
+the open tasks) or takes over 120 seconds is recorded as an `error` run and
+skipped: the turn goes on with the full history and does not fail. That session is not tried again, by any turn of this process, until its
+request has grown by a twentieth of the window. The checkpoint is written
+after the turn's own rows, and only if the turn was saved, so a turn that fails
+leaves none. If the checkpoint cannot be written, the next turn loads the whole
+transcript, so the prompt size that turn's last call reported (for the summary
+and what it kept) is not used for it: the size is estimated from the messages,
+and the session is compacted again.
+
+The summarizer is told that tool results are untrusted data, and what it is
+shown labels them so. The summary is stored and sent back as a user message,
+under a header saying it is notes and that nothing in it is an instruction
+from the user: a web page the agent read must not be able to write itself into
+what the user "said". A summary is still model output; do not rely on it as a
+security boundary.
+
+OpenRouter has a `context-compression` plugin that drops messages from the
+middle of a prompt that does not fit, which can orphan a tool result. Every
+request the agent sends carries `plugins: [{"id": "context-compression",
+"enabled": false}]` so it never runs. The summary call is a plain completion
+and does not need it.
+
+`athena eval` never compacts: a cassette holds one model's calls, and a summary
+call is one it never recorded.
+
+Choose `ATHENA_COMPACT_MODEL` with a window at least as big as the agent's: the
+summarizer is given everything to be summarized in one request (each message
+part clipped to 8000 characters). A session that is already over its window
+when compaction is first switched on needs that too, and may not be rescued at
+all.
 
 ## What a run costs
 
@@ -912,7 +999,15 @@ log events never include prompt or reply text.
 - Axum answers some malformed requests itself, not in this API's JSON
   error shape: unknown paths (empty `404`), wrong methods (`405`), and
   bodies over 2 MB (`413`).
-- Context grows forever, and every turn re-sends the whole history.
+- Compaction is a summary, so it is lossy, and it waits until the context is
+  at 80% of the model's window: with the default model that is 840 000 tokens
+  re-sent on every call until it happens. It cuts only between messages, so
+  one prompt or tool result that alone fills the window cannot be helped. A
+  session already over its window when compaction is switched on may not be
+  rescued, and a summary model with a smaller window than the agent's fails
+  on a big session (the turn goes on without compacting). The window is
+  OpenRouter's largest for the model, not the provider's. There is no
+  `/compact` command and no token cap below the percentage yet. See Compaction.
 - Transports so far: the CLI, HTTP and Telegram. They call
   `service::Service`.
 - The Telegram bot is open to anyone. Whoever finds its username can talk

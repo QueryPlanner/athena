@@ -20,7 +20,12 @@
 //! - [`Service::send_stream`] and [`Service::send_detached`] keep all of the
 //!   above, and run the turn in its own task once it holds the session, so
 //!   a caller that goes away mid-turn does not cancel it.
+//! - With a [`Compactor`] ([`Service::with_compactor`]), a turn that nears the
+//!   model's context window compacts the session. The checkpoint is saved
+//!   after the turn's own rows, and only if the turn was saved, so a failed
+//!   turn leaves none. The summary calls are recorded as runs either way.
 
+use crate::compaction::{Compactor, ContextHook, Outcome};
 use crate::runner::{self, Request, Run, RunStart, RunStream};
 use crate::store::{AppendError, SqliteMemory, Store, now_millis};
 use crate::{agent, telemetry};
@@ -106,6 +111,7 @@ pub struct Service {
     store: Store,
     model: String,
     warn: Warn,
+    compactor: Option<Arc<Compactor>>,
     /// How many spawned turns are running; see [`Service::idle`].
     in_flight: Arc<watch::Sender<usize>>,
 }
@@ -129,8 +135,22 @@ impl Service {
             store,
             model: model.into(),
             warn: Arc::new(warn),
+            compactor: None,
             in_flight: Arc::new(watch::Sender::new(0)),
         }
+    }
+
+    /// Compact sessions that near the model's window, as `compactor` says.
+    /// Without one, a session's whole transcript goes to the model every turn.
+    pub fn with_compactor(mut self, compactor: Option<Compactor>) -> Self {
+        self.compactor = compactor.map(Arc::new);
+        self
+    }
+
+    /// The hook that compacts one turn of `session`, if compaction is on.
+    fn context(&self, session: &Session) -> Option<ContextHook> {
+        let compactor = self.compactor.clone()?;
+        Some(ContextHook::new(compactor, self.store.clone(), &session.id))
     }
 
     /// The memory to build this service's agent with:
@@ -217,7 +237,9 @@ impl Service {
         let request = request.into();
         let (session, lock) = self.claim(user, session_id, &request).await?;
         let span = turn_span(user, &session);
-        self.complete(&session, lock, agent.run(&request, &session.id))
+        let context = self.context(&session);
+        let run = agent.run(&request, &session.id, context.clone());
+        self.complete(&session, lock, context, run)
             .instrument(span)
             .await
     }
@@ -240,10 +262,11 @@ impl Service {
         let (session, lock) = self.claim(user, session_id, &request).await?;
         let span = turn_span(user, &session);
         let service = self.clone();
+        let context = self.context(&session);
         self.spawn(
             async move {
-                let run = agent.run(&request, &session.id);
-                service.complete(&session, lock, run).await
+                let run = agent.run(&request, &session.id, context.clone());
+                service.complete(&session, lock, context, run).await
             }
             .instrument(span),
         )
@@ -275,13 +298,15 @@ impl Service {
         let span = turn_span(user, &session);
         let (events, receiver) = mpsc::unbounded_channel();
         let (service, text) = (self.clone(), text.to_string());
+        let context = self.context(&session);
         // The handle is not needed: the task reports through `events`, and a
         // panic in it closes the channel without a `Done`.
         drop(
             self.spawn(
                 async move {
-                    let run = relay(agent.stream(&text, &session.id), &events);
-                    let outcome = service.complete(&session, lock, run).await;
+                    let streamed = agent.stream(&text, &session.id, context.clone());
+                    let run = relay(streamed, &events);
+                    let outcome = service.complete(&session, lock, context, run).await;
                     // The receiver may be gone; the turn is saved either way.
                     let _ = events.send(TurnEvent::Done(outcome));
                 }
@@ -331,11 +356,13 @@ impl Service {
     }
 
     /// Run a claimed turn and record it. `run` must not touch the memory
-    /// before it is first polled; see [`RunStream`].
+    /// before it is first polled; see [`RunStream`]. `context` is the hook
+    /// `run` was given, which is where the turn's compaction is read from.
     async fn complete(
         &self,
         session: &Session,
         _lock: SessionLock,
+        context: Option<ContextHook>,
         run: impl Future<Output = Result<PromptResponse, PromptError>>,
     ) -> Result<Turn, Error> {
         self.store.begin_turn(&session.id);
@@ -365,7 +392,42 @@ impl Service {
         if let Err(e) = self.store.call(move |s| s.save_run(&row)).await {
             (self.warn)(&format!("run telemetry not saved: {e}"));
         }
+        if let Some(context) = context {
+            self.record_compaction(&session.id, first_seq, reply.is_ok(), context.finish())
+                .await;
+        }
         reply.map(|reply| Turn { reply, run })
+    }
+
+    /// Record what a turn's compaction did. The summary calls were paid for
+    /// whatever became of the turn, so each is a run. The newest summary
+    /// becomes the session's checkpoint only if the turn was saved: the rows
+    /// it points at are the turn's own, so they must exist.
+    async fn record_compaction(
+        &self,
+        session_id: &str,
+        first_seq: i64,
+        saved: bool,
+        outcome: Outcome,
+    ) {
+        for call in &outcome.summaries {
+            let id = uuid::Uuid::new_v4().to_string();
+            let row = call.record(session_id, id, first_seq);
+            if let Err(e) = self.store.call(move |s| s.save_run(&row)).await {
+                (self.warn)(&format!("compaction telemetry not saved: {e}"));
+            }
+        }
+        let Some(checkpoint) = outcome.checkpoint.filter(|_| saved) else {
+            return;
+        };
+        let id = session_id.to_string();
+        if let Err(e) = self
+            .store
+            .call(move |s| s.save_checkpoint(&id, &checkpoint))
+            .await
+        {
+            (self.warn)(&format!("compaction not saved: {e:#}"));
+        }
     }
 }
 
@@ -1299,7 +1361,7 @@ mod tests {
     struct Truncated;
 
     impl RunStream for Truncated {
-        async fn stream(&self, _: &str, _: &str) -> StreamingResult {
+        async fn stream(&self, _: &str, _: &str, _: Option<ContextHook>) -> StreamingResult {
             Box::pin(futures_util::stream::empty())
         }
     }
