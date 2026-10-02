@@ -176,11 +176,19 @@ bot collects them until 2 seconds pass with no new one, then runs one turn
 for all of them, with the album's caption as the text. See "Images and
 files" below.
 
-While the model works the bot shows "typing...". A reply longer than
-Telegram's 4096-character limit is split, at a line break if there is one
-near the limit, else at a space, never inside a character; at most 8
-messages, then a note that the rest is in the transcript. A 429 from
-Telegram is retried after the delay it asks for.
+While the model works the bot shows "typing...". The model writes Markdown
+and the bot renders it for Telegram: bold, italic, strikethrough, `code`,
+fenced code with its language, links, blockquotes, headings (bold),
+bullet and numbered lists, and tables (an aligned grid in a code block).
+It sends plain text plus Telegram's formatting entities, never a parse mode,
+so a stray `*` or `_` in a reply stays as written and cannot make Telegram
+refuse the message. If Telegram answers "Bad Request" to a formatted
+message, that message is sent again as plain text. A reply longer than
+Telegram's 4096-character limit is split, at a blank line if there is one
+near the limit, else a line break, else a space, never inside a character,
+and a code block or a style that crosses the cut is closed and reopened in
+the next message; at most 8 messages, then a note that the rest is in the
+transcript. A 429 from Telegram is retried after the delay it asks for.
 
 Each turn runs in its own task, so a slow model never holds up another user.
 One user gets one turn at a time: a message that arrives while their turn is
@@ -1032,6 +1040,19 @@ log events never include prompt or reply text.
   SIGKILL, which cannot be caught and loses those turns: raise the grace
   period (`docker stop -t`, `stop_grace_period`, `TimeoutStopSec`) to cover
   a slow tool-using turn.
+- Telegram messages have no headings, lists or tables, so Markdown is
+  approximated, not reproduced: a heading is bold text, a list is `•` or
+  numbered lines, a table is monospace (and one wider than 60 columns is a
+  `Header: value` block per row, since a grid that wide does not fit a
+  phone). Telegram does not let `code`, links or blockquotes contain other
+  formatting, so bold code is code only, and code or a table inside a quote
+  loses its monospace styling. A link inside a quote or a table cell, and a
+  link whose address is not http, https or mailto (`#section`, a relative
+  path), is shown as `text (address)` and is not tappable. Telegram's
+  documented nesting rules are followed to the letter; clients may accept
+  more, but that is not checked here. Raw HTML is shown as written. Table widths use an
+  approximation of Unicode's East Asian Width, so some emoji and rare
+  scripts can misalign a grid.
 - Edited messages, stickers, voice notes and other messages that are neither
   text, a photo nor a file are not prompts. Edits are ignored; the rest get
   "I read text, photos and files, not this kind of message."

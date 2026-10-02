@@ -24,6 +24,9 @@ opentelemetry-appender-tracing = "0.33.0"
 opentelemetry-http = { version = "0.33.0", default-features = false }
 opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "logs"] }
 opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["trace", "logs"] }
+# Parses the model's Markdown for Telegram (src/telegram/render.rs). Only the
+# parser is used, so the HTML renderer and the CLI option parser stay off.
+pulldown-cmark ={ version = "0.13.4", default-features = false }
 regex = "1.13.1"
 # The same version and features teloxide already builds, so no new code is compiled.
 # Used by the sandbox client, evals and bench.
