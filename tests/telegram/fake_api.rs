@@ -289,6 +289,11 @@ async fn handle(
     if let Some(error) = fault {
         return Json(error);
     }
+    if method == "sendMessage"
+        && let Some(why) = refusal(&body)
+    {
+        return Json(json!({"ok": false, "error_code": 400, "description": why}));
+    }
     let result = match method.as_str() {
         "getMe" => {
             let mut me = bot_user();
@@ -337,6 +342,63 @@ async fn handle(
         _ => json!(true),
     };
     Json(json!({"ok": true, "result": result}))
+}
+
+/// Why the real Bot API would refuse this `sendMessage`, as its error
+/// description, or `None` if it would send it. Checks what Telegram's docs
+/// require: the text fits 4096 UTF-16 units after parsing, and every entity
+/// is non-empty, in range, does not end in whitespace, and nests with the
+/// others as "Formatting options" says. A bot that sends such a message
+/// fails its test instead of silently falling back to plain text.
+fn refusal(body: &Value) -> Option<String> {
+    let text: Vec<u16> = body["text"].as_str()?.encode_utf16().collect();
+    if text.len() > 4096 {
+        return Some("Bad Request: message is too long".into());
+    }
+    let bad = |why: String| Some(format!("Bad Request: can't parse entities: {why}"));
+    let entities = body.get("entities").and_then(Value::as_array)?;
+    let spans: Vec<(&str, usize, usize)> = entities
+        .iter()
+        .map(|e| {
+            let start = e["offset"].as_u64().unwrap() as usize;
+            let end = start + e["length"].as_u64().unwrap() as usize;
+            (e["type"].as_str().unwrap(), start, end)
+        })
+        .collect();
+    for &(kind, start, end) in &spans {
+        if start >= end || end > text.len() {
+            return bad(format!("{kind} at {start}..{end} is empty or out of range"));
+        }
+        let last = char::from_u32(u32::from(text[end - 1]));
+        if last.is_some_and(char::is_whitespace) {
+            return bad(format!("{kind} at {start}..{end} ends in whitespace"));
+        }
+    }
+    let style = |k: &str| ["bold", "italic", "underline", "strikethrough", "spoiler"].contains(&k);
+    let mono = |k: &str| k == "code" || k == "pre";
+    // Whether `outer` may contain `inner`.
+    let allowed = |outer: &str, inner: &str| {
+        if mono(outer) {
+            false
+        } else if style(outer) {
+            !mono(inner)
+        } else {
+            style(inner)
+        }
+    };
+    for (i, &(a, a0, a1)) in spans.iter().enumerate() {
+        for &(b, b0, b1) in &spans[i + 1..] {
+            if a1 <= b0 || b1 <= a0 {
+                continue;
+            }
+            let a_holds_b = a0 <= b0 && b1 <= a1 && allowed(a, b);
+            let b_holds_a = b0 <= a0 && a1 <= b1 && allowed(b, a);
+            if !a_holds_b && !b_holds_a {
+                return bad(format!("{a} {a0}..{a1} and {b} {b0}..{b1} cannot overlap"));
+            }
+        }
+    }
+    None
 }
 
 /// The message a send method answers with, before its content.

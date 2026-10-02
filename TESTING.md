@@ -122,8 +122,17 @@ downloadable (`getFile`, then `/file/bot<token>/<path>`), and
 `media_from(user, ("photo", photo_sizes(id, size)), caption)` sends it.
 Uploads (`sendPhoto`, `sendDocument`) are multipart; the fake records each
 file part as `{"file_name", "bytes"}`, resolving teloxide's `attach://`
-references. The decision logic in `src/telegram.rs` is unit-tested through
-the `Chat` trait with a recording chat, so most cases need no server.
+references. The fake refuses a `sendMessage` the real Bot API would refuse,
+with a 400 "can't parse entities": text over 4096 UTF-16 units, an entity
+that is empty, out of range or ends in whitespace, or entities that overlap
+without nesting or nest where Telegram forbids it. A formatting bug
+therefore shows as a plain-text resend, which the tests assert did not
+happen. `api.messages_to` returns texts; read `Call::body["entities"]` for
+the formatting. The decision logic in `src/telegram.rs` is unit-tested
+through the `Chat` trait with a recording chat, so most cases need no
+server, and `src/telegram/render.rs` is pure and tested on its own: fixtures
+per construct, plus every short combination of Markdown pieces checked
+against Telegram's entity rules.
 
 `tests/sandbox/fake_server.rs` does not run commands, with one exception:
 a command containing `'screenshot' '--annotate' '<path>'` writes a small PNG
@@ -332,6 +341,13 @@ throwaway database.
 8. Ask for something long (`Write 6000 words about rivers.`): it arrives in
    several messages, none cut mid-word unless a word is longer than a
    message.
+   8a. Ask for formatting (`Reply with a heading, bold and italic text, a
+   bullet list, a Python code block, a table and a link.`): the heading and
+   bold are bold, the code block is monospace with a copy button, the table
+   is an aligned monospace grid, the link is tappable, and no `**` or `#`
+   shows. Then ask for a 300-line code block: it continues in a second
+   message, monospace in both. This is the one check no fake can make: it
+   shows how real clients render the entities.
 9. Press Ctrl-C, start the bot again, send `/sessions`: `default` is still
    marked. `/usage` lists both sessions.
 10. Add the bot to a group and send a message there: the bot says nothing,
