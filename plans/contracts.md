@@ -295,11 +295,21 @@ Setup B: no collector. Athena exports itself, to two independent sinks.
   `deployment.environment.name`). Logs: `time_unix_nano`, `severity`,
   `severity_number`, `target`, `body`, `trace_id`, `span_id`, `attributes`,
   `scope`, `resource`. `analytics/queries/spans.sql` reads this schema.
-- For `ATHENA_ENV=prod`, `gen_ai.input.messages`, `gen_ai.output.messages`,
+- Every environment exports everything, with no switch (PR #21): prompts,
+  replies, the system prompt and tool arguments and results
+  (`gen_ai.input.messages`, `gen_ai.output.messages`,
   `gen_ai.system_instructions`, `gen_ai.tool.call.arguments`,
-  `gen_ai.tool.call.result`, `gen_ai.prompt` and `gen_ai.completion` are
-  removed from spans and span events before either sink, and log events
-  carrying them are not exported.
+  `gen_ai.tool.call.result`, `gen_ai.prompt`) stay on spans and log events.
+  The one exception is on spans and span events: base64 runs over 1024
+  characters are replaced (`telemetry::Redacted` wraps the span exporter
+  only). Log records are exported as they are, so a long base64 value in a
+  log field reaches OpenObserve and the JSONL log files whole.
+- Staging and prod share one OpenObserve organization (`default`) and its
+  default streams. What tells them apart is the resource attribute
+  `deployment.environment.name`, from `ATHENA_ENV`. OpenObserve turns dots in
+  attribute names into underscores: filter traces on
+  `service_deployment_environment_name` and logs on
+  `deployment_environment_name`.
 - Each turn gets an Athena `invoke_agent` span carrying `gen_ai.conversation.id`,
   `athena.run_id`, `athena.transport`, and `enduser.pseudo.id` (a hash).
 - rig's own spans nest under it.
