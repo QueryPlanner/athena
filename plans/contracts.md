@@ -46,11 +46,49 @@ Rules for `serve` and `telegram`:
 | `ATHENA_SANDBOX_IMAGE` | agent | default `ghcr.io/queryplanner/athena-sandbox:latest` |
 | `ATHENA_SANDBOX_TIMEOUT_SECS` | agent | default `1800`, minimum 60 |
 | `ATHENA_PUBLIC_URL` | agent | base of sign-in links, e.g. `http://100.124.202.79:18080`; default `http://$ATHENA_ADDR` (so `serve` and `telegram` agree from the one env file). Must be http(s); required when `ATHENA_ADDR` is unspecified (`0.0.0.0`, `[::]`). |
+| `ATHENA_MCP_CONFIG` | agent | path of an `mcp.json` (section "MCP servers"). **Unset means no MCP tools**, and no default path is searched. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | all | OTLP/HTTP base URL; on the VM OpenObserve, `http://<tailnet-ip>:5080/api/default` (`/v1/traces` and `/v1/logs` are appended). **Unset means no OTLP export.** |
 | `OTEL_EXPORTER_OTLP_HEADERS` | all | `Authorization=Basic%20<base64 of OpenObserve root email:password>`, written by `setup-host.sh` into the env file only |
 | `ATHENA_TELEMETRY_DIR` | all | e.g. `/var/lib/athena/<env>/telemetry`: daily `traces-<role>-YYYYMMDD.jsonl` and `logs-<role>-YYYYMMDD.jsonl`, `<role>` being the process (`serve`, `telegram`, `cli`), so every file has one writer. **Unset means no files.** With neither this nor the endpoint, telemetry is off and logs go to stderr only. |
 | `ATHENA_TELEMETRY_RETENTION_DAYS` | all | default `30`; files of older days are deleted |
 | `OTEL_SERVICE_NAME` | all | default `athena` |
+
+## MCP servers
+
+`ATHENA_MCP_CONFIG` names a JSON file, `{"mcpServers": {NAME: ENTRY}}`, the shape
+Claude Code and Claude Desktop use (`src/mcp.rs`).
+
+| Entry field | Meaning |
+|---|---|
+| `command`, `args`, `env` | stdio server, a child process on the host (not in the sandbox) |
+| `url`, `headers` | streamable-HTTP server (legacy SSE is refused) |
+| `type` | optional `stdio`, `http` or `streamable-http`; must match the entry |
+| `disabled` | `true` leaves the server out |
+| `timeoutSecs` | per tool call, default 120 |
+| `startupTimeoutSecs` | start, handshake and tool listing, default 60 |
+
+- `${VAR}` and `${VAR:-default}` are expanded in `args`, `env` values and
+  `headers` values from athena's environment, never in `url`; `$${` is a literal
+  `${`. An unset variable without a default skips that server with a warning
+  naming the variable. No value is logged, and warnings show a URL as scheme,
+  host and port only.
+- A stdio child's environment is its `env` plus `PATH` and `HOME` from athena.
+- Servers connect at startup (`serve`, `telegram`) or on the CLI's first turn.
+  A server that fails is a warning; its tools are missing.
+- One connection per server serves every user and session of the process.
+- A tool keeps its server's name. A name that a built-in tool
+  (`agent::reserved_tool_names`: `add`, `read_skill`, the sandbox tools) or an earlier server (name order) has, that
+  is not 1 to 64 of `[A-Za-z0-9_-]`, or an input schema that is not of type
+  object, is skipped with a warning, as are a server's tools past the first
+  `MAX_TOOLS_PER_SERVER`. Descriptions are cut to `MAX_DESCRIPTION_BYTES`.
+- `ToolPolicy` (`src/policy.rs`) applies by tool name: arguments over
+  `MAX_ARGUMENT_BYTES` are not sent, MCP tools' results are cut to
+  `MAX_RESULT_BYTES` in all (blocks kept in order, an image or empty block costs
+  1 byte, the rest dropped, one notice appended), and at most
+  `media::MAX_IMAGES_PER_REQUEST` images are kept, none over `media::MAX_IMAGE_BYTES`.
+- Rust API: `agent::connect_mcp(warn) -> Mcp`, `agent::build(.., &Mcp)`,
+  `agent::build_with(.., &Mcp)`, `agent::configure_with_mcp(.., &Mcp)`, then
+  `Mcp::shutdown().await` when the process ends.
 
 ## HTTP
 

@@ -34,6 +34,21 @@ pub const DOCUMENT_LIMIT: usize = 50 * 1024 * 1024;
 /// Telegram's limit on a caption, in characters.
 pub const CAPTION_LIMIT: usize = 1024;
 
+/// The name of every tool [`register`] adds. `agent::reserved_tool_names`
+/// keeps MCP tools from taking these, and a test there fails if a tool is
+/// registered without being listed here.
+pub const NAMES: [&str; 9] = [
+    Shell::NAME,
+    RunCode::NAME,
+    ReadFile::NAME,
+    WriteFile::NAME,
+    AgentBrowser::NAME,
+    BrowserLoginLink::NAME,
+    ViewImage::NAME,
+    SendPhoto::NAME,
+    SendFile::NAME,
+];
+
 /// Add every sandbox tool to an agent.
 pub fn register(
     builder: AgentBuilder<WithBuilderTools>,

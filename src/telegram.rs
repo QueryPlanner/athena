@@ -1228,7 +1228,8 @@ pub async fn main(model: &str) -> Result<()> {
     let store = Store::open(&store::path())?;
     let service = Arc::new(Service::new(store.clone(), model, log_warning));
     let sandboxes = agent::sandboxes_from_env(&store)?;
-    let agent = agent::build_with(&client, model, service.memory(), sandboxes.clone());
+    let mcp = agent::connect_mcp(&log_warning).await;
+    let agent = agent::build_with(&client, model, service.memory(), sandboxes.clone(), &mcp);
     let app =
         Arc::new(Telegram::new(service, store, agent, Arc::new(log_warning)).sandboxes(sandboxes));
     let bot = config.bot();
@@ -1238,7 +1239,9 @@ pub async fn main(model: &str) -> Result<()> {
         transport = TRANSPORT,
         "polling for messages; Ctrl-C or SIGTERM stops"
     );
-    serve(&mut dispatcher, bot, &app).await
+    let result = serve(&mut dispatcher, bot, &app).await;
+    mcp.shutdown().await;
+    result
 }
 
 #[cfg(test)]

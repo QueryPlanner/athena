@@ -120,7 +120,7 @@ pub(crate) fn preview(text: &str) -> String {
 
 /// The longest prefix of `text` within `limit` bytes that ends on a char
 /// boundary, and how many bytes were left out.
-fn split_at_boundary(text: &str, limit: usize) -> (&str, usize) {
+pub(crate) fn split_at_boundary(text: &str, limit: usize) -> (&str, usize) {
     if text.len() <= limit {
         return (text, 0);
     }
