@@ -2,7 +2,9 @@
 
 use anyhow::Result;
 use athena::service::Service;
-use athena::{agent, bench, cli, dotenv, eval, http, ops, shutdown, store, telegram, telemetry};
+use athena::{
+    agent, bench, cli, custom, dotenv, eval, http, ops, shutdown, store, telegram, telemetry,
+};
 use std::sync::Arc;
 
 fn main() -> Result<()> {
@@ -34,7 +36,10 @@ async fn run(args: Vec<String>) -> Result<()> {
     let mut stdout = std::io::stdout();
     match args.split_first() {
         Some((cmd, rest)) if cmd == "eval" => {
-            return eval::main(rest, &model, agent::provider_model, &mut stdout).await;
+            // The same instructions and skills the agent runs with, so an
+            // eval grades and records that agent. Read here, at the edge.
+            let custom = custom::Custom::from_env();
+            return eval::main(rest, &model, agent::provider_model, &custom, &mut stdout).await;
         }
         Some((cmd, rest)) if cmd == "bench" => return bench::main(rest, &mut stdout).await,
         _ => {}

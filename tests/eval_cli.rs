@@ -4,6 +4,7 @@
 
 mod common;
 
+use athena::custom::Custom;
 use athena::eval::{self, report};
 use athena::service::Service;
 use athena::store::Store;
@@ -32,7 +33,8 @@ async fn run_with(
     model: impl Fn(&str) -> anyhow::Result<MockCompletionModel>,
 ) -> (anyhow::Result<()>, String) {
     let mut out = Vec::new();
-    let result = eval::main(&args(list), "agent/model", model, &mut out).await;
+    let custom = Custom::default();
+    let result = eval::main(&args(list), "agent/model", model, &custom, &mut out).await;
     (result, String::from_utf8(out).unwrap())
 }
 
@@ -411,6 +413,8 @@ fn athena(list: &[&str]) -> std::process::Output {
         .env_remove("ATHENA_DB")
         .env_remove("OPENROUTER_API_KEY")
         .env_remove("ATHENA_JUDGE_MODEL")
+        .env_remove("ATHENA_INSTRUCTIONS")
+        .env_remove("ATHENA_SKILLS_DIR")
         .output()
         .unwrap()
 }

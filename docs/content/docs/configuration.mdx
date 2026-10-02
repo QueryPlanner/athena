@@ -17,6 +17,8 @@ works. A malformed `.env` stops athena before it touches the database.
 | `RUNS_STORE_RAW` | all | on | `0` drops raw provider responses from `runs.calls_json` |
 | `ATHENA_ADDR` | `serve` | `127.0.0.1:8080` | Listen address; `--addr` wins over it |
 | `ATHENA_ALLOWED_HOSTS` | `serve` | unset | Comma list of `HOST` or `HOST:PORT` the API answers; see [HTTP API](/docs/http-api) |
+| `ATHENA_INSTRUCTIONS` | all | unset | File of instructions added to the system prompt; see [Instructions and skills](/docs/instructions-and-skills) |
+| `ATHENA_SKILLS_DIR` | all | unset | Directory of Agent Skills; see [Instructions and skills](/docs/instructions-and-skills) |
 | `TELEGRAM_BOT_TOKEN` | `telegram` | none, required | Bot token from @BotFather |
 | `TELEGRAM_API_URL` | `telegram` | `https://api.telegram.org` | Bot API server; the tests point it at a fake one |
 

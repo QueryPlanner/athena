@@ -1,0 +1,143 @@
+---
+title: Instructions and skills
+description: Change how the agent behaves with two files, no Rust.
+---
+
+Two optional settings change the agent without touching `src/agent.rs`:
+
+| Variable | Meaning |
+|---|---|
+| `ATHENA_INSTRUCTIONS` | Path of a text file. Its text goes into the system prompt after the built-in preamble, under `## Custom instructions`. |
+| `ATHENA_SKILLS_DIR` | Path of a directory of skills in the [Agent Skills](https://agentskills.io/specification) format. |
+
+Both are read once, when the agent is built. Restart to pick up an edit.
+
+## Instructions
+
+A plain text or Markdown file, at most 16 KiB. A larger file is ignored, not
+cut short, because half a set of instructions can mean something else. A
+file that is empty or only whitespace adds nothing.
+
+## Skills
+
+A skill is a directory holding a `SKILL.md`:
+
+```
+skills/
+  pdf-processing/
+    SKILL.md
+  release-notes/
+    SKILL.md
+```
+
+```markdown
+---
+name: pdf-processing
+description: Extracts text and tables from PDFs and fills forms. Use when the user mentions PDFs.
+---
+
+# Steps
+
+1. ...
+```
+
+The model sees each skill's name and description in its system prompt. When
+a task matches, it calls `read_skill` with the name and gets the text below
+the front matter. Only `SKILL.md` is read. A skill's `scripts/`,
+`references/` and `assets/` are not served and not copied into the sandbox.
+`read_skill` exists only when at least one skill loaded.
+
+### What is checked
+
+The rules are the specification's:
+
+- `name`: 1 to 64 characters, lowercase letters, digits and hyphens, no
+  hyphen at either end or two in a row, and equal to the directory name.
+  Letters may be any Unicode lowercase letter, as the specification says.
+  Athena compares the name and the directory name as written, with no Unicode
+  normalization (the specification's reference validator applies NFKC), so
+  use the same form in both.
+- `description`: 1 to 1 024 characters. Whitespace, including line breaks,
+  is collapsed to single spaces in the listing.
+- `compatibility`: 1 to 500 characters when present.
+- `license`, `metadata` (a map of strings), `allowed-tools`: accepted and not
+  acted on. Athena does not grant tools from `allowed-tools`.
+- Any other front matter key is ignored.
+
+Front matter is parsed without a YAML library, so only the subset the
+specification uses is understood: `key: value` lines (plain, quoted, or a
+`|` or `>` block), indented plain continuation lines, `metadata:` with
+indented string values, and full-line `#` comments, indented or not. As in
+YAML, a comment line ends a multi-line plain value, and text after it makes
+the skill invalid; inside a `|` or `>` block a line starting with `#` is
+content, not a comment. A value on a known key that does not fit, such as a
+nested map under `metadata`, makes the skill invalid. Two deliberate
+differences from YAML: a `#` inside a value is kept, and a plain value may
+contain `: `.
+
+### Limits
+
+| Limit | Value | What happens past it |
+|---|---|---|
+| `ATHENA_INSTRUCTIONS` file | 16 KiB | ignored, with a warning |
+| one `SKILL.md`, front matter included | 64 KiB | that skill is skipped |
+| the skills listing in the prompt | 16 KiB | the skill that crosses it and every later one (in name order) are not loaded |
+| skills loaded | 64 | the 65th and every later one are not loaded |
+| entries examined in the skills directory (files and links count) | 256 | the scan stops; the rest are not examined |
+
+Skills past a limit are not read, so they produce no validation warnings
+either; the one warning names the first skill left out. The entry limit is
+applied while the directory is read, so a directory with a million files
+costs the same as one with 256. Which entries are examined past the limit is
+up to the file system and can differ between starts; the skills that did
+load are always listed in name order. Together the limits
+bound what the skills add to memory and to every prompt.
+
+The specification recommends a `SKILL.md` under 500 lines. Put long
+reference material in other files and tell the model to ask for it.
+
+### When something is wrong
+
+Nothing here stops the agent from starting. A missing path, an unreadable or
+oversized file, or an invalid skill is logged as a warning, naming the skill
+and the reason, and left out. Control characters in a name are written out as
+escapes in the warning. Neither setting may point at a named pipe or other
+special file. Valid skills still load. A directory entry that
+is not a directory (a README), a hidden entry (`.git`) and a broken symlink
+are ignored without a warning.
+
+## Evals
+
+`athena eval record` and `athena eval run --target replay` build the agent
+with the same two settings, so an eval grades the agent that runs. The
+judge (`--judge`) is a bare model and does not get them. Replay serves the
+recorded replies and compares only the last message and that each recorded
+tool call is still offered, so changing instructions does not make a cassette
+drift, and it also does not change what the replayed model says: re-record a
+case to see how the model treats new instructions or skills. A cassette
+recorded with skills calls `read_skill`, so replaying it needs the same
+`ATHENA_SKILLS_DIR`, or it reports trajectory drift. Cases against a URL
+(`--target http://...`) run whatever that server was started with.
+
+## Trust
+
+<Callout type="warn">
+  Instructions and skills are code-equivalent. The model follows them with
+  the same authority as the built-in preamble, and a skill can tell it to run
+  shell commands, send files or browse. Only install skills you have read.
+  They are local files: Athena has no skill registry and never fetches a skill
+  from the network.
+</Callout>
+
+- `read_skill` returns only what was loaded at startup. It looks the name up
+  in that set and never builds a path from it, so `../secret` or an absolute
+  path finds nothing.
+- The skills section of the prompt tells the model that a skill, unlike a web
+  page or a file it opens, is not untrusted. That is why only skills you put
+  in the directory should be there.
+- Each `SKILL.md` is resolved to its real path when loaded, and a skill whose
+  file is a symlink to somewhere outside the skills directory is refused. A
+  symlink that stays inside the directory works.
+- The instructions and the skills list are part of the system prompt.
+  Telemetry exports prompts, so anything in these files reaches your trace
+  and log backends. Put no secrets in them.

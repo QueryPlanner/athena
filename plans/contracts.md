@@ -39,6 +39,8 @@ Rules for `serve` and `telegram`:
 | `ATHENA_VERSION` | all | version string, written by deploy-gate (`<git-sha>` or `v1.2.3+<sha>`) |
 | `ATHENA_ENV` | all | `staging` \| `prod` \| unset (dev). Becomes OTel `deployment.environment.name`. |
 | `OPENROUTER_API_KEY`, `AGENT_MODEL`, `RUNS_STORE_RAW`, `TELEGRAM_BOT_TOKEN` | existing | unchanged |
+| `ATHENA_INSTRUCTIONS` | agent | optional path of a text file (at most 16 KiB, `custom::MAX_INSTRUCTIONS_BYTES`), appended to the base preamble after `## Custom instructions`. Unset or unusable means none (a warning is logged). |
+| `ATHENA_SKILLS_DIR` | agent | optional path of a directory of Agent Skills (`<name>/SKILL.md`, https://agentskills.io/specification), loaded once at startup. Each valid skill is listed in the preamble after `## Skills`, and `read_skill(name)` is registered when at least one loads. Invalid skills are skipped with a warning. Limits: 64 KiB per `SKILL.md`, 64 skills, 16 KiB of listing, 256 directory entries of any kind examined, the scan stopping there; which ones past that is up to the file system (`custom::skills`). |
 | `OPEN_SANDBOX_URL` | agent | e.g. `http://100.118.54.67:9090`. **Unset means the sandbox tools are not registered** (dev and tests keep working). |
 | `OPEN_SANDBOX_API_KEY` | agent | optional; sent as the `OPEN-SANDBOX-API-KEY` header when set |
 | `ATHENA_SANDBOX_IMAGE` | agent | default `ghcr.io/queryplanner/athena-sandbox:latest` |

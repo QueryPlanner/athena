@@ -1,0 +1,21 @@
+{
+  "eval_case_id": "skill_read_on_demand",
+  "kind": "trajectory",
+  "tags": ["skills", "live"],
+  "turns": [
+    "Draft a release note for version 1.2: it adds dark mode and fixes a login crash. Use our house style."
+  ],
+  "expect": {
+    "trajectory": {
+      "mode": "ordered",
+      "tools": [
+        {"tool": "read_skill", "args_match": "house-style"}
+      ]
+    },
+    "output": {
+      "contains": ["Shipped:", "Upgrade:"]
+    },
+    "rubric": "The agent loads the house-style skill before writing, then follows it: a Shipped line first, at most three bullets that start with verbs, and an Upgrade line last."
+  },
+  "thresholds": {"pass_rate": 1.0, "gate": false}
+}

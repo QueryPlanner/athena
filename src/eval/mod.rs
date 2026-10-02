@@ -90,6 +90,7 @@ pub mod judge;
 pub mod report;
 pub mod target;
 
+use crate::custom::Custom;
 use crate::flags::Flags;
 use anyhow::{Context, Result, bail};
 use judge::Judge;
@@ -112,6 +113,7 @@ pub async fn main<M, F>(
     args: &[String],
     agent_model: &str,
     make_model: F,
+    custom: &Custom,
     out: &mut impl Write,
 ) -> Result<()>
 where
@@ -119,8 +121,10 @@ where
     F: Fn(&str) -> Result<M>,
 {
     match args.split_first() {
-        Some((cmd, rest)) if cmd == "run" => run(rest, agent_model, make_model, out).await,
-        Some((cmd, rest)) if cmd == "record" => record(rest, agent_model, make_model, out).await,
+        Some((cmd, rest)) if cmd == "run" => run(rest, agent_model, make_model, custom, out).await,
+        Some((cmd, rest)) if cmd == "record" => {
+            record(rest, agent_model, make_model, custom, out).await
+        }
         Some((cmd, rest)) if cmd == "compare" => compare(rest, out),
         _ => bail!("{USAGE}"),
     }
@@ -140,6 +144,7 @@ async fn run<M, F>(
     args: &[String],
     agent_model: &str,
     make_model: F,
+    custom: &Custom,
     out: &mut impl Write,
 ) -> Result<()>
 where
@@ -183,7 +188,7 @@ where
         let mut case_rows = Vec::new();
         for sample in 0..k {
             let obs = match &http {
-                None => target::replay(case, user).await?,
+                None => target::replay(case, user, custom).await?,
                 Some(api) => api.run(case).await,
             };
             let grade = grade::grade(case, &obs);
@@ -241,6 +246,7 @@ async fn record<M, F>(
     args: &[String],
     agent_model: &str,
     make_model: F,
+    custom: &Custom,
     out: &mut impl Write,
 ) -> Result<()>
 where
@@ -262,7 +268,8 @@ where
     let model = make_model(agent_model)?;
     let mut failures = 0;
     for case in &cases {
-        let (cassette, obs) = target::record(case, model.clone(), agent_model, user).await?;
+        let (cassette, obs) =
+            target::record(case, model.clone(), agent_model, user, custom).await?;
         let grade = grade::grade(case, &obs);
         if grade.pass {
             let path = case.cassette_path();
