@@ -78,7 +78,7 @@ every other prompt (see Observability), so put no secrets in them.
     ATHENA_DB=$PWD/agent.db cargo run -- serve --addr 127.0.0.1:9000  # or ATHENA_ADDR
     ATHENA_DB=$PWD/agent.db cargo run -- telegram  # bot; TELEGRAM_BOT_TOKEN in .env
     cargo run -- backup backups/today.db     # online copy of the database
-    cargo run -- --version                   # athena 0.1.0-dev, or ATHENA_VERSION
+    cargo run -- --version                   # athena 0.2.0-dev, or ATHENA_VERSION
 
 `athena` reads `.env` from the directory you run it in. Variables already
 set in your shell win over the file, so `ATHENA_DB=/tmp/x.db athena ...`
