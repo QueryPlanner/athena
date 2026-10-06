@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod bench;
+pub mod calories;
 pub mod cli;
 pub mod compaction;
 pub mod custom;
