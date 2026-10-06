@@ -133,6 +133,7 @@ pub fn reserved_tool_names() -> Vec<&'static str> {
     [Add::NAME, ReadSkill::NAME]
         .into_iter()
         .chain(sandbox::tools::NAMES)
+        .chain(crate::calories::NAMES)
         .collect()
 }
 
@@ -149,13 +150,15 @@ pub fn build_with(
     // Vision: tools return images (screenshots) that OpenRouter's chat API
     // only takes from the user.
     let model = media::Vision(client.completion_model(model));
-    configure_all(
+    let store = memory.store().clone();
+    configure_persistent(
         rig::agent::AgentBuilder::new(model)
             .memory(memory)
             .additional_params(openrouter_params()),
         sandboxes,
         &Custom::from_env(),
         mcp,
+        store,
     )
 }
 
@@ -226,6 +229,28 @@ pub fn configure_all(
     custom: &Custom,
     mcp: &Mcp,
 ) -> rig::agent::Agent {
+    configure_stored(builder, sandboxes, custom, mcp, None)
+}
+
+/// Configure a persistent agent with native calorie tools.
+/// Use the same store for the builder's memory and the tools.
+pub fn configure_persistent(
+    builder: rig::agent::AgentBuilder,
+    sandboxes: Option<Arc<Sandboxes>>,
+    custom: &Custom,
+    mcp: &Mcp,
+    store: crate::store::Store,
+) -> rig::agent::Agent {
+    configure_stored(builder, sandboxes, custom, mcp, Some(store))
+}
+
+fn configure_stored(
+    builder: rig::agent::AgentBuilder,
+    sandboxes: Option<Arc<Sandboxes>>,
+    custom: &Custom,
+    mcp: &Mcp,
+    store: Option<crate::store::Store>,
+) -> rig::agent::Agent {
     let builder = builder
         .name(NAME)
         // Always: every prompt, system prompt, reply and tool call goes on
@@ -238,6 +263,10 @@ pub fn configure_all(
         // a task takes as many steps as it needs.
         .default_max_turns(usize::MAX);
     let builder = custom.register(builder);
+    let builder = match store {
+        Some(store) => crate::calories::register(builder, store),
+        None => builder,
+    };
     match sandboxes {
         Some(sandboxes) => mcp
             .register(sandbox::tools::register(builder, sandboxes))
@@ -285,11 +314,12 @@ mod tests {
         });
         assert!(warnings.is_empty(), "{warnings:?}");
         let model = MockCompletionModel::new([MockTurn::text("ok")]);
-        let agent = configure_all(
+        let agent = configure_stored(
             rig::agent::AgentBuilder::new(model.clone()),
             sandboxes(Some(config), &store),
             &custom,
             &Mcp::none(),
+            Some(store.clone()),
         );
         agent.prompt("hi").await.unwrap();
         std::fs::remove_dir_all(&home).unwrap();

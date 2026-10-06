@@ -24,6 +24,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod calories;
+
 /// One turn: the model calls it made and what they cost.
 ///
 /// Token fields are plain integers rather than Rig's `Usage` so this module
@@ -389,6 +391,28 @@ const MIGRATIONS: &[&str] = &[
      );
      INSERT INTO user_identities (transport, external_id, user_id, created_at)
      SELECT transport, external_id, id, created_at FROM users;",
+    // 9: meals belong to the shared user, not to a conversation or transport.
+    // Retry keys identify occurrences; removed meals retain their key.
+    "CREATE TABLE calorie_logs (
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         user_id INTEGER NOT NULL REFERENCES users (id),
+         request_key TEXT NOT NULL,
+         request_hash TEXT NOT NULL,
+         description TEXT NOT NULL,
+         consumed_date TEXT NOT NULL,
+         calories REAL CHECK (calories BETWEEN 0 AND 1000000),
+         protein_g REAL CHECK (protein_g BETWEEN 0 AND 1000000),
+         carbs_g REAL CHECK (carbs_g BETWEEN 0 AND 1000000),
+         fat_g REAL CHECK (fat_g BETWEEN 0 AND 1000000),
+         meal_type TEXT,
+         source TEXT NOT NULL CHECK (source IN ('user', 'estimated')),
+         version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+         created_at INTEGER NOT NULL,
+         updated_at INTEGER NOT NULL,
+         deleted_at INTEGER,
+         UNIQUE (user_id, request_key)
+     );
+     CREATE INDEX calories_by_owner_date ON calorie_logs (user_id, consumed_date, id);",
 ];
 
 /// The schema version this build writes.
@@ -420,6 +444,27 @@ const RUN_COLUMNS: &[&str] = &[
 /// `CREATE TABLE IF NOT EXISTS` accepts an existing table of any shape, so
 /// a table left behind by some older build would otherwise pass unnoticed.
 const EXPECTED_COLUMNS: &[(&str, &[&str])] = &[
+    (
+        "calorie_logs",
+        &[
+            "id",
+            "user_id",
+            "request_key",
+            "request_hash",
+            "description",
+            "consumed_date",
+            "calories",
+            "protein_g",
+            "carbs_g",
+            "fat_g",
+            "meal_type",
+            "source",
+            "version",
+            "created_at",
+            "updated_at",
+            "deleted_at",
+        ],
+    ),
     ("messages", &["session_id", "seq", "json"]),
     ("runs", RUN_COLUMNS),
     ("users", &["id", "transport", "external_id", "created_at"]),
@@ -1423,12 +1468,14 @@ mod tests {
             [
                 "browser_links",
                 "browser_states",
+                "calorie_logs",
                 "compactions",
                 "messages",
                 "runs",
                 "sandboxes",
                 "selected_sessions",
                 "sessions",
+                "sqlite_sequence",
                 "user_identities",
                 "users"
             ]

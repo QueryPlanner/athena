@@ -20,12 +20,12 @@ Edit `src/agent.rs`. That is the only file that changes.
         builder ... .tool(MyTool) ...       // register them
     }
 
-`configure_with` is the agent's whole definition (`configure` is the same
-without sandbox tools). Production wraps it around the
-OpenRouter client; the tests wrap it around Rig's mock model, so they run the
-same preamble and tools you ship. Both give the builder the conversation
-memory first (`builder.memory(service.memory())`), so `configure` never has
-to know where conversations are stored.
+`configure_with` defines the agent without persistent tools (`configure` also
+omits sandbox tools). `configure_persistent` adds native calorie tools using
+the supplied `Store`. Production wraps it around the OpenRouter client;
+tests can wrap it around Rig's mock model. Give the builder conversation
+memory first (`builder.memory(service.memory())`) and use the same store for
+persistent tools.
 
 Everything else — users, sessions, storage, the turn loop, the CLI — stays
 as is.
@@ -198,12 +198,50 @@ queued. Commands still answer at once. Errors are logged to stderr and
 answered with one short line; the bot keeps running. Ctrl-C stops polling
 and waits for turns in flight to reply.
 
+## Calorie tools
+
+Persistent agents expose `calorie_log`, `calorie_history`, `calorie_summary`,
+`calorie_update`, and `calorie_remove`. Food entries live in `ATHENA_DB`, owned
+by the user behind the current session. Linked Telegram and API sessions share
+these entries. No user ID is accepted in tool arguments.
+
+To log food, provide a `meal` containing `description`, `consumed_date`
+(`YYYY-MM-DD` in the user's local calendar), and `source` (`user` or `estimated`).
+Optional values are `calories` in kcal, `protein_g`, `carbs_g`, `fat_g`, and
+`meal_type`. Unknown nutrition remains null. Athena does not contact a food
+nutrition service; the agent must distinguish estimates from user-provided values.
+If the local date is unclear, ask the user before saving.
+
+Each occurrence needs a fresh opaque `request_key`, such as a UUID. Reuse that
+key only to retry the same original meal. Matching retries return the current
+entry; a different meal with the same key conflicts. This prevents duplication
+only when a retry uses the same key. It does not deduplicate separate agent
+turns that choose different keys. Identical meals with different keys remain
+separate occurrences.
+
+History and summaries require inclusive `start_date` and `end_date`. History
+returns active entries in descending logging-ID order, with a default limit of
+20 and maximum of 50. Pass `next_before_id` as `before_id` to read another page.
+Summary totals include known values and report missing counts for each nutrient;
+a total is null if no value is known.
+
+Updates replace the meal and require `id` plus `expected_version` from history.
+Removal requires the same version check and soft-deletes the entry. Missing,
+deleted, and stale-version entries return the same conflict message. Read again
+before retrying a correction. Removal retains the original retry key, so a
+late log retry returns the deleted entry without restoring it.
+
+Schema migration 9 adds these records without importing the legacy `tools.db`.
+Library callers can use `agent::configure_persistent` with the same `Store` as
+the builder's memory to expose these tools.
+
 ## Sandbox and browser tools
 
 Tools that touch a computer run in a sandbox on an
 [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) server, never
-on the machine running athena. The template ships no host tool except `add`
-and the tools of the MCP servers you list (see "Tools from MCP servers").
+on the machine running athena. Native calorie tools access only Athena’s
+SQLite store. Other host tools are `add` and the tools of the MCP servers
+you list (see "Tools from MCP servers").
 
 | Tool | What it does |
 |---|---|
