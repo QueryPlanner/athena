@@ -7,6 +7,7 @@
 
 mod common;
 
+use athena::service::Service;
 use athena::store::{self, Store};
 use common::*;
 use rig_core::test_utils::MockTurn;
@@ -26,6 +27,7 @@ const V3_USERS_SESSIONS: &str = include_str!("fixtures/v3_users_sessions.sql");
 const V4_SELECTED_SESSIONS: &str = include_str!("fixtures/v4_selected_sessions.sql");
 const V5_SANDBOXES: &str = include_str!("fixtures/v5_sandboxes.sql");
 const V6_BROWSER_SIGNIN: &str = include_str!("fixtures/v6_browser_signin.sql");
+const V7_COMPACTIONS: &str = include_str!("fixtures/v7_compactions.sql");
 
 /// Every row of a table, every column, in rowid order, as SQLite holds it.
 fn dump(db: &Connection, table: &str) -> Vec<Vec<Value>> {
@@ -392,6 +394,57 @@ async fn a_database_at_schema_6_gains_compactions_without_changing_a_row() {
     assert_eq!(
         runs(&db, "testsess").last().unwrap(),
         &run_row(12, 13, 1, "ok")
+    );
+}
+
+#[tokio::test]
+async fn schema_7_backfills_identities_and_keeps_every_existing_row_and_owner() {
+    let tables = [
+        "messages",
+        "runs",
+        "users",
+        "sessions",
+        "selected_sessions",
+        "sandboxes",
+        "browser_links",
+        "browser_states",
+        "compactions",
+    ];
+    let tmp = from_fixture(V7_COMPACTIONS);
+    let before: Vec<_> = tables.iter().map(|t| dump(&tmp.raw(), t)).collect();
+    assert_eq!(user_version(&tmp.raw()), 7);
+    let expected: Vec<(String, String, i64, i64)> = tmp
+        .raw()
+        .prepare("SELECT transport, external_id, id, created_at FROM users ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let store = tmp.open();
+    let actual: Vec<(String, String, i64, i64)> = tmp.raw()
+        .prepare("SELECT transport, external_id, user_id, created_at FROM user_identities ORDER BY user_id")
+        .unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap().map(Result::unwrap).collect();
+    assert_eq!(actual, expected);
+    for (transport, external_id, id, _) in expected {
+        assert_eq!(store.user(&transport, &external_id).unwrap().id(), id);
+    }
+    let service = Service::new(store.clone(), "m", |_| {});
+    let owner = service.user("telegram", "111111").await.unwrap();
+    service.link_http_user(&owner, "upgrade-api").await.unwrap();
+    drop((store, service));
+    let restarted = tmp.open();
+    assert_eq!(
+        restarted.user("http", "upgrade-api").unwrap().id(),
+        owner.id()
+    );
+    let after: Vec<_> = tables.iter().map(|t| dump(&tmp.raw(), t)).collect();
+    assert_eq!(after, before);
+    assert_eq!(user_version(&tmp.raw()), store::SCHEMA_VERSION as i64);
+    assert_eq!(
+        count(&tmp.raw(), "SELECT COUNT(*) FROM pragma_foreign_key_check"),
+        0
     );
 }
 

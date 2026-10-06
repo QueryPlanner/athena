@@ -123,6 +123,27 @@ fn non_empty(what: &str, value: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Shared rules for the API header and Telegram's /link argument.
+pub(crate) const MAX_HTTP_USER_ID: usize = 256;
+
+pub(crate) fn http_user_id(value: &str) -> Result<&str, Error> {
+    let id = value.trim();
+    if id.is_empty() {
+        return Err(Error::Invalid(
+            "x-athena-user header must name someone".into(),
+        ));
+    }
+    if !id.bytes().all(|b| (b' '..=b'~').contains(&b)) {
+        return Err(Error::Invalid("API user ID must be printable ASCII".into()));
+    }
+    if id.len() > MAX_HTTP_USER_ID {
+        return Err(Error::Invalid(format!(
+            "API user ID must be at most {MAX_HTTP_USER_ID} characters"
+        )));
+    }
+    Ok(id)
+}
+
 impl Service {
     /// `model` is recorded on every run. `warn` receives problems that do
     /// not fail the call, such as a telemetry row that could not be saved.
@@ -168,6 +189,26 @@ impl Service {
             .store
             .call(move |s| s.user(&transport, &external_id))
             .await?)
+    }
+
+    /// A direct Telegram command, not an agent tool. Private-network HTTP
+    /// callers continue to be trusted; linking adds no authentication.
+    pub async fn link_http_user(&self, user: &User, external_id: &str) -> Result<(), Error> {
+        if user.transport() != "telegram" {
+            return Err(Error::Invalid("Link API identities from Telegram.".into()));
+        }
+        let external_id = http_user_id(external_id)?.to_string();
+        let owner = user.clone();
+        let linked = self
+            .store
+            .call(move |s| s.link_http_user(&owner, &external_id))
+            .await?;
+        if !linked {
+            return Err(Error::Invalid(
+                "That API user ID already belongs to another user. Choose a never-used ID; existing users are not merged.".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// A new, empty session. Fails if the user already has one by this name.
@@ -615,6 +656,46 @@ mod tests {
             sink.lock().unwrap().push(w.to_string())
         });
         (service, store, warnings)
+    }
+
+    #[tokio::test]
+    async fn linking_validates_the_caller_and_the_http_identity_before_writing() {
+        let (service, store, _) = service();
+        let owner = service.user("telegram", "42").await.unwrap();
+        let http = service.user("http", "already-used").await.unwrap();
+        assert!(matches!(
+            service.link_http_user(&http, "unused").await,
+            Err(Error::Invalid(_))
+        ));
+        for invalid in [
+            "",
+            "   ",
+            "é",
+            "a\nb",
+            "a\tb",
+            &"a".repeat(MAX_HTTP_USER_ID + 1),
+        ] {
+            assert!(matches!(
+                service.link_http_user(&owner, invalid).await,
+                Err(Error::Invalid(_))
+            ));
+        }
+        assert!(matches!(
+            service.link_http_user(&owner, "already-used").await,
+            Err(Error::Invalid(_))
+        ));
+        let longest = "a".repeat(MAX_HTTP_USER_ID);
+        service
+            .link_http_user(&owner, &format!("  {longest}  "))
+            .await
+            .unwrap();
+        assert_eq!(
+            service.user("http", &longest).await.unwrap().id(),
+            owner.id()
+        );
+        service.link_http_user(&owner, &longest).await.unwrap();
+        // Only the successful alias was added, with no new owner row.
+        assert_eq!(store.user("http", "already-used").unwrap().id(), http.id());
     }
 
     fn agent_with(

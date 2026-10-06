@@ -95,6 +95,23 @@ Claude Code and Claude Desktop use (`src/mcp.rs`).
 
 ## HTTP
 
+`X-Athena-User` remains trusted, without authentication. HTTP identity names
+are trimmed, nonempty printable ASCII, at most 256 bytes. The same validator
+applies to Telegram's `/link API_USER_ID` command.
+
+Schema migration 8 adds `user_identities(transport, external_id, user_id,
+created_at)`, keyed by `(transport, external_id)` and referencing `users.id`.
+It backfills every existing user without changing owner IDs or existing rows.
+Identity lookup and creation, and linking, use immediate transactions.
+
+In private Telegram chats, `/link API_USER_ID` binds a never-used HTTP identity
+to the caller's existing user ID. An existing binding to that same user succeeds;
+a binding to any other user is refused, even if empty. No identities are moved
+and no users are merged. The HTTP and Telegram processes must share `ATHENA_DB`.
+Linked identities share sessions, usage, and user-owned saved browser state.
+HTTP explicitly chooses a session; Telegram's selection remains unchanged.
+Authentication, unlinking, and merging existing identities are not implemented.
+
 `GET /version` returns `{"version": "<ATHENA_VERSION or pkg-dev>"}`. Like `/health`,
 it needs no user header. Every other endpoint is unchanged.
 
