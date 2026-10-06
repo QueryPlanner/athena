@@ -118,10 +118,23 @@ fn the_production_build_sends_the_environments_instructions_and_skills() {
         .iter()
         .map(|t| t["function"]["name"].as_str().unwrap())
         .collect();
-    // Instructions, skills and MCP tools in one agent, each name once.
+    // Instructions, skills, native calorie tools and MCP tools coexist.
     let mut sorted = tools.clone();
     sorted.sort();
-    assert_eq!(sorted, ["add", "echo", "read_skill"], "{tools:?}");
+    assert_eq!(
+        sorted,
+        [
+            "add",
+            "calorie_history",
+            "calorie_log",
+            "calorie_remove",
+            "calorie_summary",
+            "calorie_update",
+            "echo",
+            "read_skill"
+        ],
+        "{tools:?}"
+    );
     // And OpenRouter's own context compression is off, in the same request.
     assert_eq!(
         body["plugins"],

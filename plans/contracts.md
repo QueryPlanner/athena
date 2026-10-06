@@ -80,7 +80,7 @@ Claude Code and Claude Desktop use (`src/mcp.rs`).
   A server that fails is a warning; its tools are missing.
 - One connection per server serves every user and session of the process.
 - A tool keeps its server's name. A name that a built-in tool
-  (`agent::reserved_tool_names`: `add`, `read_skill`, the sandbox tools) or an earlier server (name order) has, that
+  (`agent::reserved_tool_names`: `add`, `read_skill`, the calorie tools, the sandbox tools) or an earlier server (name order) has, that
   is not 1 to 64 of `[A-Za-z0-9_-]`, or an input schema that is not of type
   object, is skipped with a warning, as are a server's tools past the first
   `MAX_TOOLS_PER_SERVER`. Descriptions are cut to `MAX_DESCRIPTION_BYTES`.
@@ -132,6 +132,45 @@ Unknown or expired tokens are `404`.
 | `GET /browser/{token}/controls` | `snapshot -i --json`, as `{"controls": [{"ref": "e4", "name", "kind"}]}` in page order; `kind` is `username`, `password`, `code`, `text` or `button` |
 | `POST /browser/{token}/submit` `{"fills": [{"ref", "text"}], "click"}` | `fill @ref text` for each (at most 20, 1000 chars each), then `click @ref`, as one command |
 | `POST /browser/{token}/done` | `state save`, stored for the session's owner; answers `{"saved_bytes"}` |
+
+## Calorie persistence
+
+Schema migration 9 adds `calorie_logs` in `ATHENA_DB`: `id` (monotonic
+AUTOINCREMENT), `user_id` (foreign key to `users.id`), `request_key`, immutable
+`request_hash`, `description`, `consumed_date`, nullable `calories`, `protein_g`,
+`carbs_g`, `fat_g`, `meal_type`, `source`, `version`, `created_at`, `updated_at`,
+and nullable `deleted_at`. `(user_id, request_key)` is unique. The
+`calories_by_owner_date` index covers `(user_id, consumed_date, id)`.
+Timestamps are Unix milliseconds; `consumed_date` is a supplied local date.
+
+Native tools: `calorie_log(request_key, meal)`,
+`calorie_history(start_date, end_date, limit?, before_id?)`,
+`calorie_summary(start_date, end_date)`,
+`calorie_update(id, expected_version, meal)`, and
+`calorie_remove(id, expected_version)`. The host's `runner::Conversation`
+resolves the session owner. Every query constrains that owner; the model cannot
+choose another user. Tools are registered whenever a persistent agent is built,
+and all five names are reserved against MCP collisions.
+
+A meal requires description, a real `YYYY-MM-DD` local calendar date, and source
+`user` or `estimated`. Nutrition uses kcal and grams, finite values in
+`0..=1000000`, or null for unknown. Description is nonblank printable text of at
+most 512 bytes, meal type at most 64 bytes, and retry key at most 128 bytes.
+The typed original meal is hashed after signed-zero normalization. Matching
+retry keys return the current record, including deletion state, without writing;
+changed payloads conflict. Fresh occurrences require fresh keys, even for
+identical food. No automatic retry-key generation or legacy database import.
+
+History uses inclusive dates, logging-ID descending order, limit 20 by default
+and at most 50, and returns `next_before_id` only when another page exists.
+Summary returns `entry_count`, nullable nutrient `totals`, and nutrient `missing`
+counts. SQL SUM preserves all-unknown totals as null. Deleted entries are
+excluded from both operations.
+
+Mutations commit before success. Corrections and soft deletion increment version
+and require the prior version; missing, deleted, and stale entries share a
+conflict response. Deletion retains its key and does not resurrect on log retry.
+No new HTTP routes or authentication changes.
 
 ## Compaction
 

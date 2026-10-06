@@ -624,3 +624,34 @@ fn describe_schema(db: &Connection) -> String {
     }
     out
 }
+
+#[test]
+fn schema_8_preserves_linked_users_and_all_existing_records() {
+    let tmp = from_fixture(include_str!("fixtures/v8_identities.sql"));
+    let tables = [
+        "users",
+        "user_identities",
+        "sessions",
+        "messages",
+        "runs",
+        "selected_sessions",
+        "sandboxes",
+        "browser_links",
+        "browser_states",
+        "compactions",
+    ];
+    let before: Vec<_> = tables.iter().map(|t| dump(&tmp.raw(), t)).collect();
+    assert_eq!(user_version(&tmp.raw()), 8);
+    let store = tmp.open();
+    assert_eq!(store.user("http", "linked-fixture").unwrap().id(), 2);
+    let after: Vec<_> = tables.iter().map(|t| dump(&tmp.raw(), t)).collect();
+    assert_eq!(before, after);
+    assert_eq!(user_version(&tmp.raw()), 9);
+    assert_eq!(
+        tmp.raw()
+            .query_row("SELECT COUNT(*) FROM calorie_logs", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
