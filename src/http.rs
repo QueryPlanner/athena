@@ -45,7 +45,8 @@ pub const USER_HEADER: &str = "x-athena-user";
 pub const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 
 /// Longer ids are refused: every distinct id becomes a stored user.
-const MAX_USER_ID: usize = 256;
+#[cfg(test)]
+const MAX_USER_ID: usize = service::MAX_HTTP_USER_ID;
 
 /// Printed when the server listens beyond this machine.
 pub const EXPOSED_WARNING: &str = "\
@@ -260,7 +261,8 @@ fn announce(addr: SocketAddr, hosts: &Hosts, out: &mut impl Write) {
 
 /// The user a request acts as. The only place identity is decided.
 ///
-/// Today: `X-Athena-User: <id>` is the user `("http", id)`, trusted as sent.
+/// `X-Athena-User: <id>` resolves the HTTP identity, including Telegram links.
+/// The header is still trusted as sent; linking is not authentication.
 /// Replace this extractor to add authentication.
 struct Caller(User);
 
@@ -283,17 +285,8 @@ fn user_id(headers: &HeaderMap) -> Result<&str, ApiError> {
     let value = headers.get(USER_HEADER).ok_or_else(missing)?;
     let id = value
         .to_str()
-        .map_err(|_| ApiError::invalid(format!("{USER_HEADER} must be printable ASCII")))?
-        .trim();
-    if id.is_empty() {
-        return Err(missing());
-    }
-    if id.len() > MAX_USER_ID {
-        return Err(ApiError::invalid(format!(
-            "{USER_HEADER} must be at most {MAX_USER_ID} characters"
-        )));
-    }
-    Ok(id)
+        .map_err(|_| ApiError::invalid(format!("{USER_HEADER} must be printable ASCII")))?;
+    Ok(service::http_user_id(id)?)
 }
 
 /// Refuse a request whose `Host` is not one `hosts` answers.

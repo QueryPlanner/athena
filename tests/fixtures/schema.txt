@@ -1,4 +1,4 @@
-user_version 7
+user_version 8
 
 table browser_links
   token TEXT NOT NULL PK1
@@ -80,6 +80,14 @@ table sessions
   foreign key user_id REFERENCES users (id)
   unique index (id) from pk
   unique index (user_id, name) from u
+
+table user_identities
+  transport TEXT NOT NULL PK1
+  external_id TEXT NOT NULL PK2
+  user_id INTEGER NOT NULL
+  created_at INTEGER NOT NULL
+  foreign key user_id REFERENCES users (id)
+  unique index (transport, external_id) from pk
 
 table users
   id INTEGER PK1

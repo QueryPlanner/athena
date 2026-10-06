@@ -158,6 +158,7 @@ The pick is stored (the `selected_sessions` table), so it survives a restart.
 | `/sessions` | List your sessions with message counts; `*` marks the current one. |
 | `/switch NAME` | Switch to an existing session (`default` always exists). |
 | `/usage` | Turns, model calls and tokens per session. |
+| `/link API_USER_ID` | Bind a never-used API identity to your existing user and sessions. |
 | `/help`, `/start` | What the bot is, the current session, the commands. |
 
 The commands are registered with Telegram's command menu at startup. Any
@@ -430,10 +431,28 @@ other runtime.
 
 ## Users and sessions
 
-A user is identified by `(transport, external_id)`: `("cli", "local")`,
-`("telegram", "<Telegram user id>")`, or `("http", "<account>")` once that
-transport exists. A new transport adds a transport name, never a change to
-how users are stored.
+A user has one stable numeric `users.id`. The `user_identities` table maps
+`(transport, external_id)` identities to that owner: `("cli", "local")`,
+`("telegram", "<Telegram user id>")`, and `("http", "<API user id>")`.
+Unlinked identities get separate users. The original identity columns in
+`users` remain for compatibility; lookup uses `user_identities`.
+
+In a private Telegram chat, send `/link my-api-name` before using that API
+identity. Requests with `X-Athena-User: my-api-name` then resolve to your
+existing Telegram user. Both channels can list, read and continue the same
+sessions. Browser sign-ins are also shared because saved browser state belongs
+to the user. The API names a session explicitly; it does not change Telegram's
+selected session.
+
+Repeating your own link succeeds. An API identity already assigned to another
+user is refused, even if it has no sessions. Existing users, sessions and
+messages are never merged or reassigned. Choose a never-used API identity.
+Links survive restarts and work across the serve and Telegram processes when
+they use the same database.
+
+Linking does not authenticate API callers. Anyone who can reach the API and
+provide the linked header can act as that user. This feature retains the
+trusted-private-network model; authenticated linking and unlinking are deferred.
 
 A session belongs to exactly one user. Its name is unique among that user's
 sessions; its id (a uuid) is unique everywhere. Two users can both have a
@@ -671,6 +690,9 @@ On any other address it still starts, and prints a warning.
 Every request except `/health` and `/version` names its user in a header:
 
     X-Athena-User: alice          # the user ("http", "alice")
+
+If `alice` was linked with Telegram's `/link alice`, this identity resolves to
+the Telegram user's existing `users.id`, including access to their sessions.
 
 A missing, blank, non-ASCII or over-256-byte value is `400`. `src/http.rs`
 turns the header into a user in one place, the `Caller` extractor, so

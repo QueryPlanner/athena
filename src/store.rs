@@ -56,7 +56,7 @@ pub struct RunRecord {
     pub calls_json: String,
 }
 
-/// Someone talking to the agent, as one transport knows them.
+/// A shared owner and the transport identity used for this request.
 ///
 /// The fields are private and there is no constructor outside this module:
 /// a `User` only comes from [`Store::user`], so a transport cannot build one
@@ -376,6 +376,19 @@ const MIGRATIONS: &[&str] = &[
          created_at    INTEGER NOT NULL,
          PRIMARY KEY (session_id, through_seq)
      );",
+    // 8: multiple transport identities can resolve to one existing user id.
+    // The original identity in users remains unchanged for compatibility;
+    // user_identities is now the authority for identity lookup. No sessions,
+    // transcripts or saved browser states move during this migration.
+    "CREATE TABLE user_identities (
+         transport   TEXT NOT NULL,
+         external_id TEXT NOT NULL,
+         user_id     INTEGER NOT NULL REFERENCES users (id),
+         created_at  INTEGER NOT NULL,
+         PRIMARY KEY (transport, external_id)
+     );
+     INSERT INTO user_identities (transport, external_id, user_id, created_at)
+     SELECT transport, external_id, id, created_at FROM users;",
 ];
 
 /// The schema version this build writes.
@@ -410,6 +423,10 @@ const EXPECTED_COLUMNS: &[(&str, &[&str])] = &[
     ("messages", &["session_id", "seq", "json"]),
     ("runs", RUN_COLUMNS),
     ("users", &["id", "transport", "external_id", "created_at"]),
+    (
+        "user_identities",
+        &["transport", "external_id", "user_id", "created_at"],
+    ),
     ("sessions", &["id", "user_id", "name", "created_at"]),
     (
         "selected_sessions",
@@ -703,21 +720,59 @@ impl Store {
     /// The user a transport knows by `external_id`, created on first sight.
     pub fn user(&self, transport: &str, external_id: &str) -> Result<User> {
         let db = self.db();
-        db.execute(
-            "INSERT INTO users (transport, external_id, created_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT (transport, external_id) DO NOTHING",
-            rusqlite::params![transport, external_id, now_millis()],
-        )?;
-        let id = db.query_row(
-            "SELECT id FROM users WHERE transport = ?1 AND external_id = ?2",
-            [transport, external_id],
-            |r| r.get(0),
-        );
+        // Serialize lookup/create with linking, including in other processes.
+        let tx = Transaction::new_unchecked(&db, TransactionBehavior::Immediate)?;
+        let found: Option<i64> = tx
+            .query_row(
+                "SELECT user_id FROM user_identities WHERE transport = ?1 AND external_id = ?2",
+                [transport, external_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let id = match found {
+            Some(id) => id,
+            None => {
+                let created_at = now_millis();
+                tx.execute(
+                    "INSERT INTO users (transport, external_id, created_at) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![transport, external_id, created_at],
+                )?;
+                let id = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO user_identities (transport, external_id, user_id, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![transport, external_id, id, created_at],
+                )?;
+                id
+            }
+        };
+        tx.commit()?;
         Ok(User {
-            id: id?,
+            id,
             transport: transport.to_string(),
             external_id: external_id.to_string(),
         })
+    }
+
+    /// Bind a never-used HTTP identity to this owner. Repeating the same
+    /// binding succeeds; an identity belonging to another owner never moves.
+    /// The service validates the name and restricts this to Telegram callers.
+    pub(crate) fn link_http_user(&self, owner: &User, external_id: &str) -> Result<bool> {
+        let db = self.db();
+        let tx = Transaction::new_unchecked(&db, TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO user_identities (transport, external_id, user_id, created_at)
+             VALUES ('http', ?1, ?2, ?3)
+             ON CONFLICT (transport, external_id) DO NOTHING",
+            rusqlite::params![external_id, owner.id, now_millis()],
+        )?;
+        let linked: i64 = tx.query_row(
+            "SELECT user_id FROM user_identities WHERE transport = 'http' AND external_id = ?1",
+            [external_id],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok(linked == owner.id)
     }
 
     /// A new session for `user`, or `None` if they already have one by that name.
@@ -1374,6 +1429,7 @@ mod tests {
                 "sandboxes",
                 "selected_sessions",
                 "sessions",
+                "user_identities",
                 "users"
             ]
         );
@@ -1569,6 +1625,96 @@ mod tests {
     }
 
     #[test]
+    fn linking_shares_the_owner_without_creating_or_moving_users() {
+        let store = store();
+        let owner = store.user("telegram", "42").unwrap();
+        let session = store.open_session(&owner, "notes").unwrap();
+        store
+            .append(&session.id, None, &[Message::user("remember")])
+            .unwrap();
+        store
+            .save_browser_state(&session.id, b"saved state", 1)
+            .unwrap();
+
+        assert!(store.link_http_user(&owner, "my-api").unwrap());
+        assert!(store.link_http_user(&owner, "my-api").unwrap());
+        let http = store.user("http", "my-api").unwrap();
+        assert_eq!(http.id(), owner.id());
+        assert_eq!((http.transport(), http.external_id()), ("http", "my-api"));
+        assert_eq!(
+            store.session(&http, &session.id).unwrap(),
+            Some(session.clone())
+        );
+        assert_eq!(store.session_owner(&session.id).unwrap(), Some(owner.id()));
+        assert_eq!(
+            store.load(&session.id).unwrap(),
+            [Message::user("remember")]
+        );
+        assert_eq!(
+            store.browser_state(&session.id).unwrap(),
+            Some(b"saved state".to_vec())
+        );
+        assert_eq!(store.user("telegram", "42").unwrap(), owner);
+        let users: i64 = store
+            .db()
+            .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(users, 2);
+    }
+
+    #[test]
+    fn linking_never_claims_an_existing_other_owner_even_when_empty() {
+        let store = store();
+        let owner = store.user("telegram", "42").unwrap();
+        let existing = store.user("http", "used").unwrap();
+        assert!(!store.link_http_user(&owner, "used").unwrap());
+        assert_eq!(store.user("http", "used").unwrap(), existing);
+        let private = store.open_session(&existing, "private").unwrap();
+        store
+            .save_browser_state(&private.id, b"other state", 2)
+            .unwrap();
+        assert!(!store.link_http_user(&owner, "used").unwrap());
+        assert_eq!(
+            store.session_owner(&private.id).unwrap(),
+            Some(existing.id())
+        );
+        assert_eq!(store.session(&owner, &private.id).unwrap(), None);
+        assert_eq!(
+            store.browser_state(&private.id).unwrap(),
+            Some(b"other state".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_failed_identity_insert_rolls_back_the_new_user() {
+        let store = store();
+        store
+            .db()
+            .execute_batch(
+                "CREATE TRIGGER reject_identity BEFORE INSERT ON user_identities
+             BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .user("http", "new")
+                .unwrap_err()
+                .to_string()
+                .contains("fixture failure")
+        );
+        assert!(
+            store
+                .link_http_user(&store.user("cli", "local").unwrap(), "new")
+                .is_err()
+        );
+        let users: i64 = store
+            .db()
+            .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(users, 1);
+    }
+
+    #[test]
     fn session_names_are_unique_per_user_not_globally() {
         let store = store();
         let alice = store.user("cli", "alice").unwrap();
@@ -1747,7 +1893,7 @@ mod tests {
             .execute_batch(
                 "PRAGMA foreign_keys = OFF;
                  DROP TABLE runs; DROP TABLE messages; DROP TABLE selected_sessions;
-                 DROP TABLE sessions; DROP TABLE users;",
+                 DROP TABLE sessions; DROP TABLE user_identities; DROP TABLE users;",
             )
             .unwrap();
         assert!(store.sessions(&user).is_err());

@@ -12,14 +12,18 @@ mod fake_server;
 
 use athena::agent;
 use athena::compaction::ContextHook;
+use athena::http::{self, Hosts, USER_HEADER};
 use athena::media;
 use athena::runner::{Request, Run};
 use athena::sandbox::Sandboxes;
 use athena::service::Service;
 use athena::telegram::{self, Log, Telegram};
+use axum::body::Body;
+use axum::http::{Request as HttpRequest, StatusCode};
 use common::*;
 use fake_api::{FakeApi, media_from, photo_sizes, text_from};
 use fake_server::{FakeSandbox, SCREENSHOT};
+use http_body_util::BodyExt;
 use rig_agent::agent::AgentBuilder;
 use rig_agent::agent::{Agent, PromptResponse};
 use rig_agent::completion::PromptError;
@@ -30,6 +34,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use teloxide::Bot;
 use tokio::sync::{Semaphore, mpsc};
+use tower::ServiceExt;
 
 /// The secret half of the test token: 35+ characters of `[A-Za-z0-9_-]`,
 /// which is what teloxide's redaction looks for. Built at runtime and
@@ -177,6 +182,118 @@ async fn messages_and_commands_round_trip_through_the_bot_api() {
     );
     assert_eq!(selected(&tmp, "1").as_deref(), Some("work"));
     assert!(logged.lock().unwrap().is_empty(), "{logged:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_linked_api_continues_the_telegram_session_and_survives_a_restart() {
+    let tmp = TempDb::new();
+    let api = FakeApi::start().await;
+    let mut telegram_model = None;
+    let (app, logged) = app(&tmp, |s| {
+        let (agent, model) = mock_agent(
+            s,
+            [
+                MockTurn::text("telegram reply"),
+                MockTurn::text("continued"),
+            ],
+        );
+        telegram_model = Some(model);
+        agent
+    });
+    let bot = run(&api, app).await;
+    // Group commands are ignored and cannot claim an identity.
+    let mut group = text_from(42, "/link group-api");
+    group["message"]["chat"] = json!({"id": -1001, "type": "supergroup", "title": "g"});
+    api.push(group);
+    api.push(text_from(42, "/new notes"));
+    api.push(text_from(42, "telegram message"));
+    api.messages_to(42, 2).await;
+    api.push(text_from(42, "/link my-api"));
+    let replies = api.messages_to(42, 3).await;
+    assert!(replies[2].contains("X-Athena-User: my-api"), "{replies:?}");
+
+    // Separate database connection, as used by the HTTP service process.
+    let service = Arc::new(tmp.service().0);
+    let (agent, model) = mock_agent(&service, [MockTurn::text("api reply")]);
+    let router = http::router(service.clone(), Arc::new(agent), Hosts::Any);
+    let owner = service.user("telegram", "42").await.unwrap();
+    let notes = service.sessions(&owner).await.unwrap()[0].session.clone();
+    let request = |method: &str, path: &str, user: &str, body: Body| {
+        HttpRequest::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "localhost")
+            .header(USER_HEADER, user)
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap()
+    };
+    let listed = router
+        .clone()
+        .oneshot(request("GET", "/sessions", "my-api", Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed: serde_json::Value =
+        serde_json::from_slice(&listed.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(listed["sessions"][0]["id"], notes.id);
+    let path = format!("/sessions/{}/messages", notes.id);
+    let posted = router
+        .clone()
+        .oneshot(request(
+            "POST",
+            &path,
+            "my-api",
+            Body::from(json!({"text":"api message"}).to_string()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(posted.status(), StatusCode::OK);
+    assert!(
+        model.requests()[0]
+            .chat_history
+            .contains(&rig_agent::prelude::Message::user("telegram message"))
+    );
+    api.push(text_from(42, "continue in telegram"));
+    assert_eq!(api.messages_to(42, 4).await[3], "continued");
+    assert!(
+        telegram_model.unwrap().requests()[1]
+            .chat_history
+            .contains(&rig_agent::prelude::Message::user("api message"))
+    );
+    // Another API identity still cannot access the shared session.
+    let denied = router
+        .clone()
+        .oneshot(request("GET", &path, "stranger", Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+    assert_eq!(selected(&tmp, "42").as_deref(), Some("notes"));
+    assert_eq!(
+        count(
+            &tmp.raw(),
+            "SELECT COUNT(*) FROM user_identities WHERE external_id = 'group-api'"
+        ),
+        0
+    );
+    bot.stop().await.unwrap();
+    drop((router, service));
+
+    let restarted = Arc::new(tmp.service().0);
+    let http = restarted.user("http", "my-api").await.unwrap();
+    assert_eq!(http.id(), owner.id());
+    let history = restarted.history(&http, &notes.id).await.unwrap();
+    assert_eq!(history.len(), 6);
+    assert!(history.contains(&rig_agent::prelude::Message::user("telegram message")));
+    assert!(history.contains(&rig_agent::prelude::Message::user("api message")));
+    assert!(history.contains(&rig_agent::prelude::Message::user("continue in telegram")));
+    assert!(
+        logged
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|line| line.contains("only private chats"))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

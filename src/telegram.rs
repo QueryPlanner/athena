@@ -110,6 +110,7 @@ pub const BUSY: &str =
     "Still working on your last message. Send this one again once I have replied.";
 pub const NOT_TEXT: &str = "I read text, photos and files, not this kind of message.";
 pub const SWITCH_USAGE: &str = "Usage: /switch NAME. /sessions lists your sessions.";
+pub const LINK_USAGE: &str = "Usage: /link API_USER_ID. Choose a never-used API user ID.";
 pub const FAILED: &str = "Something went wrong on my side. Try again in a moment.";
 
 /// The command menu: name, description. Registered with Telegram at startup
@@ -123,6 +124,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("sessions", "List your sessions; * marks the current one"),
     ("switch", "Talk in another session: /switch NAME"),
     ("usage", "Tokens used per session"),
+    (
+        "link",
+        "Share your sessions with the API: /link API_USER_ID",
+    ),
     ("help", "What this bot is and its commands"),
 ];
 
@@ -212,6 +217,8 @@ pub enum Input<'a> {
     /// `/switch [NAME]`.
     Switch(Option<&'a str>),
     Usage,
+    /// `/link [API_USER_ID]`, handled directly, never sent to the model.
+    Link(Option<&'a str>),
     /// A well-formed command this bot does not have.
     Unknown(&'a str),
     /// Anything else: a prompt for the model.
@@ -242,6 +249,7 @@ pub fn parse(text: &str) -> Input<'_> {
         "sessions" => Input::Sessions,
         "switch" => Input::Switch(arg),
         "usage" => Input::Usage,
+        "link" => Input::Link(arg),
         _ => Input::Unknown(word),
     }
 }
@@ -632,6 +640,13 @@ impl<R: Run + 'static> Telegram<R> {
             Input::Switch(None) => SWITCH_USAGE.into(),
             Input::Switch(Some(name)) => self.switch(&user, name).await?,
             Input::Usage => self.usage(&user).await?,
+            Input::Link(None) => LINK_USAGE.into(),
+            Input::Link(Some(id)) => {
+                self.service.link_http_user(&user, id).await?;
+                format!(
+                    "Linked. Send `X-Athena-User: {id}` with API requests to access your sessions. Saved browser sign-ins are shared too. This trusts the private network; the header is not authentication."
+                )
+            }
             Input::Unknown(cmd) => format!("Unknown command /{cmd}.\n\n{}", command_list()),
             Input::Text(prompt) => {
                 return self
@@ -1411,6 +1426,8 @@ mod tests {
             ("/switch", Input::Switch(None)),
             ("/switch\twork", Input::Switch(Some("work"))),
             ("/usage", Input::Usage),
+            ("/link", Input::Link(None)),
+            ("/link@athena_bot  my-api ", Input::Link(Some("my-api"))),
             ("/frobnicate x", Input::Unknown("frobnicate")),
             ("/", Input::Text("/")),
             ("/usr/bin is a path", Input::Text("/usr/bin is a path")),
@@ -1830,6 +1847,25 @@ mod tests {
         assert_eq!(h.sessions(42), [("default".to_string(), 2)]);
         assert_eq!(h.selected(42), None);
         assert!(h.logged().is_empty(), "{:?}", h.logged());
+    }
+
+    #[tokio::test]
+    async fn link_is_a_direct_command_and_never_reassigns_another_user() {
+        let h = harness(vec![]);
+        assert_eq!(h.reply(42, "/link").await, LINK_USAGE);
+        let linked = h.reply(42, "/link my-api").await;
+        assert!(linked.contains("X-Athena-User: my-api"), "{linked}");
+        assert_eq!(h.reply(42, "/link my-api").await, linked);
+        assert_eq!(
+            h.store.user("http", "my-api").unwrap().id(),
+            h.user(42).id()
+        );
+        let refused = h.reply(43, "/link my-api").await;
+        let conflict = "already belongs to another user";
+        assert!(refused.contains(conflict), "{refused}");
+        let invalid = h.reply(42, "/link café").await;
+        assert!(invalid.contains("printable ASCII"), "{invalid}");
+        assert!(h.sessions(42).is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
