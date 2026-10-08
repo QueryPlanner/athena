@@ -20,6 +20,8 @@ cargo clippy --all-targets --locked -- -D warnings
 CI (`.github/workflows/ci-cd.yml`) runs the same three commands on every pull
 request. `coverage.sh` also runs the unit and integration tests. CI also runs:
 
+- `python3 scripts/test_release_policy.py` checks release admission, mode selection,
+  pagination and failed or missing job evidence;
 - `shellcheck scripts/*.sh`, `scripts/setup-host.sh --dry-run` (no root), and
   `scripts/test-analytics.sh` (every DuckDB query against fixtures laid out
   like `/var/lib/athena/<env>/telemetry/`; it passes on DuckDB 1.4 and 1.5);

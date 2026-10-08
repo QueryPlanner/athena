@@ -31,7 +31,7 @@ accepts it only if it matches one of these, word for word:
 | Key | Commands |
 |---|---|
 | staging | `deploy staging <digest> [KEY=VALUE ...]`, `smoke staging`, `bench staging`, `eval staging`, `status staging` |
-| prod | `promote prod <digest> [KEY=VALUE ...]`, `smoke prod`, `status prod` |
+| prod | `promote prod <digest> [KEY=VALUE ...]`, `deploy prod <digest> [KEY=VALUE ...]`, `smoke prod`, `status prod` |
 
 `<digest>` must be `sha256:` followed by 64 lowercase hex digits. Anything
 else, including extra words, shell syntax or the other environment's
@@ -127,6 +127,7 @@ normally already cached from staging, so nothing is pulled.
 ATHENA_REPO=ghcr.io/queryplanner/athena
 ATHENA_KEEP_RELEASES=3
 ORAS=/usr/local/bin/oras
+ATHENA_DEPLOY_MODE=staged
 ```
 
 Env files use systemd's `EnvironmentFile=` syntax. As in systemd, `$VAR` is
@@ -160,3 +161,37 @@ unit tests in `src/gate/` run the real logic against a temporary root and a
 fake VM (`src/gate/testing.rs`) that behaves like systemd, ORAS, `athena`
 and `athena serve`. `tests/deploy_gate.rs` runs the built binary, but only
 with input it must reject, because the binary is rooted at `/`.
+
+## Skip staging deployments for prototyping
+
+The default mode is `staged`. Optional `direct` mode skips staging deployments
+and their benchmark, smoke and evaluation jobs. Staging resources stay installed.
+Main still runs format, lint, coverage, replay, integration and sandbox checks
+before publishing the release artifact. A release tag remains the production decision.
+
+Before enabling direct mode, an administrator must install the new deployment
+gate with `install-gate <digest>` from a validated release containing this change.
+An older gate rejects `deploy prod`; publishing the workflow does not update the VM gate.
+Follow `SETUP.md` and its approval checkpoints for any host changes.
+
+1. Set `ATHENA_DEPLOY_MODE=direct` in root-owned `/etc/athena/gate.env` with `sudoedit`.
+2. Set the repository variable `ATHENA_DEPLOY_MODE` to `direct` in GitHub Actions.
+   Use a repository variable, not an environment variable.
+3. Merge the prototype. Wait for its main validation and artifact build to pass.
+4. Create the release tag through the normal release process. CI uses
+   `deploy prod <digest>`, then runs the production smoke check.
+
+The production key cannot change this policy through command settings.
+`deploy prod` keeps the existing backup, health/version and rollback behavior.
+`promote prod` always requires a matching staging deployment, even in direct mode.
+Direct mode removes the VM rehearsal; local testing does not replace its evidence.
+
+When running setup again, include `--deploy-mode direct` to retain this choice.
+The setup flag defaults to `staged` and rewrites the gate configuration.
+Review its `--dry-run` output before applying setup changes.
+
+To return to staged releases, set the GitHub repository variable to `staged`
+or remove it, and set the VM gate mode to `staged`. Rerun the main workflow for
+the commit being released so its staging jobs run before creating a release tag.
+The verifier inspects individual jobs and will reject an earlier direct-mode run
+as staging evidence.

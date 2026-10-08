@@ -4,6 +4,12 @@ A runbook for a coding agent or a person. It takes one Linux VM on your
 Tailscale tailnet and this GitHub repository to: staging and prod on the VM,
 deployed by GitHub Actions, with traces, logs and analytics.
 
+Staged releases are the default. For faster prototyping, the optional
+[direct deployment mode](DEPLOY.md#skip-staging-deployments-for-prototyping)
+skips staging deployments while keeping staging installed. Install the updated
+gate before enabling it. When running setup in direct mode, add
+`--deploy-mode direct` to both dry-run and approved setup commands.
+
 The design is in `plans/production-template.md`; names, paths and ports are
 in `plans/contracts.md`.
 

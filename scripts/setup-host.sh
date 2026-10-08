@@ -32,6 +32,7 @@ DUCKDB_URL="https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION
 # ---- defaults ----
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 ATHENA_REPO=ghcr.io/queryplanner/athena
+DEPLOY_MODE=staged
 PORT_PROD=18080
 PORT_STAGING=18081
 PORT_O2=5080
@@ -67,6 +68,7 @@ Usage: setup-host.sh [options]
   --host-alias NAME          extra Host name accepted by Athena (default athena-vm)
   --o2-email EMAIL           OpenObserve root user (default admin@athena.internal)
   --repo REF                 release repository (default ghcr.io/queryplanner/athena)
+  --deploy-mode MODE         staged (default) or direct; keeps staging installed
   --skip-observability       do not install OpenObserve (Athena still writes JSONL)
   --uninstall                stop and remove Athena's units, binaries and rules;
                              keeps /etc/athena and the databases
@@ -92,6 +94,7 @@ while [ $# -gt 0 ]; do
         --host-alias) HOST_ALIAS="${2:?}"; shift ;;
         --o2-email) O2_EMAIL="${2:?}"; shift ;;
         --repo) ATHENA_REPO="${2:?}"; shift ;;
+        --deploy-mode) DEPLOY_MODE="${2:?}"; shift ;;
         --skip-observability) SKIP_OBSERVABILITY=1 ;;
         --uninstall) UNINSTALL=1 ;;
         --purge) PURGE=1 ;;
@@ -101,6 +104,11 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+case "$DEPLOY_MODE" in
+    staged|direct) ;;
+    *) die "--deploy-mode must be staged or direct" ;;
+esac
 
 [ "$PURGE" = 1 ] && [ "$UNINSTALL" = 0 ] && die "--purge only makes sense with --uninstall"
 if [ -n "$GATE_DIGEST" ] && ! [[ "$GATE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -126,7 +134,7 @@ if [ -n "$VM" ]; then
     [ -n "$GATE_DIGEST" ] && fwd+=(--gate-digest "$GATE_DIGEST")
     [ -n "$TAILNET_IP" ] && fwd+=(--tailnet-ip "$TAILNET_IP")
     fwd+=(--port-prod "$PORT_PROD" --port-staging "$PORT_STAGING" --host-alias "$HOST_ALIAS"
-          --o2-email "$O2_EMAIL" --repo "$ATHENA_REPO")
+          --o2-email "$O2_EMAIL" --repo "$ATHENA_REPO" --deploy-mode "$DEPLOY_MODE")
     if [ -n "$STAGING_PUBKEY" ]; then
         cp "$STAGING_PUBKEY" "$stage/keys/ci-staging.pub"; fwd+=(--ci-staging-pubkey keys/ci-staging.pub)
     fi
@@ -553,7 +561,8 @@ ensure_env_files() {
         fi
         todo "type the secrets into $file yourself: sudoedit $file"
     done
-    printf 'ATHENA_REPO=%s\nATHENA_KEEP_RELEASES=3\nORAS=/usr/local/bin/oras\n' "$ATHENA_REPO" >"$WORK/gate.env"
+    printf 'ATHENA_REPO=%s\nATHENA_KEEP_RELEASES=3\nORAS=/usr/local/bin/oras\nATHENA_DEPLOY_MODE=%s\n' "$ATHENA_REPO" "$DEPLOY_MODE" >"$WORK/gate.env"
+    if [ "$DRY_RUN" = 1 ]; then cat "$WORK/gate.env" >&2; fi
     install_file "$WORK/gate.env" /etc/athena/gate.env 0644 root:root || true
 }
 

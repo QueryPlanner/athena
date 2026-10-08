@@ -236,7 +236,7 @@ The sandbox image is a separate Docker image:
 | `/opt/athena/releases/<digest-hex>/{athena,deploy-gate}` | root | cache, pruned to `ATHENA_KEEP_RELEASES` (default 3); in-use releases are never pruned |
 | `/opt/athena/<env>/current` | root | symlink to a releases dir |
 | `/etc/athena/<env>.env` | root:athena, 0640 | secrets and settings per env |
-| `/etc/athena/gate.env` | root, 0644 | `ATHENA_REPO=ghcr.io/queryplanner/athena`, `ATHENA_KEEP_RELEASES=3`, `ORAS=/usr/local/bin/oras` |
+| `/etc/athena/gate.env` | root, 0644 | `ATHENA_REPO=ghcr.io/queryplanner/athena`, `ATHENA_KEEP_RELEASES=3`, `ORAS=/usr/local/bin/oras`, `ATHENA_DEPLOY_MODE=staged` |
 | `/var/lib/athena/<env>/agent.db` | athena | the database |
 | `/var/lib/athena/<env>/backups/` | athena | last 10 per env |
 | `/var/lib/athena/gate/<env>.state.json` | root, 0644 (dir root 0755) | written by deploy-gate, outside the athena-writable `<env>/` dir because `promote` trusts it: `{"digest":..., "version":..., "deployed_at":...}` |
@@ -292,7 +292,7 @@ must be exactly one of:
 | Key | Allowed commands |
 |---|---|
 | staging | `deploy staging <digest> [KEY=VALUE ...]`, `smoke staging`, `bench staging`, `eval staging`, `status staging` |
-| prod | `promote prod <digest> [KEY=VALUE ...]`, `smoke prod`, `status prod` |
+| prod | `promote prod <digest> [KEY=VALUE ...]`, `deploy prod <digest> [KEY=VALUE ...]`, `smoke prod`, `status prod` |
 | admin (run locally as root, no `--key-env`) | `restore <env> <backup-file>`, `install-gate <digest>` |
 
 **Validation.** The line is at most 1024 bytes. `<digest>` must match
@@ -342,6 +342,13 @@ runs), so a bad setting is rolled back only together with a bad release.
 - Refuses unless `<digest>` equals staging's `state.json` digest.
 - Then runs the same steps (step 3 is skipped when the release is already cached).
 
+**`deploy prod <digest>`**
+- Refuses unless root-owned `/etc/athena/gate.env` sets `ATHENA_DEPLOY_MODE=direct`.
+  Missing mode means `staged`; invalid or empty values fail configuration validation.
+- Runs the same deployment, backup, health/version, rollback and pruning steps
+  without requiring staging state. `promote prod` still requires staging in either mode.
+- Both deployment paths hold the gate lock while checking policy and deploying.
+
 **Other commands**
 
 | Command | Does |
@@ -363,19 +370,26 @@ runs), so a bad setting is rolled back only together with a bad release.
 | `DEPLOY_SSH_KEY` | secret | environment `staging`; another in environment `prod` |
 | `VM_HOST` | variable | e.g. `100.124.202.79` |
 | `VM_KNOWN_HOSTS` | variable | the VM's host key line |
+| `ATHENA_DEPLOY_MODE` | variable, optional | repository only; `staged` by default or `direct`. Unknown values fail. Direct mode also requires the VM administrator's opt-in in `gate.env`. |
 | `OPEN_SANDBOX_URL`, `ATHENA_SANDBOX_IMAGE`, `ATHENA_SANDBOX_TIMEOUT_SECS`, `AGENT_MODEL` | variable, optional | environment `staging` and/or `prod`; sent with that env's deploy (see Settings). Never a secret. |
 
 **Jobs**
 - **pull_request:** `unit` (fmt, clippy, coverage.sh, `athena eval run --target
   replay`), then `integration` (release build plus a tests-style smoke run of the real
   binary; no model calls).
-- **push to main:** `build` (release build, `oras push` tag `sha-<sha>`, sandbox image
-  build and push), then `deploy-staging` (environment `staging`), then
-  `bench-staging`, then `smoke-staging` + `eval-staging` (advisory).
-- **push tag `v*`:** `require-stage-success` (the tagged sha's main run must be
-  green), then `deploy-prod` (environment `prod`, v* tags only, **no reviewer**;
-  `oras tag` the digest with the version, `promote prod`), then `smoke prod` as a
-  step of `deploy-prod`.
+- **all events:** `policy` validates the repository deployment mode and tests
+  release admission. Its output fixes the mode for that workflow run.
+- **push to main:** infrastructure, unit/coverage/replay, integration and sandbox
+  checks must pass before `build` publishes `sha-<sha>`. In `staged` mode,
+  `deploy-staging`, `bench-staging`, `smoke-staging` and advisory `eval-staging`
+  follow. In `direct` mode these staging jobs are skipped; staging stays installed.
+- **push tag `v*`:** `require-release-success` checks one successful main run for
+  the exact tagged SHA. Paginated job evidence must show policy, infrastructure,
+  unit, integration, build and sandbox-image success. Staged mode also requires
+  deploy-staging, bench-staging and smoke-staging success; eval stays advisory.
+  `deploy-prod` names the validated artifact by version, then calls `promote prod`
+  in staged mode or `deploy prod` in direct mode, followed by `smoke prod`.
+  Production remains restricted to release tags.
 - The release decision is pushing the tag. The `release-tags` ruleset lets only
   repo admins create, move or delete `v*` tags.
 
