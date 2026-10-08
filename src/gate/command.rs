@@ -77,6 +77,10 @@ pub enum Command {
         digest: Digest,
         settings: Vec<Setting>,
     },
+    DirectDeploy {
+        digest: Digest,
+        settings: Vec<Setting>,
+    },
     Smoke(Env),
     Bench,
     Eval,
@@ -93,7 +97,7 @@ pub enum Command {
 impl Command {
     pub fn name(&self) -> &'static str {
         match self {
-            Command::Deploy { .. } => "deploy",
+            Command::Deploy { .. } | Command::DirectDeploy { .. } => "deploy",
             Command::Promote { .. } => "promote",
             Command::Smoke(_) => "smoke",
             Command::Bench => "bench",
@@ -155,6 +159,10 @@ fn keyed(key: Env, words: &[&str]) -> Result<Command, String> {
         (Staging, ["eval", "staging"]) => Command::Eval,
         (Staging, ["status", "staging"]) => Command::Status(Staging),
         (Prod, ["promote", "prod", digest, rest @ ..]) => Command::Promote {
+            digest: parse_digest(digest)?,
+            settings: settings::parse(rest)?,
+        },
+        (Prod, ["deploy", "prod", digest, rest @ ..]) => Command::DirectDeploy {
             digest: parse_digest(digest)?,
             settings: settings::parse(rest)?,
         },
@@ -245,6 +253,13 @@ mod tests {
             assert_eq!(key("staging", &line), run(command), "{line}");
         }
         let prod = [
+            (
+                format!("deploy prod {}", digest()),
+                Command::DirectDeploy {
+                    digest: d.clone(),
+                    settings: vec![],
+                },
+            ),
             (
                 format!("promote prod {}", digest()),
                 Command::Promote {

@@ -133,6 +133,41 @@ otherwise. That flag exists so an AI agent (or you) can drive exactly what an
 HTTP client or a Telegram chat would see, from a shell. It is not an access
 control boundary: anyone who can run the binary can read the database file.
 
+## Local testing
+
+With `OPENROUTER_API_KEY` in your environment or local `.env`, run from the
+repository with a separate database. The `target` directory is git-ignored:
+
+```sh
+ATHENA_DB="$PWD/target/local-test.db" cargo run --locked -- serve --addr 127.0.0.1:9000
+```
+
+In another terminal, check startup:
+
+```sh
+curl --fail http://127.0.0.1:9000/health
+curl --fail http://127.0.0.1:9000/version
+```
+
+Stop with Ctrl-C. This is the HTTP API, with no chat interface. Model turns use
+OpenRouter; sandbox tools still require an OpenSandbox server. This command
+reuses the testing database on later runs. Keep it on loopback because the API
+trusts the caller's user header.
+
+To test the real server without model calls, run:
+
+```sh
+cargo build --release --locked
+./scripts/smoke-binary.sh target/release/athena
+```
+
+The smoke test uses a temporary database and checks HTTP endpoints, session
+creation, Host filtering, graceful shutdown and backup.
+
+For faster prototype releases, [direct deployment mode](DEPLOY.md#skip-staging-deployments-for-prototyping)
+skips staging deployments while keeping staging installed. Validation and release
+tags remain required.
+
 ## Telegram
 
     export TELEGRAM_BOT_TOKEN=123456:ABC...   # from @BotFather

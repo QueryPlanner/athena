@@ -30,6 +30,7 @@ pub struct GateConfig {
     pub repo: String,
     pub keep: usize,
     pub oras: String,
+    pub direct: bool,
 }
 
 impl GateConfig {
@@ -58,10 +59,20 @@ impl GateConfig {
                 "gate.env: ORAS {oras:?} must be an absolute path"
             )));
         }
+        let direct = match envfile::get(vars, "ATHENA_DEPLOY_MODE") {
+            None | Some("staged") => false,
+            Some("direct") => true,
+            Some(mode) => {
+                return Err(failed(format!(
+                    "gate.env: ATHENA_DEPLOY_MODE {mode:?} must be staged or direct"
+                )));
+            }
+        };
         Ok(GateConfig {
             repo: repo.to_string(),
             keep,
             oras: oras.to_string(),
+            direct,
         })
     }
 }
@@ -91,10 +102,25 @@ impl Gate<'_> {
     /// `changes` are written into the env file with the release, and the
     /// file is put back as it was if the deploy rolls back.
     pub(super) fn deploy(&self, env: Env, digest: &Digest, changes: &[Setting]) -> Result<Value> {
+        let _lock = self.lock()?;
         if env == Env::Prod {
             self.require_staged(digest)?;
         }
+        self.deploy_release(env, digest, changes)
+    }
+
+    /// Direct production deployment requires an administrator's opt-in.
+    pub(super) fn deploy_direct(&self, digest: &Digest, changes: &[Setting]) -> Result<Value> {
         let _lock = self.lock()?;
+        if !self.gate_config()?.direct {
+            return Err(Failure::Rejected(
+                "deploy prod requires ATHENA_DEPLOY_MODE=direct in root-owned gate.env".into(),
+            ));
+        }
+        self.deploy_release(Env::Prod, digest, changes)
+    }
+
+    fn deploy_release(&self, env: Env, digest: &Digest, changes: &[Setting]) -> Result<Value> {
         // Everything that can fail without changing anything goes first.
         let settings = self.settings(env)?;
         let env_file = self.layout.env_file(env);
@@ -482,15 +508,23 @@ mod tests {
             GateConfig {
                 repo: DEFAULT_REPO.into(),
                 keep: 3,
-                oras: DEFAULT_ORAS.into()
+                oras: DEFAULT_ORAS.into(),
+                direct: false,
             }
         );
         let set = GateConfig::from_vars(&pairs(&[
             ("ATHENA_REPO", "ghcr.io/x/y"),
             ("ATHENA_KEEP_RELEASES", "5"),
             ("ORAS", "/bin/oras"),
+            ("ATHENA_DEPLOY_MODE", "direct"),
         ]))
         .unwrap();
+        assert!(set.direct);
+        assert!(
+            !GateConfig::from_vars(&pairs(&[("ATHENA_DEPLOY_MODE", "staged")]))
+                .unwrap()
+                .direct
+        );
         assert_eq!(
             (set.repo.as_str(), set.keep, set.oras.as_str()),
             ("ghcr.io/x/y", 5, "/bin/oras")
@@ -501,6 +535,8 @@ mod tests {
             ("ATHENA_KEEP_RELEASES", "0", "ATHENA_KEEP_RELEASES"),
             ("ATHENA_KEEP_RELEASES", "three", "ATHENA_KEEP_RELEASES"),
             ("ORAS", "oras", "absolute"),
+            ("ATHENA_DEPLOY_MODE", "", "staged or direct"),
+            ("ATHENA_DEPLOY_MODE", "DIRECT", "staged or direct"),
         ] {
             let err = GateConfig::from_vars(&pairs(&[(key, value)])).unwrap_err();
             assert!(err.to_string().contains(message), "{key}={value}: {err}");

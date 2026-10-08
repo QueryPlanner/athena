@@ -154,6 +154,7 @@ impl<'a> Gate<'a> {
         match command {
             Command::Deploy { digest, settings } => self.deploy(Env::Staging, digest, settings),
             Command::Promote { digest, settings } => self.deploy(Env::Prod, digest, settings),
+            Command::DirectDeploy { digest, settings } => self.deploy_direct(digest, settings),
             Command::Smoke(env) => self.smoke(*env),
             Command::Bench => self.bench(),
             Command::Eval => self.eval(),
@@ -494,6 +495,69 @@ mod tests {
                 .unwrap()
                 .contains("deploy to staging first")
         );
+    }
+
+    #[test]
+    fn direct_deployment_requires_admin_policy_and_preserves_rollback() {
+        let vm = Vm::new();
+        let deploy = |hex: &str| {
+            run(
+                &vm,
+                &["--key-env", "prod"],
+                Some(&format!("deploy prod sha256:{hex}")),
+            )
+        };
+        let (code, out) = deploy(HEX_A);
+        assert_eq!(code, 2);
+        assert!(
+            out["rejected"]
+                .as_str()
+                .unwrap()
+                .contains("root-owned gate.env")
+        );
+        assert_eq!(vm.current(Env::Prod), None);
+        assert_eq!(vm.fake.effects(), Vec::<String>::new());
+
+        vm.write("etc/athena/gate.env", "ATHENA_DEPLOY_MODE=invalid\n");
+        assert_eq!(deploy(HEX_A).0, 1);
+        assert_eq!(vm.current(Env::Prod), None);
+        vm.write("etc/athena/gate.env", "ATHENA_DEPLOY_MODE=direct\n");
+        // Even in direct mode, promotion still requires staging proof.
+        let (code, _) = run(
+            &vm,
+            &["--key-env", "prod"],
+            Some(&format!("promote prod sha256:{HEX_A}")),
+        );
+        assert_eq!(code, 2);
+        let (code, out) = deploy(HEX_A);
+        assert_eq!(code, 0);
+        assert_eq!(out["command"], "deploy");
+        assert_eq!(out["env"], "prod");
+        assert_eq!(vm.current(Env::Prod).as_deref(), Some(HEX_A));
+        assert!(
+            !vm.root()
+                .join("var/lib/athena/gate/staging.state.json")
+                .exists()
+        );
+
+        vm.create_db(Env::Prod);
+        vm.fake.now.set(NOW + 100);
+        let (code, out) = deploy(HEX_B);
+        assert_eq!(code, 0);
+        assert_eq!(out["previous"], HEX_A);
+        assert!(Path::new(out["backup"].as_str().unwrap()).is_file());
+        let before = vm.state(Env::Prod);
+        vm.fake.now.set(NOW + 200);
+        vm.fake
+            .unhealthy_versions
+            .borrow_mut()
+            .push("rev-ccccccc".into());
+        let (code, out) = deploy(HEX_C);
+        assert_eq!(code, 1);
+        assert!(out["error"].as_str().unwrap().contains("rolled back to"));
+        assert_eq!(vm.current(Env::Prod).as_deref(), Some(HEX_B));
+        assert_eq!(vm.state(Env::Prod), before);
+        assert_eq!(vm.fake.count("@staging"), 0);
     }
 
     #[test]

@@ -4,7 +4,8 @@
 #                  sandbox image build + tool check
 #   push main      build (release artifact to GHCR, sandbox image)
 #                  -> deploy-staging -> bench-staging -> smoke-staging, eval-staging
-#   push tag v*    require-stage-success -> deploy-prod -> smoke-prod
+#   direct mode    main validates/builds without staging; v* deploys to prod
+#   push tag v*    require-release-success -> deploy-prod -> smoke-prod
 #                  (no approval step: the tag is the release decision, and
 #                  the v* tag ruleset lets only repo admins create one)
 #
@@ -35,6 +36,26 @@ env:
   ARTIFACT_TYPE: application/vnd.athena.release.v1
 
 jobs:
+  policy:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate deployment mode
+        id: mode
+        env:
+          DEPLOY_MODE: ${{ vars.ATHENA_DEPLOY_MODE }}
+        run: |
+          mode=$(python3 scripts/release_policy.py mode "$DEPLOY_MODE")
+          echo "mode=$mode" >>"$GITHUB_OUTPUT"
+      - name: Release admission regression tests
+        run: python3 scripts/test_release_policy.py
+
   # ---------------------------------------------------------------- CI ----
   infra-checks:
     if: github.event_name != 'push' || github.ref == 'refs/heads/main'
@@ -65,6 +86,11 @@ jobs:
           if grep -q '127.0.0.1:4318' details.txt; then
             echo "::error::an env file still points at the collector"; exit 1
           fi
+          "$GITHUB_WORKSPACE/scripts/setup-host.sh" --dry-run --tailnet-ip 100.64.0.1 --deploy-mode direct 2>direct-details.txt
+          grep -q 'ATHENA_DEPLOY_MODE=direct' direct-details.txt
+          if "$GITHUB_WORKSPACE/scripts/setup-host.sh" --dry-run --deploy-mode typo; then
+            echo "::error::setup-host accepted an invalid deployment mode"; exit 1
+          fi
           # Bad input is refused before anything else happens.
           if "$GITHUB_WORKSPACE/scripts/setup-host.sh" --dry-run --gate-digest sha256:nothex; then
             echo "::error::setup-host accepted a malformed digest"; exit 1
@@ -84,7 +110,7 @@ jobs:
           PATH="$RUNNER_TEMP:$PATH" ./scripts/test-analytics.sh
 
   unit:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -110,7 +136,7 @@ jobs:
         run: cargo run --locked --quiet -- eval run --target replay
 
   integration:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     needs: unit
     runs-on: ubuntu-24.04
     permissions:
@@ -130,6 +156,7 @@ jobs:
 
   # --------------------------------------------------------- CD: main ----
   build:
+    needs: [policy, infra-checks, unit, integration, sandbox-image]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     # Older glibc than the VM's Ubuntu 24.04, so the binary runs on both.
     runs-on: ubuntu-22.04
@@ -235,7 +262,8 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
 
   deploy-staging:
-    needs: build
+    needs: [policy, build]
+    if: needs.policy.outputs.mode == 'staged'
     runs-on: ubuntu-24.04
     environment: staging
     concurrency:
@@ -350,27 +378,47 @@ jobs:
           ts-oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
 
   # ------------------------------------------------------- CD: v* tag ----
-  require-stage-success:
+  require-release-success:
+    needs: policy
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
+      contents: read
       actions: read
       packages: read
     outputs:
       digest: ${{ steps.resolve.outputs.digest }}
       repo: ${{ steps.resolve.outputs.repo }}
+      command: ${{ steps.admit.outputs.command }}
     steps:
-      - name: The tagged commit's main run must be green
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require complete validation for the tagged commit
+        id: admit
         env:
           GH_TOKEN: ${{ github.token }}
+          DEPLOY_MODE: ${{ needs.policy.outputs.mode }}
         run: |
           set -euo pipefail
-          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci-cd.yml/runs?head_sha=$GITHUB_SHA&event=push&branch=main&status=success" --jq .total_count)
-          if [ "$runs" -lt 1 ]; then
-            echo "::error::no successful push-to-main run of ci-cd.yml for $GITHUB_SHA. Tag a commit that passed staging, or wait for its run to finish and re-run this job."
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/workflows/ci-cd.yml/runs?head_sha=$GITHUB_SHA&event=push&branch=main&status=success&per_page=100" >"$RUNNER_TEMP/runs.json"
+          jq -r --arg sha "$GITHUB_SHA" '.[] | .workflow_runs[] | select(.head_sha == $sha and .head_branch == "main" and .event == "push" and .conclusion == "success") | .id' "$RUNNER_TEMP/runs.json" >"$RUNNER_TEMP/run-ids"
+          admitted=false
+          while read -r run_id; do
+            gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100" >"$RUNNER_TEMP/jobs.json"
+            if python3 scripts/release_policy.py verify "$DEPLOY_MODE" <"$RUNNER_TEMP/jobs.json"; then
+              admitted=true
+              echo "Validated main run $run_id for $GITHUB_SHA in $DEPLOY_MODE mode" >>"$GITHUB_STEP_SUMMARY"
+              break
+            fi
+          done <"$RUNNER_TEMP/run-ids"
+          if [ "$admitted" != true ]; then
+            echo "::error::no complete successful main run for $GITHUB_SHA in $DEPLOY_MODE mode. Wait for validation, or rerun main after changing mode."
             exit 1
           fi
-          echo "main run for $GITHUB_SHA passed staging ($runs successful run(s))"
+          command=promote
+          if [ "$DEPLOY_MODE" = direct ]; then command=deploy; fi
+          echo "command=$command" >>"$GITHUB_OUTPUT"
       - name: Install oras (pinned, checksum verified)
         run: |
           set -euo pipefail
@@ -380,7 +428,7 @@ jobs:
           tar -xzf "$RUNNER_TEMP/oras.tgz" -C "$RUNNER_TEMP" oras
           sudo install -m 0755 "$RUNNER_TEMP/oras" /usr/local/bin/oras
           oras version
-      - name: Resolve the artifact staging tested
+      - name: Resolve the validated commit artifact
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
@@ -392,13 +440,13 @@ jobs:
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::cannot resolve $repo:sha-$GITHUB_SHA"; exit 1; }
           echo "digest=$digest" >>"$GITHUB_OUTPUT"
           echo "repo=$repo" >>"$GITHUB_OUTPUT"
-          echo "Promoting \`$repo@$digest\` (sha-$GITHUB_SHA) as \`$GITHUB_REF_NAME\`" >>"$GITHUB_STEP_SUMMARY"
+          echo "Releasing \`$repo@$digest\` (sha-$GITHUB_SHA) as \`$GITHUB_REF_NAME\`" >>"$GITHUB_STEP_SUMMARY"
 
   # The prod environment only admits v* tags (see scripts/init-github.sh).
   # If a reviewer is ever added there, this job waits for them; the prod smoke
   # test runs in this job so it would not ask twice.
   deploy-prod:
-    needs: require-stage-success
+    needs: require-release-success
     runs-on: ubuntu-24.04
     environment: prod
     concurrency:
@@ -423,8 +471,8 @@ jobs:
       - name: Name the release (same bytes, new tag)
         env:
           GH_TOKEN: ${{ github.token }}
-          REPO: ${{ needs.require-stage-success.outputs.repo }}
-          DIGEST: ${{ needs.require-stage-success.outputs.digest }}
+          REPO: ${{ needs.require-release-success.outputs.repo }}
+          DIGEST: ${{ needs.require-release-success.outputs.digest }}
         run: |
           set -euo pipefail
           [[ "$GITHUB_REF_NAME" =~ ^v[A-Za-z0-9._-]{1,127}$ ]] || { echo "::error::'$GITHUB_REF_NAME' is not a valid OCI tag"; exit 1; }
@@ -456,11 +504,11 @@ jobs:
           done
           echo "words=$words" >>"$GITHUB_OUTPUT"
           echo "Settings sent with the deploy:${words:- none}" >>"$GITHUB_STEP_SUMMARY"
-      - name: Promote to prod, then smoke-prod
+      - name: Deploy release to prod, then smoke-prod
         uses: ./.github/actions/gate
         with:
           commands: |
-            promote prod ${{ needs.require-stage-success.outputs.digest }}${{ steps.settings.outputs.words }}
+            ${{ needs.require-release-success.outputs.command }} prod ${{ needs.require-release-success.outputs.digest }}${{ steps.settings.outputs.words }}
             smoke prod
           host: ${{ vars.VM_HOST }}
           known-hosts: ${{ vars.VM_KNOWN_HOSTS }}
