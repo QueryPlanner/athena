@@ -125,8 +125,7 @@ recorded with skills calls `read_skill`, so replaying it needs the same
   Instructions and skills are code-equivalent. The model follows them with
   the same authority as the built-in preamble, and a skill can tell it to run
   shell commands, send files or browse. Only install skills you have read.
-  They are local files: Athena has no skill registry and never fetches a skill
-  from the network.
+  They are local files: Athena never fetches one of these from the network.
 </Callout>
 
 - `read_skill` returns only what was loaded at startup. It looks the name up
@@ -141,3 +140,34 @@ recorded with skills calls `read_skill`, so replaying it needs the same
 - The instructions and the skills list are part of the system prompt.
   Telemetry exports prompts, so anything in these files reaches your trace
   and log backends. Put no secrets in them.
+
+## The user's own skills
+
+Each user can also keep skills of their own, separate from these: installed
+from a public GitHub repository or written in a conversation, and stored in
+`ATHENA_DB` under that user. They are not in the system prompt and not
+trusted like the owner's. The prompt ends with a short section saying they
+exist, and the agent reaches them with `skill_list`, `skill_read`,
+`skill_install`, `skill_create`, `skill_confirm` and `skill_remove`.
+
+- `skill_read` returns a skill between two lines of a delimiter made fresh for
+  each call, after a label. A GitHub skill is labelled untrusted third-party
+  content, with its repository and commit; a created one is the user's notes.
+- Adding one takes two calls. `skill_install` or `skill_create` returns a
+  preview (name, description, source repository, pinned commit, files and
+  sizes, an excerpt of the body) and a short-lived `preview_id`, and saves
+  nothing. The agent shows it and asks the user; after the user agrees in the
+  chat it calls `skill_confirm(preview_id)`, which saves what was previewed.
+  A preview expires after 10 minutes, works once, and only for the same user
+  and session. Athena does not check that the user agreed: it relies on the
+  model asking, so injected content could trigger an install (see
+  [Known limits](/docs/known-limits)).
+- GitHub is read on the host, without credentials (public repositories, 60
+  requests an hour), at the commit the ref resolves to. `SKILL.md` follows the
+  rules above; its name must match its directory, or the repository's name at
+  the root. Other text files are kept: at most 32 of them, 64 KiB each and
+  256 KiB in all. Binary and oversized files are skipped.
+- A user keeps at most 64 skills. Files are stored, not copied into the
+  sandbox.
+
+The limits and the stored columns are in `plans/contracts.md`.

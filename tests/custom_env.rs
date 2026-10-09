@@ -111,7 +111,12 @@ fn the_production_build_sends_the_environments_instructions_and_skills() {
     let prompt: String = parts.iter().map(|p| p["text"].as_str().unwrap()).collect();
     assert!(prompt.starts_with(agent::PREAMBLE));
     assert!(prompt.contains("## Custom instructions\n\nCall the user Boss."));
-    assert!(prompt.ends_with("- house-style: How we write."), "{prompt}");
+    // The owner's skills are listed; the user's own skills come after them,
+    // only as a pointer to the skill tools.
+    let owners = prompt
+        .strip_suffix(athena::user_skills::PREAMBLE)
+        .expect("the user-skills section ends the prompt");
+    assert!(owners.ends_with("- house-style: How we write."), "{prompt}");
     let tools: Vec<&str> = body["tools"]
         .as_array()
         .unwrap()
@@ -139,6 +144,12 @@ fn the_production_build_sends_the_environments_instructions_and_skills() {
             "reminder_confirm",
             "reminder_create",
             "reminder_list",
+            "skill_confirm",
+            "skill_create",
+            "skill_install",
+            "skill_list",
+            "skill_read",
+            "skill_remove",
             "timezone_set",
             "workout_history",
             "workout_last",

@@ -67,6 +67,14 @@ description: What athena does not do yet. Read this before exposing it.
   its id and confirmation code, so a page or file cannot schedule one by
   itself; but a user who confirms a task without reading the preview gives
   it the same authority as their own message, every time it runs.
+- A user's own skills (`skill_install`, `skill_create`) are added in two
+  steps, a preview and then `skill_confirm(preview_id)`, but nothing checks
+  that the user agreed in the chat. The agent is told to show the preview and
+  ask first; Athena relies on the model doing so. A web page, file or skill
+  that talks the model into confirming could therefore install a skill. The
+  preview expires after 10 minutes, works once and is tied to the user and
+  session; GitHub text is labelled untrusted when read, and skills are only
+  read, never run. A user's skill can still steer the model afterwards.
 - Axum answers some malformed requests itself, outside the JSON error
   shape: unknown paths (`404`), wrong methods (`405`), bodies over 2 MB
   (`413`).

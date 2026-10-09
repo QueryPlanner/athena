@@ -59,9 +59,46 @@ the details.
 
 Treat both like code. The model follows them with the authority of its own
 preamble, so a skill from someone else is instructions you have chosen to
-run. They are local files only: Athena has no skill registry and fetches
-nothing. They are part of the system prompt, which telemetry exports with
+run. They are local files only, and Athena never fetches one. They are part of the system prompt, which telemetry exports with
 every other prompt (see Observability), so put no secrets in them.
+
+### The user's own skills
+
+Separately from the owner's skills, each user can keep skills of their own,
+stored in `ATHENA_DB` under their user and shared by their linked Telegram and
+API identities. They are never listed in the system prompt: the agent reaches
+them through six tools, and the prompt only says they exist.
+
+| Tool | What it does |
+|---|---|
+| `skill_list` | the user's skills: name, description, origin, source and file count |
+| `skill_read(name, file?)` | a skill's instructions, or one of its files, fenced and labelled with where it came from |
+| `skill_install(repo, path, ref)` | preview a skill from a public GitHub repository; saves nothing |
+| `skill_create(name, description, body)` | preview a skill written in the conversation; saves nothing |
+| `skill_confirm(preview_id)` | save a previewed skill |
+| `skill_remove(name)` | remove one |
+
+Adding a skill takes two calls. `skill_install` or `skill_create` saves
+nothing: it returns a preview (name, description, source repository and pinned
+commit, files and sizes, an excerpt of the instructions) and a short-lived
+`preview_id` (10 minutes, one use, tied to your user and session). The agent
+shows you the preview and asks. Only after you agree in the chat does it call
+`skill_confirm(preview_id)`, which saves exactly what was previewed.
+
+Athena does not check that you agreed: it relies on the model asking you. A
+web page, file or skill that talks the model into confirming could add a skill
+without you. The preview, expiry, size limits and the untrusted labelling of
+GitHub text limit the damage; they do not remove the risk. Read the preview
+before you say yes (see [Known limits](docs/content/docs/known-limits.mdx)).
+
+A skill from GitHub is read on the host through GitHub's public API, without
+credentials (so public repositories only, and 60 requests an hour), at the
+commit its ref resolved to. Its `SKILL.md` follows the same rules as the
+owner's skills, and its other text files are kept (at most 32, 256 KiB in all;
+binary and oversized files are skipped). `skill_read` labels it untrusted
+third-party content, like a web page. A skill created in a conversation is
+labelled as the user's notes. Files are stored, not copied into the sandbox.
+A user keeps at most 64 skills.
 
 ## Run
 
@@ -597,8 +634,8 @@ connects only when a command runs a turn. A server that dies later fails its
 tool calls until athena restarts: there is no reconnect.
 
 **Names and shapes.** A tool keeps the name its server gave it: Rig cannot
-rename an MCP tool. A tool whose name an athena tool has (`add`, `read_skill` and the
-sandbox tools, whether or not they are set up) or a server earlier in name
+rename an MCP tool. A tool whose name an athena tool has (`add`, `read_skill`, the
+calorie and user skill tools, and the sandbox tools, whether or not they are set up) or a server earlier in name
 order has is skipped with a warning; the official filesystem server's
 `read_file` and `write_file` are lost this way. So is a tool a model provider
 would refuse, which fails every request: a name of more than 64 characters or
@@ -690,6 +727,8 @@ Caddy or Tailscale settings, and never overwrites a file holding secrets.
     src/search.rs      web_search: Exa's search API, when EXA_API_KEY is set
     src/custom.rs      the owner's instructions file and skills; custom/ has
                        the front matter parser and the skills and read_skill
+    src/user_skills.rs each user's own skills and their tools; user_skills/
+                       has the GitHub reader
     src/media.rs       images and files: the provider adapter, the outbox,
                        stripping images from transcripts
     src/cli.rs         the CLI transport: arguments, output, REPL

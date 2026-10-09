@@ -187,7 +187,14 @@ fn read(root: &Path, dir: &str) -> Result<Skill, String> {
         return Err("SKILL.md is a link to a file outside the skills directory".into());
     }
     let text = read_limited(&file, MAX_SKILL_BYTES).map_err(|why| format!("SKILL.md: {why}"))?;
-    let (block, body) = frontmatter::split(&text)?;
+    parse(&text, dir)
+}
+
+/// The skill a `SKILL.md`'s `text` describes, in directory `dir`, or why it
+/// is not one. Skills fetched from GitHub (`crate::user_skills`) are read
+/// here too, so both follow the same rules.
+pub(crate) fn parse(text: &str, dir: &str) -> Result<Skill, String> {
+    let (block, body) = frontmatter::split(text)?;
     let front = frontmatter::parse(block)?;
     validate(&front, dir)?;
     Ok(Skill {
@@ -215,7 +222,7 @@ fn clean_body(body: &str) -> String {
 }
 
 /// The specification's rules for the fields it defines.
-fn validate(front: &FrontMatter, dir: &str) -> Result<(), String> {
+pub(crate) fn validate(front: &FrontMatter, dir: &str) -> Result<(), String> {
     let name = front.name.as_deref().ok_or("`name` is missing")?;
     let description = front
         .description

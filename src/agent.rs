@@ -8,6 +8,7 @@ use crate::policy::ToolPolicy;
 use crate::sandbox::{self, Sandboxes};
 use crate::search::WebSearch;
 use crate::store::{SqliteMemory, Store};
+use crate::user_skills::github::GitHub;
 use anyhow::Result;
 use rig_agent as rig;
 use rig_agent::prelude::*;
@@ -166,6 +167,7 @@ pub fn reserved_tool_names() -> Vec<&'static str> {
         .chain(crate::timezone::NAMES)
         .chain(crate::workouts::NAMES)
         .chain(crate::reminders::NAMES)
+        .chain(crate::user_skills::NAMES)
         .collect()
 }
 
@@ -269,7 +271,8 @@ pub fn configure_all(
 }
 
 /// Configure a persistent agent with native calorie, workout, time and
-/// reminder tools, and `web_search` when `search` is given: what
+/// reminder tools, the user's own skills (`user_skills`, installed from
+/// GitHub's public API), and `web_search` when `search` is given: what
 /// [`build_with`] builds.
 /// Use the same store for the builder's memory and the tools.
 pub fn configure_persistent(
@@ -280,7 +283,31 @@ pub fn configure_persistent(
     store: crate::store::Store,
     search: Option<WebSearch>,
 ) -> rig::agent::Agent {
-    configure_stored(builder, sandboxes, custom, mcp, Some(store), search)
+    configure_stored(
+        builder,
+        sandboxes,
+        custom,
+        mcp,
+        Some((store, GitHub::default())),
+        search,
+    )
+}
+
+/// [`configure_persistent`] with the GitHub API `github` for
+/// `skill_install`: tests give it a fake.
+pub fn configure_persistent_with_github(
+    builder: rig::agent::AgentBuilder,
+    store: crate::store::Store,
+    github: GitHub,
+) -> rig::agent::Agent {
+    configure_stored(
+        builder,
+        None,
+        &Custom::default(),
+        &Mcp::none(),
+        Some((store, github)),
+        None,
+    )
 }
 
 fn configure_stored(
@@ -288,15 +315,21 @@ fn configure_stored(
     sandboxes: Option<Arc<Sandboxes>>,
     custom: &Custom,
     mcp: &Mcp,
-    store: Option<crate::store::Store>,
+    store: Option<(crate::store::Store, GitHub)>,
     search: Option<WebSearch>,
 ) -> rig::agent::Agent {
+    let mut preamble = custom.preamble(PREAMBLE);
+    if store.is_some() {
+        // Only says the tools exist: the skills themselves are the user's,
+        // not the owner's, so they are never listed in the preamble.
+        preamble.push_str(crate::user_skills::PREAMBLE);
+    }
     let builder = builder
         .name(NAME)
         // Always: every prompt, system prompt, reply and tool call goes on
         // spans, so the telemetry sinks export all of it.
         .record_content_telemetry(true)
-        .preamble(&custom.preamble(PREAMBLE))
+        .preamble(&preamble)
         .tool(Add)
         .add_hook(ToolPolicy::default().limiting_results_of(mcp.tool_names()))
         // No limit on model calls per reply, nor on tool calls (`policy.rs`):
@@ -304,11 +337,12 @@ fn configure_stored(
         .default_max_turns(usize::MAX);
     let builder = custom.register(builder);
     let builder = match store {
-        Some(store) => {
+        Some((store, github)) => {
             let builder = crate::calories::register(builder, store.clone());
             let builder = crate::workouts::register(builder, store.clone());
             let builder = crate::timezone::register(builder, store.clone());
-            crate::reminders::register(builder, store)
+            let builder = crate::reminders::register(builder, store.clone());
+            crate::user_skills::register(builder, store, github)
         }
         None => builder,
     };
@@ -368,7 +402,7 @@ mod tests {
             sandboxes(Some(config), &store),
             &custom,
             &Mcp::none(),
-            Some(store.clone()),
+            Some((store.clone(), GitHub::default())),
             // Registered so its name is checked; the prompt never calls it.
             WebSearch::new("k", "http://127.0.0.1:1/search", crate::search::TIMEOUT),
         );

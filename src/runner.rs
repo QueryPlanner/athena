@@ -24,7 +24,7 @@ pub struct Conversation(pub String);
 /// The text the user sent to start a run, as the transport received it.
 /// Tools that need the user's own consent check it here: the model can
 /// relay a request to the user, but it cannot write the user's message.
-/// `user_skills` looks for a confirmation code in it.
+/// `reminders` looks for a confirmation code in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserText(pub String);
 
