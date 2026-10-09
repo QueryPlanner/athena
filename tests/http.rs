@@ -867,6 +867,7 @@ fn athena_serve(
         .env_remove("ATHENA_ALLOWED_HOSTS")
         .env_remove("ATHENA_VERSION")
         .env_remove("OPEN_SANDBOX_URL")
+        .env_remove("EXA_API_KEY")
         .env_remove("OPENROUTER_API_KEY");
     if let Some(key) = key {
         command.env("OPENROUTER_API_KEY", key);

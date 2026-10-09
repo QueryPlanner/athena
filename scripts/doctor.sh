@@ -123,7 +123,7 @@ for e in staging prod; do
 done
 for e in staging prod; do
     echo "env_$e=$(stat -c '%a %U:%G' /etc/athena/$e.env 2>/dev/null || echo missing)"
-    for k in OPENROUTER_API_KEY TELEGRAM_BOT_TOKEN OPEN_SANDBOX_URL OPEN_SANDBOX_API_KEY \
+    for k in OPENROUTER_API_KEY TELEGRAM_BOT_TOKEN OPEN_SANDBOX_URL OPEN_SANDBOX_API_KEY EXA_API_KEY \
         ATHENA_TELEMETRY_DIR OTEL_EXPORTER_OTLP_ENDPOINT OTEL_EXPORTER_OTLP_HEADERS; do
         v=$(s grep -c "^$k=..*" /etc/athena/$e.env 2>/dev/null); rc=$?
         [ "$rc" = 99 ] && v=nosudo
@@ -184,6 +184,10 @@ else
         if [ "$k" != nosudo ] && [ "$(get "secret_${e}_OPEN_SANDBOX_URL")" != 0 ]; then
             if [ "$(get "secret_${e}_OPEN_SANDBOX_API_KEY")" != 0 ]; then check "$e sandbox auth" pass "API key set"
             else check "$e sandbox auth" warn "OPEN_SANDBOX_URL set without OPEN_SANDBOX_API_KEY (sandbox server is open to the tailnet)"; fi
+        fi
+        if [ "$k" != nosudo ]; then
+            if [ "$(get "secret_${e}_EXA_API_KEY")" != 0 ]; then check "$e web search" pass "EXA_API_KEY present (value not read)"
+            else check "$e web search" skip "EXA_API_KEY is not set: no web_search tool"; fi
         fi
         if [ "$k" != nosudo ]; then
             files=$(get "telemetry_$e")

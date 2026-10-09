@@ -298,6 +298,7 @@ fn athena_with(
         .env_remove("ATHENA_DB")
         .env_remove("ATHENA_VERSION")
         .env_remove("OPENROUTER_API_KEY")
+        .env_remove("EXA_API_KEY")
         .env_remove("AGENT_MODEL")
         .env_remove("ATHENA_COMPACT_AT")
         .env_remove("ATHENA_COMPACT_MODEL")

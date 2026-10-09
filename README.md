@@ -21,7 +21,8 @@ Edit `src/agent.rs`. That is the only file that changes.
     }
 
 `configure_with` defines the agent without persistent tools (`configure` also
-omits sandbox tools). `configure_persistent` adds native calorie and time tools using
+omits sandbox tools). `configure_persistent` adds native calorie and time tools
+(and `web_search` when given a `WebSearch`) using
 the supplied `Store`. Production wraps it around the OpenRouter client;
 tests can wrap it around Rig's mock model. Give the builder conversation
 memory first (`builder.memory(service.memory())`) and use the same store for
@@ -115,6 +116,7 @@ set it), else the crate version with `-dev`.
 | `ATHENA_ALLOWED_HOSTS` | `serve` | unset | Comma list of `HOST` or `HOST:PORT` the API answers; see HTTP API |
 | `ATHENA_INSTRUCTIONS` | all | unset | File of instructions added to the system prompt; see Instructions and skills |
 | `ATHENA_SKILLS_DIR` | all | unset | Directory of Agent Skills; see Instructions and skills |
+| `EXA_API_KEY` | all | unset: no `web_search` tool | Exa API key for the `web_search` tool; see Web search |
 | `TELEGRAM_BOT_TOKEN` | `telegram` | none, required | Bot token from @BotFather |
 | `TELEGRAM_API_URL` | `telegram` | `https://api.telegram.org` | Bot API server; the tests point it at a fake one |
 | `CLOUDFLARE_ACCOUNT_ID` | `telegram` | unset | With `CLOUDFLARE_API_TOKEN`, transcribe voice notes; see Telegram |
@@ -304,13 +306,37 @@ against the host's `/usr/share/zoneinfo`, or a copy built into the binary
 when the host has none. Code that needs the user's "today" calls
 `Store::today(owner, jiff::Timestamp::now())`.
 
+## Web search
+
+With `EXA_API_KEY` set, the agent has `web_search(query, num_results)`: it
+calls Exa's search API (`POST https://api.exa.ai/search`) from the machine
+running athena and returns up to 10 results (default 5), each with its
+title, URL, publication date when Exa knows it, and up to three short
+highlights. Without the key the tool does not exist, and the name is still
+kept from MCP tools.
+
+- The result is text from web pages, so it is wrapped in markers that carry
+  a fresh nonce per call and labelled untrusted; the agent is told never to
+  follow instructions in it.
+- The tool cuts its own result to 64 KiB (`policy::MAX_RESULT_BYTES`): the
+  policy hook limits only MCP tools.
+- A search gives up after 30 s. Errors name the HTTP status (a refused key,
+  the rate limit, rejected parameters) and never contain the key, which is
+  sent only as the `x-api-key` header; redirects are not followed.
+- Like every tool call, the query and the result are stored in the session
+  and recorded on telemetry spans.
+- Evals (`configure_custom`) do not have the tool.
+
+On the VM, a human adds `EXA_API_KEY=...` to `/etc/athena/<env>.env` with
+`sudoedit` and restarts the units.
+
 ## Sandbox and browser tools
 
 Tools that touch a computer run in a sandbox on an
 [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) server, never
 on the machine running athena. Native calorie and time tools access only Athena’s
-SQLite store. Other host tools are `add` and the tools of the MCP servers
-you list (see "Tools from MCP servers").
+SQLite store. Other host tools are `add`, `web_search` (see "Web search") and
+the tools of the MCP servers you list (see "Tools from MCP servers").
 
 | Tool | What it does |
 |---|---|
@@ -604,6 +630,7 @@ Caddy or Tailscale settings, and never overwrites a file holding secrets.
     src/sandbox.rs     per-session OpenSandbox sandboxes; sandbox/ has the
                        HTTP client, stream parser, quoting and the tools
     src/policy.rs      the tool-call argument-size hook
+    src/search.rs      web_search: Exa's search API, when EXA_API_KEY is set
     src/custom.rs      the owner's instructions file and skills; custom/ has
                        the front matter parser and the skills and read_skill
     src/media.rs       images and files: the provider adapter, the outbox,

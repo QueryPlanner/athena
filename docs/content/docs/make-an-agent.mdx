@@ -18,7 +18,8 @@ pub fn configure(builder: AgentBuilder) -> Agent {
 ```
 
 The template ships one host tool, `add`, plus sandbox and browser tools when
-`OPEN_SANDBOX_URL` is set (see the README), the tools of any [MCP servers](/docs/mcp)
+`OPEN_SANDBOX_URL` is set (see the README), `web_search` when `EXA_API_KEY` is set
+(see [Configuration](/docs/configuration)), the tools of any [MCP servers](/docs/mcp)
 you list, and the default model
 `openai/gpt-6-luna`. `AGENT_MODEL` overrides the model at runtime.
 

@@ -539,6 +539,7 @@ async fn linked_channels_share_food_through_the_real_agent_loop() {
         &athena::custom::Custom::default(),
         &athena::mcp::Mcp::none(),
         store.clone(),
+        None,
     );
     for (u, s, p) in [
         (&tg, &a, "log"),
@@ -597,6 +598,7 @@ async fn linked_channels_share_food_through_the_real_agent_loop() {
         &athena::custom::Custom::default(),
         &athena::mcp::Mcp::none(),
         store.clone(),
+        None,
     );
     for prompt in ["history", "summary", "correct", "remove"] {
         service

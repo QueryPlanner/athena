@@ -412,6 +412,7 @@ fn athena(list: &[&str]) -> std::process::Output {
         .current_dir(dir.path())
         .env_remove("ATHENA_DB")
         .env_remove("OPENROUTER_API_KEY")
+        .env_remove("EXA_API_KEY")
         .env_remove("ATHENA_JUDGE_MODEL")
         .env_remove("ATHENA_INSTRUCTIONS")
         .env_remove("ATHENA_SKILLS_DIR")
