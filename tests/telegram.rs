@@ -899,6 +899,112 @@ async fn a_captioned_video_is_neither_a_prompt_nor_a_command() {
     assert_eq!(selected(&tmp, "14"), None);
 }
 
+// ---- voice notes ----
+
+/// What a fake Workers AI endpoint was sent: the path, the Authorization
+/// header and the JSON body.
+type Transcribed = Arc<Mutex<Vec<(String, String, serde_json::Value)>>>;
+
+/// A fake Cloudflare Workers AI on loopback that hears `text` in every
+/// note. Returns its base URL and what it was sent.
+async fn fake_cloudflare(text: &'static str) -> (String, Transcribed) {
+    let seen = Transcribed::default();
+    let sink = seen.clone();
+    let app = axum::Router::new().fallback(
+        move |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+            let sink = sink.clone();
+            async move {
+                let auth = headers["authorization"].to_str().unwrap().to_string();
+                let body = serde_json::from_slice(&body).unwrap();
+                sink.lock()
+                    .unwrap()
+                    .push((uri.path().to_string(), auth, body));
+                axum::Json(json!({"success": true, "errors": [], "result": {"text": text}}))
+            }
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/client/v4", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (url, seen)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn voice_notes_and_audio_files_become_turns_through_cloudflare() {
+    const VOICE: &[u8] = b"OggS\0\x02 opus voice";
+    const AUDIO: &[u8] = b"ID3\x04 an mp3";
+    let tmp = TempDb::new();
+    let api = FakeApi::start().await;
+    let (cf_url, transcribed) = fake_cloudflare("log a 5k run").await;
+    api.host_file("vn", "voice/file_1.oga", VOICE);
+    api.host_file("au", "music/file_2.mp3", AUDIO);
+    // Reported as small, but longer than a voice note may be.
+    let oversized = vec![b'x'; telegram::voice::VOICE_LIMIT + 1];
+    api.host_file("liar", "voice/file_3.oga", &oversized);
+    let store = tmp.open();
+    let service = Service::new(store.clone(), "m", |_| {});
+    let (agent, model) = mock_agent(&service, [MockTurn::text("one"), MockTurn::text("two")]);
+    let logged = Logged::default();
+    let sink = logged.clone();
+    let log: Log = Arc::new(move |m| sink.lock().unwrap().push(m.to_string()));
+    let whisper = telegram::voice::Whisper::new("acct1", "cf-test-token", &cf_url).unwrap();
+    let app = Telegram::new(Arc::new(service), store, agent, log).voice(Some(Arc::new(whisper)));
+    let running = run(&api, Arc::new(app)).await;
+    let note = |kind: &str, id: &str, mime: &str| {
+        let file = json!({
+            "file_id": id, "file_unique_id": id, "duration": 3, "mime_type": mime, "file_size": 20
+        });
+        (kind.to_string(), file)
+    };
+
+    let (kind, file) = note("voice", "vn", "audio/ogg");
+    api.push(media_from(40, (&kind, file), Some("/new cardio")));
+    api.messages_to(40, 1).await;
+    let (kind, file) = note("audio", "au", "audio/mpeg");
+    api.push(media_from(40, (&kind, file), None));
+    api.messages_to(40, 2).await;
+    let (kind, file) = note("voice", "liar", "audio/ogg");
+    api.push(media_from(40, (&kind, file), None));
+    let replies = api.messages_to(40, 3).await;
+    running.stop().await.unwrap();
+
+    assert_eq!(replies, ["one", "two", telegram::NOT_HEARD]);
+    let fetched: Vec<_> = api
+        .calls_to("getFile")
+        .iter()
+        .map(|c| c.body["file_id"].clone())
+        .collect();
+    assert_eq!(fetched, [json!("vn"), json!("au"), json!("liar")]);
+    // The oversized note never reached Cloudflare.
+    let transcribed = transcribed.lock().unwrap().clone();
+    assert_eq!(transcribed.len(), 2);
+    for ((path, auth, body), audio) in transcribed.iter().zip([VOICE, AUDIO]) {
+        assert_eq!(
+            path,
+            "/client/v4/accounts/acct1/ai/run/@cf/openai/whisper-large-v3-turbo"
+        );
+        assert_eq!(auth, "Bearer cf-test-token");
+        assert_eq!(
+            *body,
+            json!({"audio": media::base64(audio), "task": "transcribe"})
+        );
+    }
+    // The caption leads the prompt and is never a command.
+    let text = |n| prompt(&model, n)["content"][0]["text"].clone();
+    assert_eq!(text(0), "/new cardio\n\nlog a 5k run");
+    assert_eq!(text(1), "log a 5k run");
+    assert_eq!(selected(&tmp, "40"), None);
+    assert_eq!(sessions(&tmp, "40"), [("default".to_string(), 4)]);
+    let logged = logged.lock().unwrap().clone();
+    assert_eq!(
+        logged,
+        [
+            "transcribing a voice note failed: downloading it from Telegram failed: \
+          the file is over 2097152 bytes"
+        ]
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_photo_lost_on_the_way_is_not_sent_again() {
     let tmp = TempDb::new();
