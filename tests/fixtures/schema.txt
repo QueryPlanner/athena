@@ -1,4 +1,4 @@
-user_version 9
+user_version 10
 
 table browser_links
   token TEXT NOT NULL PK1
@@ -109,6 +109,12 @@ table user_identities
   created_at INTEGER NOT NULL
   foreign key user_id REFERENCES users (id)
   unique index (transport, external_id) from pk
+
+table user_settings
+  user_id INTEGER NOT NULL PK1
+  timezone TEXT NOT NULL
+  updated_at INTEGER NOT NULL
+  foreign key user_id REFERENCES users (id)
 
 table users
   id INTEGER PK1

@@ -118,7 +118,7 @@ fn the_production_build_sends_the_environments_instructions_and_skills() {
         .iter()
         .map(|t| t["function"]["name"].as_str().unwrap())
         .collect();
-    // Instructions, skills, native calorie tools and MCP tools coexist.
+    // Instructions, skills, native calorie and time tools and MCP tools coexist.
     let mut sorted = tools.clone();
     sorted.sort();
     assert_eq!(
@@ -131,7 +131,9 @@ fn the_production_build_sends_the_environments_instructions_and_skills() {
             "calorie_summary",
             "calorie_update",
             "echo",
-            "read_skill"
+            "now",
+            "read_skill",
+            "timezone_set"
         ],
         "{tools:?}"
     );

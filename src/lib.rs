@@ -23,3 +23,4 @@ pub mod shutdown;
 pub mod store;
 pub mod telegram;
 pub mod telemetry;
+pub mod timezone;

@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod calories;
+mod timezone;
 
 /// One turn: the model calls it made and what they cost.
 ///
@@ -413,6 +414,15 @@ const MIGRATIONS: &[&str] = &[
          UNIQUE (user_id, request_key)
      );
      CREATE INDEX calories_by_owner_date ON calorie_logs (user_id, consumed_date, id);",
+    // 10: per-user settings, one typed column each. A user without a row
+    // uses `timezone::DEFAULT_TIMEZONE`; only `timezone_set` writes a row.
+    // Changing that default would move every such user's "today", so it
+    // needs a migration that first writes their current zone explicitly.
+    "CREATE TABLE user_settings (
+         user_id    INTEGER NOT NULL PRIMARY KEY REFERENCES users (id),
+         timezone   TEXT NOT NULL,
+         updated_at INTEGER NOT NULL
+     );",
 ];
 
 /// The schema version this build writes.
@@ -468,6 +478,7 @@ const EXPECTED_COLUMNS: &[(&str, &[&str])] = &[
     ("messages", &["session_id", "seq", "json"]),
     ("runs", RUN_COLUMNS),
     ("users", &["id", "transport", "external_id", "created_at"]),
+    ("user_settings", &["user_id", "timezone", "updated_at"]),
     (
         "user_identities",
         &["transport", "external_id", "user_id", "created_at"],
@@ -1477,6 +1488,7 @@ mod tests {
                 "sessions",
                 "sqlite_sequence",
                 "user_identities",
+                "user_settings",
                 "users"
             ]
         );

@@ -34,6 +34,9 @@ pub const PREAMBLE: &str = "\
 You are Athena, a personal assistant. Do things for the user, not only answer: when you \
 have sandbox tools, use them.
 
+- You have no clock: call now before reasoning about dates or times (today, yesterday, \
+a weekday, a deadline). When the user says where they are or which time they keep, call \
+timezone_set.
 - The sandbox is this conversation's own Linux machine, with a browser. Files the user \
 sends are saved there, and their message says where.
 - To use a website: agent_browser, the agent-browser CLI. Read its guide first, as its \
@@ -134,6 +137,7 @@ pub fn reserved_tool_names() -> Vec<&'static str> {
         .into_iter()
         .chain(sandbox::tools::NAMES)
         .chain(crate::calories::NAMES)
+        .chain(crate::timezone::NAMES)
         .collect()
 }
 
@@ -232,7 +236,7 @@ pub fn configure_all(
     configure_stored(builder, sandboxes, custom, mcp, None)
 }
 
-/// Configure a persistent agent with native calorie tools.
+/// Configure a persistent agent with native calorie and time tools.
 /// Use the same store for the builder's memory and the tools.
 pub fn configure_persistent(
     builder: rig::agent::AgentBuilder,
@@ -264,7 +268,9 @@ fn configure_stored(
         .default_max_turns(usize::MAX);
     let builder = custom.register(builder);
     let builder = match store {
-        Some(store) => crate::calories::register(builder, store),
+        Some(store) => {
+            crate::timezone::register(crate::calories::register(builder, store.clone()), store)
+        }
         None => builder,
     };
     match sandboxes {

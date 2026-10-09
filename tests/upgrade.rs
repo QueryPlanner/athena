@@ -646,12 +646,91 @@ fn schema_8_preserves_linked_users_and_all_existing_records() {
     assert_eq!(store.user("http", "linked-fixture").unwrap().id(), 2);
     let after: Vec<_> = tables.iter().map(|t| dump(&tmp.raw(), t)).collect();
     assert_eq!(before, after);
-    assert_eq!(user_version(&tmp.raw()), 9);
+    assert_eq!(user_version(&tmp.raw()), store::SCHEMA_VERSION as i64);
     assert_eq!(
         tmp.raw()
             .query_row("SELECT COUNT(*) FROM calorie_logs", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
+        0
+    );
+}
+
+/// Migration 10 only adds `user_settings`. Every row of every earlier table
+/// survives, existing users read the default time zone without a row being
+/// written, meals still read back, and a turn and a `set_timezone` work.
+#[tokio::test]
+async fn schema_9_gains_user_settings_without_changing_a_row() {
+    const TABLES: [&str; 11] = [
+        "users",
+        "user_identities",
+        "sessions",
+        "messages",
+        "runs",
+        "selected_sessions",
+        "sandboxes",
+        "browser_links",
+        "browser_states",
+        "compactions",
+        "calorie_logs",
+    ];
+    let tmp = from_fixture(include_str!("fixtures/v9_calories.sql"));
+    let before: Vec<_> = TABLES.iter().map(|t| dump(&tmp.raw(), t)).collect();
+    assert_eq!(user_version(&tmp.raw()), 9);
+    let sizes: Vec<usize> = before.iter().map(Vec::len).collect();
+    assert_eq!(sizes, [3, 4, 6, 14, 3, 1, 1, 1, 1, 1, 3]);
+
+    let (service, _) = tmp.service();
+    let db = tmp.raw();
+    assert_eq!(user_version(&db), store::SCHEMA_VERSION as i64);
+    let after: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
+    assert_eq!(after, before);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM user_settings"), 0);
+
+    // Every existing user, a linked identity included, is on the default zone.
+    let store = tmp.open();
+    let at: jiff::Timestamp = "2026-10-09T20:00:00Z".parse().unwrap();
+    for (transport, id) in [
+        ("cli", "local"),
+        ("telegram", "111111"),
+        ("http", "linked-fixture"),
+    ] {
+        let owner = store.user(transport, id).unwrap().id();
+        assert_eq!(store.today(owner, at).unwrap().to_string(), "2026-10-10");
+    }
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM user_settings"), 0);
+
+    // The migrated meals still read back for their owner.
+    let owner = store.user("telegram", "111111").unwrap().id();
+    let summary = store
+        .calorie_summary(
+            owner,
+            athena::calories::Range {
+                start_date: "2026-10-01".into(),
+                end_date: "2026-10-31".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(summary["entry_count"], 1);
+    assert_eq!(summary["totals"]["calories"], 450.0);
+
+    // A turn in a migrated session appends; setting a zone adds one row.
+    let user = service.user("telegram", "111111").await.unwrap();
+    let notes = store.selected_session(&user).unwrap().unwrap();
+    let (agent, _) = mock_agent(&service, [MockTurn::text("noted")]);
+    service
+        .send(&agent, &user, &notes.id, "hello")
+        .await
+        .unwrap();
+    store.set_timezone(owner, "Europe/Paris").unwrap();
+    let now: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
+    for ((table, old), new) in TABLES.iter().zip(&before).zip(&now) {
+        assert_eq!(&new[..old.len()], &old[..], "{table}");
+    }
+    assert_eq!(runs(&db, &notes.id), [run_row(0, 1, 1, "ok")]);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM user_settings"), 1);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check"),
         0
     );
 }

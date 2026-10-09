@@ -21,7 +21,7 @@ Edit `src/agent.rs`. That is the only file that changes.
     }
 
 `configure_with` defines the agent without persistent tools (`configure` also
-omits sandbox tools). `configure_persistent` adds native calorie tools using
+omits sandbox tools). `configure_persistent` adds native calorie and time tools using
 the supplied `Store`. Production wraps it around the OpenRouter client;
 tests can wrap it around Rig's mock model. Give the builder conversation
 memory first (`builder.memory(service.memory())`) and use the same store for
@@ -270,11 +270,31 @@ Schema migration 9 adds these records without importing the legacy `tools.db`.
 Library callers can use `agent::configure_persistent` with the same `Store` as
 the builder's memory to expose these tools.
 
+## Time and time zone tools
+
+The model has no clock. Persistent agents expose two tools, registered with the
+calorie tools, that act for the user behind the current session:
+
+| Tool | What it does |
+|---|---|
+| `now()` | the user's `datetime` (RFC 3339 with offset), `date`, `weekday`, `timezone` and `utc_offset` |
+| `timezone_set(timezone)` | sets the user's IANA zone, e.g. `Europe/London`; returns `previous_timezone` and `now` in the new zone |
+
+Every user starts on `Asia/Kolkata`. The preamble tells the agent to call `now`
+before reasoning about dates or times, and `timezone_set` when the user says
+where they are. Fixed offsets such as `+05:30` and abbreviations such as `IST`
+are refused, because they get daylight saving wrong; the agent is told to ask
+for a city. Linked Telegram and API identities share one zone. Schema
+migration 10 adds the `user_settings` table that holds it. Zones resolve
+against the host's `/usr/share/zoneinfo`, or a copy built into the binary
+when the host has none. Code that needs the user's "today" calls
+`Store::today(owner, jiff::Timestamp::now())`.
+
 ## Sandbox and browser tools
 
 Tools that touch a computer run in a sandbox on an
 [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) server, never
-on the machine running athena. Native calorie tools access only Athena’s
+on the machine running athena. Native calorie and time tools access only Athena’s
 SQLite store. Other host tools are `add` and the tools of the MCP servers
 you list (see "Tools from MCP servers").
 

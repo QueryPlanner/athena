@@ -80,7 +80,7 @@ Claude Code and Claude Desktop use (`src/mcp.rs`).
   A server that fails is a warning; its tools are missing.
 - One connection per server serves every user and session of the process.
 - A tool keeps its server's name. A name that a built-in tool
-  (`agent::reserved_tool_names`: `add`, `read_skill`, the calorie tools, the sandbox tools) or an earlier server (name order) has, that
+  (`agent::reserved_tool_names`: `add`, `read_skill`, the calorie tools, `now`, `timezone_set`, the sandbox tools) or an earlier server (name order) has, that
   is not 1 to 64 of `[A-Za-z0-9_-]`, or an input schema that is not of type
   object, is skipped with a warning, as are a server's tools past the first
   `MAX_TOOLS_PER_SERVER`. Descriptions are cut to `MAX_DESCRIPTION_BYTES`.
@@ -171,6 +171,46 @@ Mutations commit before success. Corrections and soft deletion increment version
 and require the prior version; missing, deleted, and stale entries share a
 conflict response. Deletion retains its key and does not resurrect on log retry.
 No new HTTP routes or authentication changes.
+
+## User time zone
+
+Schema migration 10 adds `user_settings(user_id, timezone, updated_at)`, keyed
+by `user_id` (foreign key to `users.id`), one typed column per setting. A user
+without a row uses `timezone::DEFAULT_TIMEZONE`, `Asia/Kolkata`. Only
+`timezone_set` writes a row (an upsert); reads never do. The default is part of
+this contract: changing it needs a migration that first writes every affected
+user's zone explicitly, or their "today" moves. Linked identities share the
+zone, as it belongs to the user.
+
+Native tools, registered with the calorie tools and reserved the same way:
+`now()` and `timezone_set(timezone)`. The owner comes from the host's
+`runner::Conversation`, never from arguments.
+
+| Field | `now` result |
+|---|---|
+| `datetime` | wall clock, RFC 3339 to the second with offset, e.g. `2026-10-10T01:30:00+05:30` |
+| `date` | `YYYY-MM-DD` in the user's zone |
+| `weekday` | English name, e.g. `Saturday` |
+| `timezone` | IANA name |
+| `utc_offset` | e.g. `+05:30` |
+
+`timezone_set` returns `{"previous_timezone", "now"}`, `now` being the object
+above in the new zone. A name is accepted when it is `UTC` or contains `/`, is
+not under `posix/` or `right/`, is at most 64 printable ASCII bytes, and
+resolves in jiff's time zone database (lookup ignores case; the stored name is
+the database's spelling; aliases such as `Asia/Calcutta` keep their own name).
+Fixed offsets (`+05:30`, `GMT+9`) and abbreviations (`IST`) are refused, with a
+message asking for a city. An invalid name writes nothing.
+
+The database is the host's (`/usr/share/zoneinfo`), else the copy compiled in
+by jiff's `tzdb-bundle-always`. A stored name that no longer resolves is an
+error naming it, not a silent fallback; `timezone_set` repairs it.
+
+Rust API for later features (workouts, reminders): `Store::timezone(owner)`,
+`Store::local_now(owner, at)` and `Store::today(owner, at)`, with
+`at = jiff::Timestamp::now()` in production. "Today" is computed there, never
+supplied by the model. Calorie dates stay model-supplied (`consumed_date`); the
+preamble tells the agent to call `now` before reasoning about dates. No env var.
 
 ## Compaction
 
