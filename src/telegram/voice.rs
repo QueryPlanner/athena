@@ -178,7 +178,7 @@ pub(crate) mod fake {
     use serde_json::{Value, json};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
-    use tokio::sync::{Notify, Semaphore};
+    use tokio::sync::{Semaphore, watch};
 
     /// A request as the fake saw it.
     #[derive(Debug, Clone)]
@@ -192,7 +192,8 @@ pub(crate) mod fake {
     struct State {
         seen: Mutex<Vec<Seen>>,
         answers: Mutex<VecDeque<(u16, String)>>,
-        arrived: Notify,
+        /// How many requests have arrived, for waiting on.
+        arrived: watch::Sender<usize>,
         /// Requests wait for a permit here once `park` was called.
         gate: Mutex<Option<Arc<Semaphore>>>,
     }
@@ -244,18 +245,14 @@ pub(crate) mod fake {
 
         /// Wait until `n` requests have arrived.
         pub async fn arrived(&self, n: usize) {
-            let wait = async {
-                loop {
-                    let notified = self.state.arrived.notified();
-                    if self.state.seen.lock().unwrap().len() >= n {
-                        return;
-                    }
-                    notified.await;
-                }
-            };
+            // No branch on whether they are already here: `wait_for` checks
+            // the current count first, so the test reads the same either way.
+            let mut count = self.state.arrived.subscribe();
+            let wait = count.wait_for(|&arrived| arrived >= n);
             tokio::time::timeout(std::time::Duration::from_secs(10), wait)
                 .await
-                .expect("the requests arrive");
+                .expect("the requests arrive")
+                .expect("the fake is running");
         }
     }
 
@@ -273,7 +270,7 @@ pub(crate) mod fake {
             body: serde_json::from_slice(&body).unwrap_or(Value::Null),
         };
         state.seen.lock().unwrap().push(seen);
-        state.arrived.notify_waiters();
+        state.arrived.send_modify(|arrived| *arrived += 1);
         let gate = state.gate.lock().unwrap().clone();
         if let Some(gate) = gate {
             gate.acquire().await.unwrap().forget();
