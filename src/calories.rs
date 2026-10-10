@@ -56,7 +56,7 @@ pub(crate) fn date(value: &str) -> Result<()> {
     );
     Ok(())
 }
-fn text(value: &str, max: usize) -> Result<()> {
+pub(crate) fn text(value: &str, max: usize) -> Result<()> {
     ensure!(
         !value.trim().is_empty() && value.len() <= max && !value.chars().any(char::is_control),
         "text must be nonblank, printable, and at most {max} bytes"

@@ -26,6 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod calories;
 mod timezone;
+mod workouts;
 
 /// One turn: the model calls it made and what they cost.
 ///
@@ -423,6 +424,46 @@ const MIGRATIONS: &[&str] = &[
          timezone   TEXT NOT NULL,
          updated_at INTEGER NOT NULL
      );",
+    // 11: training sessions belong to the shared user, like meals. Sets and
+    // rowing pieces hang off a session and are read only through an owned,
+    // active session. `day_type` is checked in Rust (`workouts::DayType`),
+    // so a new type needs no table rebuild. Weights are kilograms only; a
+    // rowing piece is its distance and time, and the 500 m split is derived.
+    "CREATE TABLE workout_sessions (
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         user_id INTEGER NOT NULL REFERENCES users (id),
+         request_key TEXT NOT NULL,
+         request_hash TEXT NOT NULL,
+         session_date TEXT NOT NULL,
+         day_type TEXT NOT NULL,
+         notes TEXT,
+         version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+         created_at INTEGER NOT NULL,
+         updated_at INTEGER NOT NULL,
+         deleted_at INTEGER,
+         UNIQUE (user_id, request_key)
+     );
+     CREATE INDEX workouts_by_owner_type_date
+         ON workout_sessions (user_id, day_type, session_date, id);
+     CREATE TABLE workout_sets (
+         session_id INTEGER NOT NULL REFERENCES workout_sessions (id),
+         exercise_index INTEGER NOT NULL CHECK (exercise_index > 0),
+         set_index INTEGER NOT NULL CHECK (set_index > 0),
+         exercise TEXT NOT NULL,
+         exercise_key TEXT NOT NULL,
+         reps INTEGER NOT NULL CHECK (reps BETWEEN 0 AND 1000),
+         weight_kg REAL NOT NULL CHECK (weight_kg BETWEEN 0 AND 1000),
+         target_reps INTEGER CHECK (target_reps BETWEEN 1 AND 1000),
+         is_warmup INTEGER NOT NULL CHECK (is_warmup IN (0, 1)),
+         notes TEXT,
+         PRIMARY KEY (session_id, exercise_index, set_index)
+     );
+     CREATE INDEX workout_sets_by_exercise ON workout_sets (exercise_key, session_id);
+     CREATE TABLE rowing_results (
+         session_id INTEGER NOT NULL PRIMARY KEY REFERENCES workout_sessions (id),
+         distance_m INTEGER NOT NULL DEFAULT 2000 CHECK (distance_m BETWEEN 100 AND 100000),
+         time_ms INTEGER NOT NULL CHECK (time_ms > 0)
+     );",
 ];
 
 /// The schema version this build writes.
@@ -505,6 +546,38 @@ const EXPECTED_COLUMNS: &[(&str, &[&str])] = &[
         &["token", "session_id", "url", "expires_at"],
     ),
     ("browser_states", &["user_id", "state", "saved_at"]),
+    (
+        "workout_sessions",
+        &[
+            "id",
+            "user_id",
+            "request_key",
+            "request_hash",
+            "session_date",
+            "day_type",
+            "notes",
+            "version",
+            "created_at",
+            "updated_at",
+            "deleted_at",
+        ],
+    ),
+    (
+        "workout_sets",
+        &[
+            "session_id",
+            "exercise_index",
+            "set_index",
+            "exercise",
+            "exercise_key",
+            "reps",
+            "weight_kg",
+            "target_reps",
+            "is_warmup",
+            "notes",
+        ],
+    ),
+    ("rowing_results", &["session_id", "distance_m", "time_ms"]),
     (
         "compactions",
         &[
@@ -1482,6 +1555,7 @@ mod tests {
                 "calorie_logs",
                 "compactions",
                 "messages",
+                "rowing_results",
                 "runs",
                 "sandboxes",
                 "selected_sessions",
@@ -1489,7 +1563,9 @@ mod tests {
                 "sqlite_sequence",
                 "user_identities",
                 "user_settings",
-                "users"
+                "users",
+                "workout_sessions",
+                "workout_sets"
             ]
         );
         assert!(fk);

@@ -25,3 +25,4 @@ pub mod store;
 pub mod telegram;
 pub mod telemetry;
 pub mod timezone;
+pub mod workouts;
