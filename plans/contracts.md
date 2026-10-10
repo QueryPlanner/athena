@@ -584,6 +584,80 @@ and the user's pending links; it says whether Google confirmed. `health_daily`
 rows stay. The preamble tells the model to call `health_summary` for recovery,
 sleep and activity when advising on training.
 
+## Daily brief
+
+An opt-in morning message on Telegram: what is due today, last session's
+numbers with progression, recent recovery and yesterday's calories. No new
+crate; no confirmation code (see below).
+
+**Schema** (migration 15, after Google Health, 14). One table, no existing
+table changed: `daily_briefs(user_id PRIMARY KEY REFERENCES users(id) ON
+DELETE CASCADE, local_time TEXT 'HH:MM', enabled INTEGER 0/1, last_sent_date
+TEXT NULL, last_attempt_at INTEGER NULL, last_error TEXT NULL, created_at,
+updated_at)`. `local_time` is on the user's wall clock; the zone is
+`user_settings.timezone`, read each pass, so it follows `timezone_set` and
+daylight saving. `last_sent_date` is the user's local date the brief was
+last *claimed* for.
+
+**Tools** (names in `brief::NAMES`, always reserved and registered with the
+native tools; the owner is the session's user):
+
+- `daily_brief_set(time)`: `HH:MM`, 24-hour, strictly; needs a Telegram
+  identity. Upserts and switches on. If that time has already passed today,
+  today is marked done, so the first brief is tomorrow's; if one was already
+  claimed today, changing the time or switching off and on does not send
+  another. Returns `time`, `timezone`, `next_brief`.
+- `daily_brief_off()`: `{status: off, was_on}`.
+- `daily_brief_status()`: `status`, `time`, `timezone`, `last_brief_date`,
+  `last_error`, `next_brief`.
+
+**Why no confirmation code.** An `agent_task` reminder runs a prompt the
+model or user wrote, with the user's authority, so it needs a code only the
+user can type. The brief's prompt is a constant in code (`brief::prompt`);
+the only inputs are two dates the host computes. Nothing a user, a page or the
+model wrote can change what the turn is told to do, and enabling it only
+needs the user's own request for a time. The turn is `Request.scheduled`, so
+its `UserText` is empty and it cannot confirm anything (a task, a skill).
+
+**Delivery.** `Jobs::system(now)` (after the Google Health pass, in the same
+call) runs `Telegram::daily_brief`, in `athena telegram` only. For each
+enabled brief with a Telegram chat, `brief::phase(now, zone, time,
+last_sent_date, health_pending)`:
+
+- `Done`: `last_sent_date` is today's local date.
+- `NotYet`: before today's `local_time` (a time a clock change skips moves
+  later; computed per pass with jiff, so it is DST-correct).
+- `WaitingForHealth`: Google Health is configured and the user's connection
+  is `connected` but last synced on an earlier local date: wait until
+  `local_time + 30 min`, then send without it. A revoked or absent
+  connection never waits. The brief's prompt says to leave recovery out when
+  health is unavailable, and that data may be old when `last_synced_at` is
+  not today.
+- `Send`: due.
+- `Missed`: more than 4 hours past `local_time` (or past local midnight):
+  skipped silently for that day, never made up.
+
+A due brief takes a permit of the shared `TASKS` semaphore and the user's
+`Busy` slot with `try_acquire`/`claim`: if either is not free nothing changes
+and the next tick (30 s) tries again until the window closes; nothing waits
+while holding the other. Only then is the day claimed, by `UPDATE ... SET
+last_sent_date = today WHERE enabled = 1 AND last_sent_date IS NOT today`
+(compare-and-set, so overlapping ticks and processes cannot both win). It
+is claimed before the turn, so a crash or a failed send loses that day's
+brief and never repeats it (as a reminder run). Then one scheduled turn runs
+in the user's current session and the reply is sent as any turn's. A
+Telegram refusal that `jobs::permanent` recognises (403, blocked, chat not
+found) sets `enabled = 0` and records `last_error`; a failure to plan (an
+unresolvable zone) records `last_error` and leaves it on.
+
+**Cost.** At most one turn per user per local day, no retry after a send
+failure. Known gaps, not fixed here: the agent has no per-turn model-call cap
+(`default_max_turns(usize::MAX)`), and a scheduled turn still has the agent's
+write tools; the fixed prompt tells the model to use three read tools and to
+treat results as data, but that is a prompt, not a filter (the same exposure
+as an `agent_task`). A zone change can shift a brief by up to a day (west:
+two within 24 h; east: one skipped) since the claim is by local date.
+
 ## Compaction
 
 | Name | Value | Owner |

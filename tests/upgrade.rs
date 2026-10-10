@@ -7,12 +7,17 @@
 
 mod common;
 
+use athena::agent;
+use athena::custom::Custom;
+use athena::mcp::Mcp;
 use athena::service::Service;
 use athena::store::{self, Store};
 use common::*;
-use rig_core::test_utils::MockTurn;
+use rig_agent::agent::AgentBuilder;
+use rig_core::test_utils::{MockCompletionModel, MockTurn};
 use rusqlite::Connection;
 use rusqlite::types::Value;
+use serde_json::json;
 
 fn from_fixture(sql: &str) -> TempDb {
     let tmp = TempDb::new();
@@ -1000,7 +1005,7 @@ async fn schema_13_gains_google_health_without_changing_a_row() {
     let (service, _) = tmp.service();
     let db = tmp.raw();
     assert_eq!(user_version(&db), store::SCHEMA_VERSION as i64);
-    assert_eq!(store::SCHEMA_VERSION, 14);
+    assert_eq!(store::SCHEMA_VERSION, 15);
     let after: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
     assert_eq!(after, before);
     for table in NEW {
@@ -1051,6 +1056,115 @@ async fn schema_13_gains_google_health_without_changing_a_row() {
         assert_eq!(&new[..old.len()], &old[..], "{table}");
     }
     assert_eq!(runs(&db, &notes.id), [run_row(0, 1, 1, "ok")]);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check"),
+        0
+    );
+}
+
+/// Migration 15 only adds the daily brief table. Every row of every schema 14
+/// table survives, the Google Health ones included. A migrated user gets a
+/// brief that is claimed once, their synced health still reads through
+/// `health_summary`, and a turn still appends.
+#[tokio::test]
+async fn schema_14_gains_daily_briefs_without_changing_a_row() {
+    const TABLES: [&str; 21] = [
+        "users",
+        "user_identities",
+        "sessions",
+        "messages",
+        "runs",
+        "selected_sessions",
+        "sandboxes",
+        "browser_links",
+        "browser_states",
+        "compactions",
+        "calorie_logs",
+        "user_settings",
+        "workout_sessions",
+        "workout_sets",
+        "rowing_results",
+        "jobs",
+        "user_skills",
+        "user_skill_files",
+        "health_connections",
+        "health_oauth_states",
+        "health_daily",
+    ];
+    let tmp = from_fixture(include_str!("fixtures/v14_google_health.sql"));
+    let before: Vec<_> = TABLES.iter().map(|t| dump(&tmp.raw(), t)).collect();
+    assert_eq!(user_version(&tmp.raw()), 14);
+    let sizes: Vec<usize> = before.iter().map(Vec::len).collect();
+    assert_eq!(
+        sizes,
+        [
+            3, 4, 7, 20, 5, 1, 1, 1, 1, 1, 4, 2, 4, 7, 2, 6, 2, 1, 1, 1, 2
+        ]
+    );
+
+    let (service, _) = tmp.service();
+    let db = tmp.raw();
+    assert_eq!(user_version(&db), store::SCHEMA_VERSION as i64);
+    let after: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
+    assert_eq!(after, before);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM daily_briefs"), 0);
+
+    // A migrated user sets a brief, is its candidate, and claims a day once.
+    let store = tmp.open();
+    let user = service.user("telegram", "222222").await.unwrap();
+    let now: jiff::Timestamp = "2026-10-10T10:00:00Z".parse().unwrap();
+    store
+        .brief_set(user.id(), "06:30", "2026-10-09", false, now)
+        .unwrap();
+    let candidates = store.brief_candidates().unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].owner, user.id());
+    assert_eq!(candidates[0].chat, 222222);
+    assert_eq!(candidates[0].local_time, "06:30");
+    assert!(store.brief_claim(user.id(), "2026-10-10", now).unwrap());
+    assert!(!store.brief_claim(user.id(), "2026-10-10", now).unwrap());
+
+    // Google Health still reads: the connection and its two synced days.
+    let connection = store.health_connection(user.id()).unwrap().unwrap();
+    assert_eq!(connection.status, "connected");
+    assert_eq!(
+        store
+            .health_days(user.id(), "2026-10-01", "2026-10-31")
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // The agent's health_summary reads that connection, and a turn appends.
+    let session = service.open_session(&user, "default").await.unwrap();
+    let runs_before = runs(&db, &session.id).len();
+    let model = MockCompletionModel::new([
+        MockTurn::tool_call("c1", "health_summary", json!({"days": 1})),
+        MockTurn::text("Synced."),
+    ]);
+    let agent = agent::configure_persistent(
+        AgentBuilder::new(model.clone()).memory(service.memory()),
+        None,
+        &Custom::default(),
+        &Mcp::none(),
+        store.clone(),
+        None,
+    );
+    service
+        .send(&agent, &user, &session.id, "How did I sleep?")
+        .await
+        .unwrap();
+    let result = serde_json::to_string(model.requests()[1].chat_history.last().unwrap()).unwrap();
+    assert!(result.contains("\"connected\""), "{result}");
+    assert!(result.contains("2026-10-10"), "{result}");
+
+    let now_tables: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
+    for ((table, old), new) in TABLES.iter().zip(&before).zip(&now_tables) {
+        assert_eq!(&new[..old.len()], &old[..], "{table}");
+    }
+    let all_runs = runs(&db, &session.id);
+    assert_eq!(all_runs.len(), runs_before + 1);
+    assert_eq!(all_runs.last(), Some(&run_row(4, 7, 2, "ok")));
     assert_eq!(
         count(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check"),
         0

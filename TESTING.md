@@ -374,6 +374,14 @@ throwaway database.
    week?`: the model calls `health_summary`. `/disconnect_health` says Google
    confirmed, and the row is gone. This is the one check that real Google
    accepts the filters, page size, scopes and PKCE; the tests use a fake.
+   8e. Daily brief: send `Send me a training brief every morning at <two
+   minutes from now, 24-hour>` (set `timezone_set` first if needed). The
+   reply gives `next_brief` for tomorrow when that time has passed, so pick a
+   time that is still ahead. At that time a short brief arrives within about
+   30 seconds (30 minutes later if Google Health is connected and had not
+   synced that day), and `sqlite3 /tmp/tg.db "SELECT local_time,
+   last_sent_date FROM daily_briefs"` shows today's date. Restart the bot:
+   no second brief. Ask `Turn the brief off`: `enabled` is 0.
 9. Press Ctrl-C, start the bot again, send `/sessions`: `default` is still
    marked. `/usage` lists both sessions.
 10. Add the bot to a group and send a message there: the bot says nothing,

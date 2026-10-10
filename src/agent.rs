@@ -52,6 +52,9 @@ or about their activity, call health_summary and use its sleep, resting heart ra
 activity alongside the workout log. It is their Google Health data, synced once a day: say \
 when it is missing or old, and use health_status to see why. health_sync_now fetches it \
 now. Give wellness context, not medical advice.
+- Morning brief: when the user asks for a training brief or plan every morning (for \
+example at 6:30), call daily_brief_set with the time as HH:MM; daily_brief_off stops it \
+and daily_brief_status shows it. Athena then sends it by itself in Telegram.
 - The sandbox is this conversation's own Linux machine, with a browser. Files the user \
 sends are saved there, and their message says where.
 - To use a website: agent_browser, the agent-browser CLI. Read its guide first, as its \
@@ -179,6 +182,7 @@ pub fn reserved_tool_names() -> Vec<&'static str> {
         .chain(crate::reminders::NAMES)
         .chain(crate::user_skills::NAMES)
         .chain(crate::health::NAMES)
+        .chain(crate::brief::NAMES)
         .collect()
 }
 
@@ -378,6 +382,7 @@ fn configure_stored(
             let builder = crate::timezone::register(builder, store.clone());
             let builder = crate::reminders::register(builder, store.clone());
             let builder = crate::health::tools::register(builder, store.clone(), health);
+            let builder = crate::brief::register(builder, store.clone());
             crate::user_skills::register(builder, store, github)
         }
         None => builder,

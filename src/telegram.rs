@@ -38,6 +38,7 @@
 //!   reply shows what was understood, and the transcript is in the session.
 //!   The audio is never stored, and one note is transcribed at a time.
 
+pub mod brief;
 pub mod health;
 pub mod jobs;
 pub mod render;
@@ -4057,5 +4058,581 @@ mod tests {
             .await;
         assert!(plain.logged().is_empty());
         assert!(collect(&mut rx).is_empty());
+    }
+
+    // ---- the daily training brief ----
+
+    use crate::store::BriefCandidate;
+
+    /// 06:30 in Kolkata on 2026-10-10 is 01:00Z: the brief's due instant.
+    const DUE: &str = "2026-10-10T01:00:00Z";
+    const NEXT_DAY: &str = "2026-10-11T01:00:00Z";
+
+    fn when(text: &str) -> Timestamp {
+        text.parse().unwrap()
+    }
+
+    fn brief_tasks() -> Semaphore {
+        Semaphore::new(jobs::TASKS)
+    }
+
+    /// One daily pass at `now`, every chat recording to `chat`.
+    async fn brief_pass<R: Run + 'static>(
+        h: &Harness<R>,
+        chat: &Recorder,
+        tasks: &Semaphore,
+        now: Timestamp,
+    ) {
+        let chat = chat.clone();
+        h.app
+            .daily_brief(&move |_: i64| chat.clone(), tasks, now)
+            .await;
+    }
+
+    /// A brief at `time` for Telegram user `id`, not yet sent on any day.
+    fn set_brief<R: Run + 'static>(h: &Harness<R>, id: u64, time: &str) -> i64 {
+        let owner = h.user(id).id();
+        h.store
+            .brief_set(
+                owner,
+                time,
+                "2026-10-09",
+                false,
+                when("2026-10-09T12:00:00Z"),
+            )
+            .unwrap();
+        owner
+    }
+
+    fn brief_row<R: Run + 'static>(h: &Harness<R>, owner: i64) -> crate::store::Brief {
+        h.store.brief(owner).unwrap().unwrap()
+    }
+
+    /// The brief's reply, as the chat sees it: typing, then the text.
+    fn brief_sent(text: &str) -> Vec<Event> {
+        vec![Event::Typing, said(text)]
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_due_brief_is_one_scheduled_turn_in_the_selected_session() {
+        let model = MockCompletionModel::new([MockTurn::text("Push day, 2.5 kg up.")]);
+        let given = model.clone();
+        let h =
+            harness_with(move |s| agent::configure(AgentBuilder::new(given).memory(s.memory())));
+        let user = h.user(42);
+        let owner = set_brief(&h, 42, "06:30");
+        let side = h.store.open_session(&user, "side").unwrap();
+        assert!(h.store.select_session(&user, &side.id).unwrap());
+
+        let (chat, mut rx) = recorder();
+        brief_pass(&h, &chat, &brief_tasks(), when(DUE)).await;
+
+        assert_eq!(collect(&mut rx), brief_sent("Push day, 2.5 kg up."));
+        let requests = model.requests();
+        assert_eq!(requests.len(), 1);
+        let asked = serde_json::to_string(requests[0].chat_history.last().unwrap()).unwrap();
+        assert!(asked.contains("daily training brief for 2026-10-10 (Saturday)"));
+        // The turn ran in the selected session, not in a new default one.
+        assert_eq!(h.sessions(42), [("side".to_string(), 2)]);
+        let row = brief_row(&h, owner);
+        assert_eq!(row.last_sent_date.as_deref(), Some("2026-10-10"));
+        assert_eq!(row.last_attempt_at, Some(when(DUE)));
+        assert_eq!(row.last_error, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_day_is_sent_once_even_when_passes_overlap() {
+        let model = MockCompletionModel::new([MockTurn::text("one"), MockTurn::text("two")]);
+        let given = model.clone();
+        let h =
+            harness_with(move |s| agent::configure(AgentBuilder::new(given).memory(s.memory())));
+        let owner = set_brief(&h, 42, "06:30");
+
+        let (chat, mut rx) = recorder();
+        let tasks = brief_tasks();
+        let (a, b) = (
+            brief_pass(&h, &chat, &tasks, when(DUE)),
+            brief_pass(&h, &chat, &tasks, when(DUE)),
+        );
+        tokio::join!(a, b);
+        assert_eq!(collect(&mut rx), brief_sent("one"));
+        assert_eq!(model.requests().len(), 1);
+
+        // Later the same day, and a new Telegram on the same store: nothing.
+        brief_pass(&h, &chat, &tasks, when("2026-10-10T02:00:00Z")).await;
+        let restarted_model = MockCompletionModel::new([MockTurn::text("unused")]);
+        let given = restarted_model.clone();
+        let restarted = harness_over(
+            h.store.clone(),
+            move |s| agent::configure(AgentBuilder::new(given).memory(s.memory())),
+            None,
+        );
+        brief_pass(&restarted, &chat, &tasks, when("2026-10-10T02:30:00Z")).await;
+        assert!(collect(&mut rx).is_empty());
+        assert!(restarted_model.requests().is_empty());
+
+        // The next morning it is sent again.
+        brief_pass(&h, &chat, &tasks, when(NEXT_DAY)).await;
+        assert_eq!(collect(&mut rx), brief_sent("two"));
+        assert_eq!(model.requests().len(), 2);
+        assert_eq!(
+            brief_row(&h, owner).last_sent_date.as_deref(),
+            Some("2026-10-11")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nothing_happens_before_the_time_or_after_the_window() {
+        let h = harness(vec![MockTurn::text("never")]);
+        let owner = set_brief(&h, 42, "06:30");
+        let (chat, mut rx) = recorder();
+        let tasks = brief_tasks();
+
+        brief_pass(&h, &chat, &tasks, when("2026-10-10T00:59:59Z")).await;
+        assert!(collect(&mut rx).is_empty());
+        // Four hours after the time the day is missed, and nothing records it.
+        brief_pass(&h, &chat, &tasks, when("2026-10-10T05:00:00Z")).await;
+        assert!(collect(&mut rx).is_empty());
+        let row = brief_row(&h, owner);
+        assert_eq!((row.last_sent_date, row.last_attempt_at), (None, None));
+        assert!(h.logged().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_zone_moves_a_brief_that_has_not_yet_come() {
+        let model = MockCompletionModel::new([MockTurn::text("Dubai morning")]);
+        let given = model.clone();
+        let h =
+            harness_with(move |s| agent::configure(AgentBuilder::new(given).memory(s.memory())));
+        let owner = set_brief(&h, 42, "06:30");
+        let (chat, mut rx) = recorder();
+        let tasks = brief_tasks();
+
+        // 06:20 in Kolkata: not yet.
+        brief_pass(&h, &chat, &tasks, when("2026-10-10T00:50:00Z")).await;
+        assert!(collect(&mut rx).is_empty());
+        // The user moves to Dubai (UTC+4): 06:30 there is 02:30Z.
+        h.store.set_timezone(owner, "Asia/Dubai").unwrap();
+        brief_pass(&h, &chat, &tasks, when("2026-10-10T01:30:00Z")).await;
+        assert!(collect(&mut rx).is_empty());
+        brief_pass(&h, &chat, &tasks, when("2026-10-10T02:30:00Z")).await;
+        assert_eq!(collect(&mut rx), brief_sent("Dubai morning"));
+        brief_pass(&h, &chat, &tasks, when("2026-10-10T02:31:00Z")).await;
+        assert!(collect(&mut rx).is_empty());
+        assert_eq!(model.requests().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_york_sends_once_a_local_day_across_both_2026_clock_changes() {
+        let ny = crate::timezone::parse("America/New_York").unwrap();
+        let days = [
+            "2026-03-07",
+            "2026-03-08",
+            "2026-03-09",
+            "2026-10-31",
+            "2026-11-01",
+            "2026-11-02",
+        ];
+        let model = MockCompletionModel::new(days.map(|d| MockTurn::text(format!("brief {d}"))));
+        let given = model.clone();
+        let h =
+            harness_with(move |s| agent::configure(AgentBuilder::new(given).memory(s.memory())));
+        let owner = set_brief(&h, 42, "06:30");
+        h.store.set_timezone(owner, "America/New_York").unwrap();
+        let (chat, mut rx) = recorder();
+        let tasks = brief_tasks();
+
+        let mut sent = Vec::new();
+        for day in days {
+            let start = day
+                .parse::<jiff::civil::Date>()
+                .unwrap()
+                .at(0, 0, 0, 0)
+                .to_zoned(ny.clone())
+                .unwrap()
+                .timestamp();
+            // Every half hour from local midnight to just past 13:00 on the day.
+            for step in 0..28 {
+                let now = start + jiff::SignedDuration::from_mins(30 * step);
+                brief_pass(&h, &chat, &tasks, now).await;
+                if collect(&mut rx).iter().any(|e| e.said().is_some()) {
+                    sent.push(now.to_zoned(ny.clone()).strftime("%F %H:%M").to_string());
+                }
+            }
+        }
+        assert_eq!(
+            sent,
+            [
+                "2026-03-07 06:30",
+                "2026-03-08 06:30",
+                "2026-03-09 06:30",
+                "2026-10-31 06:30",
+                "2026-11-01 06:30",
+                "2026-11-02 06:30",
+            ]
+        );
+        assert_eq!(model.requests().len(), 6);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_brief_waits_for_a_user_mid_turn_and_is_skipped_past_its_window() {
+        let model = MockCompletionModel::new([MockTurn::text("after the turn")]);
+        let given = model.clone();
+        let h =
+            harness_with(move |s| agent::configure(AgentBuilder::new(given).memory(s.memory())));
+        let owner = set_brief(&h, 42, "06:30");
+        let (chat, mut rx) = recorder();
+        let tasks = brief_tasks();
+
+        // Mid-turn at the due time: nothing is claimed, so nothing is lost.
+        let busy = Busy::claim(&h.app.busy, 42).unwrap();
+        brief_pass(&h, &chat, &tasks, when(DUE)).await;
+        assert!(collect(&mut rx).is_empty());
+        assert_eq!(brief_row(&h, owner).last_sent_date, None);
+        drop(busy);
+        // Free an hour later, still in the window: sent then.
+        brief_pass(&h, &chat, &tasks, when("2026-10-10T02:00:00Z")).await;
+        assert_eq!(collect(&mut rx), brief_sent("after the turn"));
+
+        // Another user, mid-turn until the window closes: skipped, not made up.
+        let late = set_brief(&h, 43, "06:30");
+        let busy = Busy::claim(&h.app.busy, 43).unwrap();
+        brief_pass(&h, &chat, &tasks, when("2026-10-10T04:59:00Z")).await;
+        drop(busy);
+        brief_pass(&h, &chat, &tasks, when("2026-10-10T05:00:00Z")).await;
+        assert!(collect(&mut rx).is_empty());
+        assert_eq!(brief_row(&h, late).last_sent_date, None);
+        assert_eq!(model.requests().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_permit_means_nothing_now_and_the_brief_later_in_the_window() {
+        let model = MockCompletionModel::new([MockTurn::text("with a permit")]);
+        let given = model.clone();
+        let h =
+            harness_with(move |s| agent::configure(AgentBuilder::new(given).memory(s.memory())));
+        let owner = set_brief(&h, 42, "06:30");
+        let (chat, mut rx) = recorder();
+
+        brief_pass(&h, &chat, &Semaphore::new(0), when(DUE)).await;
+        assert!(collect(&mut rx).is_empty());
+        assert_eq!(brief_row(&h, owner).last_sent_date, None);
+        brief_pass(&h, &chat, &brief_tasks(), when("2026-10-10T01:30:00Z")).await;
+        assert_eq!(collect(&mut rx), brief_sent("with a permit"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_switched_off_brief_or_one_without_telegram_is_never_a_candidate() {
+        let h = harness(vec![MockTurn::text("never")]);
+        let off = set_brief(&h, 42, "06:30");
+        h.store.brief_off(off, when(DUE)).unwrap();
+        let cli = h.store.user("cli", "local").unwrap().id();
+        h.store
+            .brief_set(cli, "06:30", "2026-10-09", false, when(DUE))
+            .unwrap();
+        let (chat, mut rx) = recorder();
+        brief_pass(&h, &chat, &brief_tasks(), when(DUE)).await;
+        assert!(collect(&mut rx).is_empty());
+        assert!(h.logged().is_empty());
+        assert_eq!(brief_row(&h, cli).last_sent_date, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_brief_waits_for_todays_health_sync_then_goes_without_it() {
+        let f = fit(vec![MockTurn::text("Brief without today's sync")]).await;
+        f.connect(1).await;
+        let owner = set_brief(&f.h, 1, "06:30");
+        let (chat, mut rx) = recorder();
+        let tasks = brief_tasks();
+
+        // Connected yesterday's morning: at 06:30 the sync is still to come.
+        brief_pass(&f.h, &chat, &tasks, when(NEXT_DAY)).await;
+        assert!(collect(&mut rx).is_empty());
+        brief_pass(&f.h, &chat, &tasks, when("2026-10-11T01:29:59Z")).await;
+        assert!(collect(&mut rx).is_empty());
+        // Half an hour after the time, it is sent without the sync.
+        brief_pass(&f.h, &chat, &tasks, when("2026-10-11T01:30:00Z")).await;
+        assert_eq!(collect(&mut rx), brief_sent("Brief without today's sync"));
+        assert_eq!(
+            brief_row(&f.h, owner).last_sent_date,
+            Some("2026-10-11".into())
+        );
+        // Waiting is the brief's own: the health sync was not run by it.
+        assert_eq!(f.fake.seen_at("/steps/dataPoints").len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_daily_pass_syncs_health_before_a_brief_is_due() {
+        let f = fit(vec![MockTurn::text("Brief after today's sync")]).await;
+        f.connect(1).await;
+        set_brief(&f.h, 1, "06:30");
+        f.clock.set(NEXT_DAY);
+        let (chat, mut rx) = recorder();
+        let scheduler = crate::scheduler::Scheduler::new(
+            f.h.store.clone(),
+            jobs::Jobs::new(f.h.app.clone(), move |_: i64| chat.clone()),
+            f.h.app.log.clone(),
+        )
+        .clock(f.clock.clone());
+        let mut running = JoinSet::new();
+        scheduler.tick(&mut running).await.unwrap();
+        while running.join_next().await.is_some() {}
+
+        // Synced at 06:30, so no wait: the brief goes at its time.
+        assert_eq!(collect(&mut rx), brief_sent("Brief after today's sync"));
+        assert_eq!(f.fake.seen_at("/steps/dataPoints").len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_connection_or_once_revoked_the_brief_is_sent_on_time() {
+        let never = fit(vec![MockTurn::text("no connection")]).await;
+        set_brief(&never.h, 1, "06:30");
+        let (chat, mut rx) = recorder();
+        brief_pass(&never.h, &chat, &brief_tasks(), when(DUE)).await;
+        assert_eq!(collect(&mut rx), brief_sent("no connection"));
+
+        let revoked = fit(vec![MockTurn::text("revoked")]).await;
+        revoked.connect(1).await;
+        let owner = set_brief(&revoked.h, 1, "06:30");
+        revoked
+            .h
+            .store
+            .health_mark_revoked(owner, "Google revoked it", when(DUE))
+            .unwrap();
+        let (chat, mut rx) = recorder();
+        brief_pass(&revoked.h, &chat, &brief_tasks(), when(DUE)).await;
+        assert_eq!(collect(&mut rx), brief_sent("revoked"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_chat_that_blocked_the_bot_switches_the_brief_off_for_good() {
+        let model = MockCompletionModel::new([MockTurn::text("blocked")]);
+        let given = model.clone();
+        let h =
+            harness_with(move |s| agent::configure(AgentBuilder::new(given).memory(s.memory())));
+        let owner = set_brief(&h, 42, "06:30");
+        let (mut chat, mut rx) = recorder();
+        chat.blocked = true;
+        let tasks = brief_tasks();
+
+        brief_pass(&h, &chat, &tasks, when(DUE)).await;
+        assert_eq!(collect(&mut rx), brief_sent("blocked"));
+        let row = brief_row(&h, owner);
+        assert!(!row.enabled);
+        assert!(
+            row.last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("refused")
+        );
+        assert_eq!(row.last_sent_date.as_deref(), Some("2026-10-10"));
+
+        brief_pass(&h, &chat, &tasks, when(NEXT_DAY)).await;
+        assert!(collect(&mut rx).is_empty());
+        assert_eq!(model.requests().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_send_keeps_the_brief_on_and_the_day_claimed() {
+        let model = MockCompletionModel::new([MockTurn::text("lost on the way")]);
+        let given = model.clone();
+        let h =
+            harness_with(move |s| agent::configure(AgentBuilder::new(given).memory(s.memory())));
+        let owner = set_brief(&h, 42, "06:30");
+        let (mut chat, mut rx) = recorder();
+        chat.fail = true;
+        let tasks = brief_tasks();
+
+        brief_pass(&h, &chat, &tasks, when(DUE)).await;
+        assert_eq!(collect(&mut rx).len(), 2, "typing and the attempt");
+        let row = brief_row(&h, owner);
+        assert!(row.enabled);
+        assert_eq!(row.last_sent_date.as_deref(), Some("2026-10-10"));
+        assert!(
+            h.logged()
+                .iter()
+                .any(|l| l.contains("sending a message failed"))
+        );
+
+        // Not tried again that day, even inside the window.
+        brief_pass(&h, &chat, &tasks, when("2026-10-10T02:00:00Z")).await;
+        assert!(collect(&mut rx).is_empty());
+        assert_eq!(model.requests().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_model_turn_gets_the_standard_reply_and_claims_the_day() {
+        let h = harness(vec![MockTurn::error("provider unavailable")]);
+        let owner = set_brief(&h, 42, "06:30");
+        let (chat, mut rx) = recorder();
+
+        brief_pass(&h, &chat, &brief_tasks(), when(DUE)).await;
+        assert_eq!(
+            collect(&mut rx),
+            [
+                Event::Typing,
+                said("The model failed to answer. Try again in a moment.")
+            ]
+        );
+        let row = brief_row(&h, owner);
+        assert!(row.enabled);
+        assert_eq!(row.last_sent_date.as_deref(), Some("2026-10-10"));
+        assert!(h.logged().iter().any(|l| l.contains("turn failed")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_zone_that_no_longer_resolves_is_logged_and_noted_and_left_on() {
+        let h = harness(vec![MockTurn::text("never")]);
+        let owner = set_brief(&h, 42, "06:30");
+        h.store.set_timezone(owner, "UTC").unwrap();
+        h.store
+            .db_for_tests()
+            .execute(
+                "UPDATE user_settings SET timezone = 'Gone/Away' WHERE user_id = ?1",
+                [owner],
+            )
+            .unwrap();
+        let (chat, mut rx) = recorder();
+
+        brief_pass(&h, &chat, &brief_tasks(), when(DUE)).await;
+        assert!(collect(&mut rx).is_empty());
+        let row = brief_row(&h, owner);
+        assert!(row.enabled);
+        assert_eq!(row.last_sent_date, None);
+        assert!(
+            row.last_error
+                .as_deref()
+                .unwrap()
+                .contains("no longer resolves")
+        );
+        assert!(
+            h.logged()
+                .iter()
+                .any(|l| l.starts_with(&format!("daily brief for user {owner} failed"))),
+            "{:?}",
+            h.logged()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failure_to_read_the_briefs_is_logged_and_nothing_is_sent() {
+        let h = harness(vec![MockTurn::text("never")]);
+        h.store
+            .db_for_tests()
+            .execute_batch("DROP TABLE daily_briefs")
+            .unwrap();
+        let (chat, mut rx) = recorder();
+
+        brief_pass(&h, &chat, &brief_tasks(), when(DUE)).await;
+        assert!(collect(&mut rx).is_empty());
+        assert!(
+            h.logged()[0].starts_with("daily brief: reading the briefs failed"),
+            "{:?}",
+            h.logged()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_brief_turn_cannot_confirm_a_reminder() {
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call(
+                "c",
+                "reminder_confirm",
+                serde_json::json!({"id": 1, "code": "ABCDEFGH"}),
+            ),
+            MockTurn::text("tried"),
+        ]);
+        let scripted = model.clone();
+        let h = harness_with(move |s| {
+            agent::configure_persistent(
+                AgentBuilder::new(scripted).memory(s.memory()),
+                None,
+                &crate::custom::Custom::default(),
+                &crate::mcp::Mcp::none(),
+                s.memory().store().clone(),
+                None,
+            )
+        });
+        let user = h.user(60);
+        let owner = set_brief(&h, 60, "06:30");
+        // A pending task whose code the brief's own session could confirm.
+        let session = h.store.open_session(&user, DEFAULT_SESSION).unwrap();
+        h.store
+            .db_for_tests()
+            .execute(
+                "INSERT INTO jobs (user_id, kind, payload, next_run_at, status, created_at,
+                                   updated_at, confirm_code, confirm_session, confirm_expires_at)
+                 VALUES (?1, 'agent_task', 'x', ?2, 'pending', 0, 0, 'ABCDEFGH', ?3, ?2)",
+                rusqlite::params![
+                    owner,
+                    (when(DUE) + jiff::SignedDuration::from_hours(1)).as_millisecond(),
+                    session.id
+                ],
+            )
+            .unwrap();
+        let (chat, _rx) = recorder();
+        brief_pass(&h, &chat, &brief_tasks(), when(DUE)).await;
+
+        let refused =
+            serde_json::to_string(model.requests()[1].chat_history.last().unwrap()).unwrap();
+        assert!(refused.contains("Not confirmed"), "{refused}");
+        assert_eq!(job_row(&h, 1).0, "pending");
+    }
+
+    /// A pass that read the candidate before another pass claimed today must
+    /// not send a second brief: the claim itself refuses it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_candidate_read_before_today_was_claimed_is_not_sent_again() {
+        let model = MockCompletionModel::new([MockTurn::text("never")]);
+        let given = model.clone();
+        let h =
+            harness_with(move |s| agent::configure(AgentBuilder::new(given).memory(s.memory())));
+        let owner = h.user(42).id();
+        h.store
+            .brief_set(owner, "06:30", "2026-10-10", true, when(DUE))
+            .unwrap();
+        // The candidate as an earlier pass read it, before today was claimed.
+        let stale = BriefCandidate {
+            owner,
+            chat: 42,
+            local_time: "06:30".into(),
+            last_sent_date: None,
+        };
+        let (chat, mut rx) = recorder();
+        let make = move |_: i64| chat.clone();
+        h.app
+            .try_brief(&make, &brief_tasks(), stale, when(DUE))
+            .await
+            .unwrap();
+        assert!(collect(&mut rx).is_empty());
+        assert!(model.requests().is_empty());
+    }
+
+    /// A time that cannot be planned (stored by hand, not by `daily_brief_set`)
+    /// is logged and noted, and the brief stays on for the user to fix.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stored_time_that_cannot_be_planned_is_noted_and_left_on() {
+        let h = harness(vec![MockTurn::text("never")]);
+        let owner = set_brief(&h, 42, "06:30");
+        h.store
+            .db_for_tests()
+            .execute(
+                "UPDATE daily_briefs SET local_time = '24:00' WHERE user_id = ?1",
+                [owner],
+            )
+            .unwrap();
+        let (chat, mut rx) = recorder();
+
+        brief_pass(&h, &chat, &brief_tasks(), when(DUE)).await;
+        assert!(collect(&mut rx).is_empty());
+        let row = brief_row(&h, owner);
+        assert!(row.enabled);
+        assert!(
+            row.last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("time must be")
+        );
+        assert!(h.logged().iter().any(|l| l.contains("failed: ")));
     }
 }
