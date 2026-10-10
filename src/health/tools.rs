@@ -74,7 +74,7 @@ fn when(at: jiff::Timestamp, zone: &TimeZone) -> String {
 
 /// One stored day as the model sees it: sleep as minutes asleep and minutes
 /// per stage, without the heart-rate zone limits and clock times.
-fn compact(date: &str, metrics: &str) -> Value {
+fn compact(date: &str, metrics: &str) -> Map<String, Value> {
     let mut day: Map<String, Value> = serde_json::from_str(metrics).unwrap_or_default();
     day.remove("hr_zones");
     if let Some(sleeps) = day.remove("sleep").as_ref().and_then(Value::as_array) {
@@ -98,24 +98,124 @@ fn compact(date: &str, metrics: &str) -> Value {
     let mut out = Map::new();
     out.insert("date".into(), date.into());
     out.extend(day);
-    Value::Object(out)
+    out
 }
+
+/// The metric names a day can carry, and so the names `metrics` accepts.
+/// Objects hold their parts: `heart_rate` is `{min, avg, max, n}`,
+/// `nutrition` the day's totals, `moods` a count and labels.
+pub const METRICS: [&str; 40] = [
+    "steps",
+    "floors",
+    "distance_km",
+    "elevation_change_m",
+    "active_kcal",
+    "basal_kcal",
+    "active_min",
+    "zone_min",
+    "sedentary_min",
+    "activity_level_min",
+    "swim",
+    "hydration_ml",
+    "nutrition",
+    "heart_rate",
+    "hrv_ms",
+    "spo2_pct",
+    "resp_rate_sleep",
+    "glucose_mgdl",
+    "core_temp_c",
+    "resting_hr",
+    "hrv_daily",
+    "spo2_daily",
+    "vo2max_daily",
+    "resp_rate_daily",
+    "sleep_temp",
+    "hr_zone_minutes",
+    "weight_kg",
+    "body_fat_pct",
+    "height_cm",
+    "vo2max",
+    "run_vo2max",
+    "workouts",
+    "sleep_min",
+    "sleep_stage_min",
+    "ecg",
+    "irn",
+    "moods",
+    "symptoms",
+    "ovulation_tests",
+    "menstrual_period_started",
+];
+
+/// What is averaged over the days that have it: (name, JSON pointer into a
+/// day).
+const AVERAGED: [(&str, &str); 11] = [
+    ("steps", "/steps"),
+    ("active_min", "/active_min"),
+    ("zone_min", "/zone_min"),
+    ("resting_hr", "/resting_hr"),
+    ("sleep_min", "/sleep_min"),
+    ("floors", "/floors"),
+    ("active_kcal", "/active_kcal"),
+    ("hrv_ms", "/hrv_daily/avg_ms"),
+    ("spo2_pct", "/spo2_daily/avg"),
+    ("resp_rate", "/resp_rate_daily"),
+    ("heart_rate_avg", "/heart_rate/avg"),
+];
+
+/// The most bytes `health_summary` returns, with room under
+/// [`crate::policy::MAX_RESULT_BYTES`] for the envelope around it.
+pub const SUMMARY_BYTES: usize = 56 * 1024;
 
 /// The days and their averages, for `rows` of (date, metrics JSON).
 pub fn summarize(rows: &[(String, String)]) -> Value {
-    let days: Vec<Value> = rows.iter().map(|(d, m)| compact(d, m)).collect();
+    summarize_metrics(rows, &[])
+}
+
+/// [`summarize`], keeping only `metrics` (all if empty) and no more than
+/// [`SUMMARY_BYTES`]: if the days do not fit, the oldest are left out and
+/// `truncated_days` says how many.
+pub fn summarize_metrics(rows: &[(String, String)], metrics: &[String]) -> Value {
+    let mut maps: Vec<Map<String, Value>> = rows.iter().map(|(d, m)| compact(d, m)).collect();
+    if !metrics.is_empty() {
+        for map in &mut maps {
+            // A day keeps its date and the note of what was dropped.
+            map.retain(|k, _| {
+                let owner = k.strip_suffix("_omitted").unwrap_or(k);
+                k == "date" || k == "dropped" || metrics.iter().any(|m| m == k || m == owner)
+            });
+        }
+    }
+    let mut days: Vec<Value> = maps.into_iter().map(Value::Object).collect();
+    let mut out = json!({"days": days, "averages": averages(&days)});
+    let mut cut = 0;
+    while out.to_string().len() > SUMMARY_BYTES && days.len() > 1 {
+        days.remove(0);
+        cut += 1;
+        out = json!({"days": days, "averages": averages(&days)});
+    }
+    if cut > 0 {
+        out["truncated_days"] = cut.into();
+    }
+    out
+}
+
+fn averages(days: &[Value]) -> Value {
     let mut averages = Map::new();
-    for key in ["steps", "active_min", "zone_min", "resting_hr", "sleep_min"] {
-        let values: Vec<f64> = days.iter().filter_map(|d| d[key].as_f64()).collect();
+    for (name, pointer) in AVERAGED {
+        let values: Vec<f64> = days
+            .iter()
+            .filter_map(|d| d.pointer(pointer)?.as_f64())
+            .collect();
         if !values.is_empty() {
             let mean = values.iter().sum::<f64>() / values.len() as f64;
             averages.insert(
-                key.into(),
+                name.into(),
                 json!({"average": (mean * 10.0).round() / 10.0, "days_with_data": values.len()}),
             );
         }
     }
-    json!({"days": days, "averages": averages})
+    Value::Object(averages)
 }
 
 /// The `days` local days ending `today`, as inclusive dates.
@@ -169,6 +269,8 @@ impl Tool for Status {
 #[serde(deny_unknown_fields)]
 pub struct SummaryArgs {
     pub days: Option<i64>,
+    /// Names from [`METRICS`]; all of them if absent or empty.
+    pub metrics: Option<Vec<String>>,
 }
 
 struct Summary(Ctx);
@@ -181,17 +283,26 @@ impl Tool for Summary {
     fn description(&self) -> String {
         format!(
             "The user's synced Google Health data for the last N local days (1 to {MAX_DAYS}, \
-             default {DEFAULT_DAYS}), oldest first, today included: steps, distance_km, \
-             active_min, zone_min (active zone minutes), active_kcal, resting_hr, sleep_min and \
-             sleep_stage_min, workouts, weight_kg, body_fat_pct, hr_zone_minutes, plus averages. \
-             A key is missing when Google reported nothing for it that day. Data is synced once \
-             a day, so today can be partial. Use it for recovery, sleep and activity context \
-             when advising on training."
+             default {DEFAULT_DAYS}), oldest first, today included, as per-day totals and \
+             summaries, plus averages: steps, floors, distance_km, active_min, zone_min \
+             (active zone minutes), active_kcal, basal_kcal, resting_hr, sleep_min and \
+             sleep_stage_min, workouts, weight_kg, body_fat_pct, hr_zone_minutes, and, when the \
+             user's device and consent give them, heart_rate and hrv_ms ({{min, avg, max, n}}), \
+             spo2_pct, spo2_daily, hrv_daily, resp_rate_daily, sleep_temp, vo2max_daily, \
+             glucose_mgdl, core_temp_c, nutrition, hydration_ml, ecg, irn, moods, symptoms and \
+             more. Pass `metrics` to get only some. A key is missing when Google reported \
+             nothing for it that day; a `dropped` list names what was left out of a day for \
+             size. Data is synced once a day, so today can be partial. Use it for recovery, \
+             sleep and activity context when advising on training."
         )
     }
     fn parameters(&self) -> Value {
-        json!({"type":"object","properties":{"days":{"type":"integer",
-               "description":"Local days to return, 1 to 30; default 7"}},
+        json!({"type":"object","properties":{
+               "days":{"type":"integer",
+                       "description":"Local days to return, 1 to 30; default 7"},
+               "metrics":{"type":"array","items":{"type":"string","enum":METRICS.as_slice()},
+                          "description":"Only these metrics (default: all). Ask for a few \
+                                         when asking for many days."}},
                "additionalProperties":false})
     }
     async fn call(
@@ -200,12 +311,19 @@ impl Tool for Summary {
         args: SummaryArgs,
     ) -> Result<Value, Self::Error> {
         let days = args.days.unwrap_or(DEFAULT_DAYS);
+        let metrics = args.metrics.unwrap_or_default();
         let (configured, now) = (self.0.health.is_some(), self.0.clock.now());
         for_owner(&self.0.store, context, move |store, owner| {
             ensure!(
                 (1..=MAX_DAYS).contains(&days),
                 "days must be between 1 and {MAX_DAYS}"
             );
+            if let Some(unknown) = metrics.iter().find(|m| !METRICS.contains(&m.as_str())) {
+                anyhow::bail!(
+                    "unknown metric `{unknown}`; the metrics are {}",
+                    METRICS.join(", ")
+                );
+            }
             let Some(c) = store.health_connection(owner)? else {
                 let hint = if configured { CONNECT } else { NOT_CONFIGURED };
                 return Ok(json!({"status": "not_connected", "hint": hint}));
@@ -213,7 +331,7 @@ impl Tool for Summary {
             let zone = store.timezone(owner)?;
             let today = now.to_zoned(zone.clone()).date();
             let (start, end) = range(today, days);
-            let mut out = summarize(&store.health_days(owner, &start, &end)?);
+            let mut out = summarize_metrics(&store.health_days(owner, &start, &end)?, &metrics);
             out["status"] = c.status.clone().into();
             out["today"] = today.to_string().into();
             out["last_synced_at"] = c.last_synced_at.map(|t| when(t, &zone)).into();

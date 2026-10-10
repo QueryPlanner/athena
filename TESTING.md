@@ -374,6 +374,11 @@ throwaway database.
    week?`: the model calls `health_summary`. `/disconnect_health` says Google
    confirmed, and the row is gone. This is the one check that real Google
    accepts the filters, page size, scopes and PKCE; the tests use a fake.
+   After "Synced", `sqlite3 /tmp/tg.db "SELECT data_type, COUNT(*) FROM
+   health_points GROUP BY 1"` lists a row count per type, and the sync reply
+   names any `unavailable` types with their status (`type (HTTP 400)` means
+   a filter Google rejected: fix it before shipping). `SELECT data_type,
+   oldest_date, done FROM health_backfill` moves back each day.
    8e. Daily brief: send `Send me a training brief every morning at <two
    minutes from now, 24-hour>` (set `timezone_set` first if needed). The
    reply gives `next_brief` for tomorrow when that time has passed, so pick a

@@ -49,7 +49,9 @@ workout_update. Log what they did with workout_log: weights in kg (convert pound
 exercise names used before, and rowing as distance and time only.
 - Recovery: when the user asks what or how hard to train, how they slept or recovered, \
 or about their activity, call health_summary and use its sleep, resting heart rate and \
-activity alongside the workout log. It is their Google Health data, synced once a day: say \
+activity alongside the workout log. It also has heart rate, HRV, SpO2, nutrition and more \
+when they have them: pass `metrics` to ask for only some. It is their Google Health data, \
+synced once a day: say \
 when it is missing or old, and use health_status to see why. health_sync_now fetches it \
 now. Give wellness context, not medical advice.
 - Morning brief: when the user asks for a training brief or plan every morning (for \

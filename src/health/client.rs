@@ -6,6 +6,7 @@
 //! only in a header marked sensitive or in a form body. An [`Error`] holds a
 //! status and Google's short error code at most, never a URL, a body, a
 //! token or a code.
+use super::catalog::{self, Filter};
 use super::{Config, Secret};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderValue};
 use serde_json::Value;
@@ -18,10 +19,7 @@ pub const TOKEN_BODY_LIMIT: usize = 64 * 1024;
 /// The most of one page of data points that is read. The bot runs under
 /// `MemoryMax=128M`: a page is held, parsed and dropped before the next.
 pub const PAGE_BODY_LIMIT: usize = 2 * 1024 * 1024;
-/// Data points asked for per page.
-pub const PAGE_SIZE: u32 = 1000;
-/// The most pages read for one data type in one sync.
-pub const MAX_PAGES: usize = 40;
+pub use super::catalog::{MAX_PAGES, PAGE_SIZE};
 /// The longest error code from Google that is kept.
 const CODE_CHARS: usize = 64;
 
@@ -44,6 +42,8 @@ pub enum Error {
     Malformed(&'static str),
     /// More than this build reads.
     TooMuch(&'static str),
+    /// The points read could not be saved.
+    Storage(&'static str),
 }
 
 impl std::fmt::Display for Error {
@@ -57,7 +57,10 @@ impl std::fmt::Display for Error {
                 code: Some(code),
             } => write!(f, "Google answered HTTP {status} ({code})"),
             Error::Http { status, code: None } => write!(f, "Google answered HTTP {status}"),
-            Error::Transport(why) | Error::Malformed(why) | Error::TooMuch(why) => f.write_str(why),
+            Error::Transport(why)
+            | Error::Malformed(why)
+            | Error::TooMuch(why)
+            | Error::Storage(why) => f.write_str(why),
         }
     }
 }
@@ -220,7 +223,7 @@ impl Google {
             .map_err(|_| Error::Malformed("the access token is not a header value"))?;
         auth.set_sensitive(true);
         let mut query = vec![
-            ("pageSize", PAGE_SIZE.to_string()),
+            ("pageSize", catalog::of(data_type).page_size.to_string()),
             ("filter", filter(data_type, window)),
         ];
         query.extend(page.map(|token| ("pageToken", token.to_string())));
@@ -313,27 +316,31 @@ fn error_code(body: &[u8]) -> Option<String> {
     word.then(|| code.to_string())
 }
 
-/// The filter that selects `data_type` within `window`: civil dates for the
-/// daily and exercise types, otherwise instants on the field that places a
-/// point in time.
+/// The filter that selects `data_type` within `window`. The field depends
+/// on how the type is placed in time ([`Filter`]). The type's name is in
+/// snake case, as the API requires: a hyphen is `INVALID_DATA_POINT_FILTER`.
+/// Session types and daily types use civil dates; the others, instants.
 pub fn filter(data_type: &str, window: &Window) -> String {
     let field = data_type.replace('-', "_");
     let (start, end) = (&window.start, &window.end);
     let (start_date, end_date) = (&window.start_date, &window.end_date);
-    match data_type {
-        "daily-resting-heart-rate" | "daily-heart-rate-zones" => {
+    match catalog::of(data_type).filter {
+        Filter::DailyDate => {
             format!(r#"{field}.date >= "{start_date}" AND {field}.date < "{end_date}""#)
         }
-        "exercise" => format!(
-            r#"exercise.interval.civil_start_time >= "{start_date}" AND exercise.interval.civil_start_time < "{end_date}""#
+        Filter::SessionCivilStart => format!(
+            r#"{field}.interval.civil_start_time >= "{start_date}" AND {field}.interval.civil_start_time < "{end_date}""#
         ),
-        "weight" | "body-fat" => format!(
+        Filter::SamplePhysical => format!(
             r#"{field}.sample_time.physical_time >= "{start}" AND {field}.sample_time.physical_time < "{end}""#
         ),
-        "sleep" => {
+        Filter::SleepEnd => {
             format!(r#"sleep.interval.end_time >= "{start}" AND sleep.interval.end_time < "{end}""#)
         }
-        _ => format!(
+        // Only `>=` on the start is supported; nothing is later than the
+        // window's end anyway.
+        Filter::EcgStart => format!(r#"electrocardiogram.interval.start_time >= "{start}""#),
+        Filter::IntervalStart => format!(
             r#"{field}.interval.start_time >= "{start}" AND {field}.interval.start_time < "{end}""#
         ),
     }

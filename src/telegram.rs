@@ -3996,6 +3996,15 @@ mod tests {
         f.connect(1).await;
         let (chat, mut rx) = recorder();
         let jobs = Jobs::new(f.h.app.clone(), move |_| chat.clone());
+        // Only the window requests are counted: the daily pass also fetches
+        // history chunks, which end at or before the window's start.
+        let window_asks = |end: &str| {
+            f.fake
+                .seen_at("/steps/dataPoints")
+                .iter()
+                .filter(|s| s.query["filter"].contains(&format!(r#"start_time < "{end}""#)))
+                .count()
+        };
         // Connecting synced already: at 15:30 in Kolkata nothing is due.
         jobs.system(f.health.now()).await;
         assert!(collect(&mut rx).is_empty());
@@ -4004,7 +4013,7 @@ mod tests {
         f.clock.set("2026-10-11T00:00:00Z");
         jobs.system(f.health.now()).await;
         assert!(collect(&mut rx).is_empty());
-        assert_eq!(f.fake.seen_at("/steps/dataPoints").len(), 2);
+        assert_eq!(window_asks("2026-10-11T18:30:00Z"), 1);
         // The morning after, Google has revoked the access.
         f.clock.set("2026-10-12T00:00:00Z");
         f.fake.answer("token", 400, r#"{"error":"invalid_grant"}"#);
@@ -4380,7 +4389,15 @@ mod tests {
 
         // Synced at 06:30, so no wait: the brief goes at its time.
         assert_eq!(collect(&mut rx), brief_sent("Brief after today's sync"));
-        assert_eq!(f.fake.seen_at("/steps/dataPoints").len(), 2);
+        // Today's window was asked for once; the history chunks that follow
+        // in the same pass end before the window starts.
+        let today_window = f
+            .fake
+            .seen_at("/steps/dataPoints")
+            .into_iter()
+            .filter(|s| s.query["filter"].contains(r#"start_time < "2026-10-11T18:30:00Z""#))
+            .count();
+        assert_eq!(today_window, 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

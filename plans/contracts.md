@@ -454,7 +454,7 @@ Read-only sleep, activity, heart-rate and body data from the Google Health API
 the model through three tools. Ported from Blacki (`src/blacki/health/`),
 which keeps the same environment variable names.
 
-**Schema** (migration 14, after `user_skills`, 13). All keyed to `users.id`
+**Schema** (migration 14, after `user_skills`, 13; `health_points` and `health_backfill` are migration 16, after the daily brief, 15). All keyed to `users.id`
 (`ON DELETE CASCADE`):
 
 - `health_connections`: `user_id` (primary key), `encrypted_refresh_token`
@@ -470,11 +470,58 @@ which keeps the same environment variable names.
 - `health_daily`: `user_id`, `date` (`YYYY-MM-DD`, the user's local day),
   `metrics` (JSON), `updated_at`; key `(user_id, date)`. Rows survive
   `/disconnect_health`. Keys of `metrics`, present only when Google reported
-  them: `steps`, `distance_m`, `active_kcal`, `active_min`, `zone_min`
-  (active zone minutes), `resting_hr`, `hr_zone_minutes` (`{zone: minutes}`),
-  `hr_zones` (`[{type, min_bpm, max_bpm}]`), `weight_kg`, `body_fat_pct`,
-  `workouts` (`[{type, minutes, kcal?, zone_min?}]`), `sleep` (`[{minutes,
-  start, end, stages: [{type, minutes}]}]`).
+  them. Only the recent 14-day window is aggregated; history is in
+  `health_points`. Each day is at most 4 KiB of JSON (`health::normalize::
+  MAX_DAY_BYTES`): over that, `hr_zones`, `activity_level_min`,
+  `hr_zone_minutes`, `moods`, `symptoms`, `ovulation_tests`, `swim`,
+  `workouts`, `sleep` are dropped in that order and named in `dropped`.
+  Free text from Google is never stored in a day; enum-valued labels are kept
+  only if `[A-Z0-9_]{1,40}`.
+  - Sums of interval points: `steps`, `floors`, `distance_m`,
+    `elevation_change_m` (net: Google's altitude value is a signed delta),
+    `active_kcal`, `basal_kcal`, `active_min`, `zone_min` (active zone
+    minutes), `sedentary_min`, `activity_level_min` (`{TYPE: minutes}`),
+    `swim` (`{lengths, strokes}`), `hydration_ml`, `nutrition` (`{entries,
+    kcal, carbs_g, fat_g, protein_g?, fiber_g?, sugar_g?, sodium_mg?}`),
+    `hr_zone_minutes` (`{zone: minutes}`).
+  - Samples, `{min, avg, max, n}`: `heart_rate`, `hrv_ms` (RMSSD),
+    `spo2_pct`, `resp_rate_sleep`, `glucose_mgdl`, `core_temp_c`.
+  - Latest of the day: `weight_kg`, `body_fat_pct`, `height_cm`, `vo2max`,
+    `run_vo2max`.
+  - Google's daily summaries as sent: `resting_hr`, `hrv_daily` (`{avg_ms,
+    deep_rmssd_ms, non_rem_hr, entropy}`), `spo2_daily` (`{avg, min, max}`),
+    `vo2max_daily` (`{value, level, estimated}`), `resp_rate_daily`,
+    `sleep_temp` (`{nightly_c, baseline_c, rel_stddev_30d_c}`), `hr_zones`
+    (`[{type, min_bpm, max_bpm}]`).
+  - Sessions, capped per day (`workouts_omitted`, `sleeps_omitted` count the
+    rest): `workouts` (at most 8: `[{type, minutes, kcal?, distance_m?,
+    avg_hr?, zone_min?}]`), `sleep` (at most 4: `[{minutes, start, end,
+    stages: [{type, minutes}], nap?}]`).
+  - Counts and labels only, never a waveform or a heart-beat series: `ecg`
+    (`{count, classes}`), `irn` (`{count}`), `moods` and `symptoms` (`{count,
+    labels: {LABEL: n}}`, at most 12 labels), `ovulation_tests` (`{RESULT:
+    n}`), `menstrual_period_started` (periods that began that day).
+- `health_points` (migration 16): every data point as Google returned it.
+  `id`, `user_id`, `data_type` (kebab case, as in the path), `point_key`
+  (Google's `name`, else `sha256:` of type, start, source and value),
+  `start_ms` and `end_ms` (UTC milliseconds; a sample has both the same; a
+  daily summary is its date's local midnight), `civil_date` (the user's local
+  day), `value` (the data point's JSON, whole), `source` (`PLATFORM:device`),
+  `ingested_at`; unique `(user_id, data_type, point_key)`, index `(user_id,
+  data_type, start_ms)`. Writes are upserts that change a row only when
+  `value` differs, so re-reading is idempotent. Rows survive
+  `/disconnect_health` and are in `athena backup` (the online backup copies
+  the whole database). **Growth:** heart rate is about one point every few
+  seconds to a minute: minute-level alone is about 525,000 rows a year, each
+  a few hundred bytes with its index. Other minute types (steps, distance,
+  energy, altitude, active minutes, SpO2) add a similar order each; ECG points
+  carry their waveform (tens of KB each). Budget gigabytes for years of data
+  per user. A later change adds the tools that read it; the model does not see
+  this table today.
+- `health_backfill` (migration 16): `user_id`, `data_type`, `oldest_date` (the
+  earliest local day fetched so far), `done`, `empty_run`, `last_error`,
+  `updated_at`; key `(user_id, data_type)`. Reconnecting deletes the user's
+  rows here so history is looked for again.
 
 **Connecting ("paste back").** Athena has no HTTPS callback and no new route:
 
@@ -486,7 +533,14 @@ which keeps the same environment variable names.
    `code_challenge` (S256) and these scopes, all read-only:
    `googlehealth.activity_and_fitness.readonly`,
    `googlehealth.health_metrics_and_measurements.readonly`,
-   `googlehealth.sleep.readonly`, `googlehealth.nutrition.readonly`. The PKCE
+   `googlehealth.location.readonly`, `googlehealth.nutrition.readonly`,
+   `googlehealth.sleep.readonly`, `googlehealth.reproductive_health.readonly`,
+   `googlehealth.logged_symptoms.readonly`, `googlehealth.mindfulness.readonly`,
+   `googlehealth.ecg.readonly`, `googlehealth.irn.readonly` (`health::SCOPES`;
+   never a `writeonly` one). The user can untick any on Google's consent
+   screen; a type whose scope was not granted answers 403 and is skipped. A
+   connection made before these were added holds the first four only and must
+   `/connect_health` again. The PKCE
    verifier is `sha256(secret, state)` in hex, derived and never stored.
 2. The user approves; the browser goes to the redirect URI (it need not
    load) and the user pastes that URL into Telegram.
@@ -523,22 +577,74 @@ prints one with `Debug`. Base URLs are constants (`health::TOKEN_URL`,
 `health::client::Endpoints`.
 
 **Sync.** `GET https://health.googleapis.com/v4/users/me/dataTypes/<type>/dataPoints`
-with `pageSize=1000`, a `filter` and `pageToken`, for `steps`, `distance`,
-`active-energy-burned`, `active-minutes`, `active-zone-minutes`, `exercise`,
-`sleep`, `daily-resting-heart-rate`, `daily-heart-rate-zones`,
-`time-in-heart-rate-zone`, `weight` and `body-fat` (Blacki's filters). The
-window is the user's last 14 local days ending today (whole days from local
-midnight, so a day with a clock change is its real length). A point goes on
-its civil date, else on its instant in the user's zone (`user_settings`);
-sleep goes on the day it ended. At most 40 pages per type. Access tokens are
-kept in memory until a minute before they expire and never stored; a rotated
-refresh token is sealed and stored.
+with a `pageSize`, a `filter` and `pageToken`, for the 40 data types of
+`health::catalog::SPECS`, from the v4 `DataPoint` union
+(<https://developers.google.com/health/reference/rest/v4/users.dataTypes.dataPoints>;
+filters <https://developers.google.com/health/filters>, page sizes
+<https://developers.google.com/health/reference/rest/v4/users.dataTypes.dataPoints/list>).
+The filter names the type in snake case (`body_fat`; a hyphen is a 400), and
+depends on the type's shape:
 
-- A type Google answers 403 for is skipped and reported; its days in the window
-  are replaced by days without it.
-- Any other failure (HTTP error, timeout, too many pages) writes nothing:
+| Shape | Filter field | Types |
+|---|---|---|
+| Interval | `{t}.interval.start_time` (RFC 3339, `>=` and `<`) | steps, floors, distance, altitude, active-energy-burned, basal-energy-burned, active-minutes, active-zone-minutes, activity-level, sedentary-period, swim-lengths-data, time-in-heart-rate-zone, menstrual-period |
+| Sample | `{t}.sample_time.physical_time` | vo2-max, run-vo2-max, heart-rate, heart-rate-variability, oxygen-saturation, respiratory-rate-sleep-summary, core-body-temperature, blood-glucose, weight, body-fat, height, ovulation-test, symptoms, moods |
+| Daily | `{t}.date` (`YYYY-MM-DD`) | daily-vo2-max, daily-resting-heart-rate, daily-heart-rate-variability, daily-oxygen-saturation, daily-respiratory-rate, daily-sleep-temperature-derivations, daily-heart-rate-zones |
+| Session | `{t}.interval.civil_start_time` (dates) | exercise, nutrition-log, hydration-log, irregular-rhythm-notification |
+| Sleep | `sleep.interval.end_time` (a night belongs to the day it ended) | sleep |
+| ECG | `electrocardiogram.interval.start_time >= ...` only (no end; docs) | electrocardiogram |
+
+Scopes by type: `activity_and_fitness` (the activity, interval, VO2 max and
+exercise types), `health_metrics_and_measurements` (heart rate, HRV, SpO2,
+respiration, temperature, glucose, weight, body fat, height and the `daily-*`
+summaries but `daily-vo2-max`), `sleep`, `nutrition` (`nutrition-log`,
+`hydration-log`), `ecg`, `irn`, and, by their names, `reproductive_health`
+(`menstrual-period`, `ovulation-test`), `logged_symptoms` (`symptoms`),
+`mindfulness` (`moods`). `location` is requested for exercise GPS; no type
+read today uses it. The docs do not tabulate scopes for `basal-energy-burned`
+or the women's-health types; any scope not granted answers 403.
+
+Page sizes: 25 for `exercise`, `sleep` and `irregular-rhythm-notification`
+(the documented maximum for the first two); 10 for ECG (waveforms); 200 for
+`nutrition-log`; otherwise 1000 (the documented maximum is 10,000, but a page
+is read whole under 2 MiB). `dataSourceFamily` is never sent (not supported for
+`sleep`, `food`, `food-measurement-unit`). Paging follows `nextPageToken`, at
+most 60 pages per type (400 for heart rate). Left out: `food` and
+`food-measurement-unit` (catalogues with no time, not intake; `nutrition-log`
+is the intake) and `v4beta`-only types. The window is the user's last 14
+local days ending today (whole days from local midnight, so a day with a
+clock change is its real length). A point goes on its civil date, else on its
+instant in the user's zone (`user_settings`); sleep goes on the day it ended;
+ECG on its start instant in the user's zone (old ECGs carry no UTC offset).
+Access tokens are kept in memory until a minute before they expire and never
+stored; a rotated refresh token is sealed and stored.
+
+Every page is written to `health_points` as it arrives (one transaction per
+page, so memory holds one page) and, for the window, folded into the day
+aggregates.
+
+**Backfill.** On each *daily* pass (not on `health_sync_now`), after the
+window is stored, for each type not `done`: up to 3 chunks
+(`BACKFILL_CHUNKS_PER_PASS`) of 7 days (`BACKFILL_DAYS`) working backwards from
+`health_backfill.oldest_date` (at first the start of the window), points
+stored only (no aggregates). A type is `done` at 3 years back
+(`BACKFILL_FLOOR_DAYS`; Google sets no retention limit), after 12 empty chunks
+in a row, or when Google refuses it (403, or 400/404 for a type added after the
+first release). ECG has no upper-bound filter, so its history is read in one
+go back to the floor. A chunk that needs more pages than the cap keeps what it
+read and moves on (`last_error: partial`). Any other failure leaves the
+cursor and ends the pass; it never fails the sync. A user with history
+therefore finishes in about 52 days (156 weeks / 3).
+
+- A type Google answers 403 for is skipped and reported by name in
+  `unavailable`; its days in the window are replaced by days without it. A
+  type added after the first release that answers 400 or 404 is skipped and
+  reported as `type (HTTP 400)`, so a filter Google rejects shows in the
+  report instead of failing every user's sync.
+- Any other failure (HTTP error, timeout, too many pages) writes no days:
   the old days stay, `last_sync_error` records why, the connection stays
-  `connected`, and the next try is an hour later.
+  `connected`, and the next try is an hour later. Points already stored stay
+  (they are the same points).
 - On success the window's days are replaced in one transaction that also sets
   `last_synced_at` and clears the error, only if the connection still
   exists and is `connected` (a disconnect during a sync is not undone).
@@ -563,11 +669,17 @@ the other native tools; the owner is the session's user, no tool takes one):
 - `health_status()`: `configured`, `status` (`not_connected`, `connected`,
   `revoked`), `connected_at`, `last_synced_at` (local time), `last_sync_error`,
   and a `hint`.
-- `health_summary(days?)`: 1 to 30 local days (default 7) ending today,
-  oldest first: the stored metrics with sleep as `sleep_min` and
-  `sleep_stage_min`, `distance_km`, no `hr_zones`; `averages` over the days
-  that have a value (`steps`, `active_min`, `zone_min`, `resting_hr`,
-  `sleep_min`); `status`, `today`, `last_synced_at`. A user with no connection
+- `health_summary(days?, metrics?)`: 1 to 30 local days (default 7) ending
+  today, oldest first: the stored metrics with sleep as `sleep_min` and
+  `sleep_stage_min`, `distance_km`, no `hr_zones`; `metrics` is a list of names
+  from `health::tools::METRICS` (unknown name: an error listing them) and keeps
+  only those (and `date`, `dropped`); `averages` over the days that have a
+  value (`steps`, `active_min`, `zone_min`, `resting_hr`, `sleep_min`,
+  `floors`, `active_kcal`, `hrv_ms`, `spo2_pct`, `resp_rate`,
+  `heart_rate_avg`); `status`, `today`, `last_synced_at`. The result is at
+  most `SUMMARY_BYTES` (56 KiB, under the 64 KiB tool-result policy): if the
+  days do not fit, the oldest are left out and `truncated_days` counts them.
+  A user with no connection
   row gets no days; a revoked one gets the old days with a hint. The daily
   sync fills 14 days, so a longer window fills over time.
 - `health_sync_now()`: a sync now, refused within an hour of the last attempt
@@ -581,7 +693,7 @@ like every command), both in the command menu. Disconnecting asks Google to
 revoke the refresh token (`POST https://oauth2.googleapis.com/revoke`, token
 in the body), then deletes the connection row, so the sealed token is gone,
 and the user's pending links; it says whether Google confirmed. `health_daily`
-rows stay. The preamble tells the model to call `health_summary` for recovery,
+and `health_points` rows stay. The preamble tells the model to call `health_summary` for recovery,
 sleep and activity when advising on training.
 
 ## Daily brief

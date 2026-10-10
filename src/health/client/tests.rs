@@ -407,3 +407,61 @@ async fn an_access_token_that_cannot_be_a_header_is_refused_before_sending() {
     assert!(!format!("{e}").contains("bad"));
     assert!(fake.seen().is_empty());
 }
+
+#[test]
+fn an_ecg_is_filtered_by_start_only_because_that_is_all_google_supports() {
+    assert_eq!(
+        filter("electrocardiogram", &window()),
+        r#"electrocardiogram.interval.start_time >= "2026-09-27T00:00:00Z""#
+    );
+}
+
+#[test]
+fn a_sample_type_with_hyphens_is_filtered_by_its_snake_case_name() {
+    assert_eq!(
+        filter("respiratory-rate-sleep-summary", &window()),
+        r#"respiratory_rate_sleep_summary.sample_time.physical_time >= "2026-09-27T00:00:00Z" AND respiratory_rate_sleep_summary.sample_time.physical_time < "2026-10-11T00:00:00Z""#
+    );
+}
+
+#[tokio::test]
+async fn each_type_asks_for_its_documented_page_size_and_never_the_data_source_family() {
+    let (fake, google) = setup().await;
+    let access = Secret::new("a");
+    for data_type in [
+        "sleep",
+        "exercise",
+        "electrocardiogram",
+        "nutrition-log",
+        "steps",
+    ] {
+        google
+            .data_page(&access, data_type, &window(), None)
+            .await
+            .unwrap();
+    }
+    let sizes: Vec<(String, String)> = fake
+        .seen()
+        .iter()
+        .map(|s| {
+            let kind = s.path.split('/').nth(5).unwrap().to_string();
+            (kind, s.query["pageSize"].clone())
+        })
+        .collect();
+    assert_eq!(
+        sizes,
+        [
+            ("sleep".to_string(), "25".to_string()),
+            ("exercise".to_string(), "25".to_string()),
+            ("electrocardiogram".to_string(), "10".to_string()),
+            ("nutrition-log".to_string(), "200".to_string()),
+            ("steps".to_string(), "1000".to_string()),
+        ]
+    );
+    // No request sends a dataSourceFamily parameter.
+    assert!(
+        fake.seen()
+            .iter()
+            .all(|s| !s.query.contains_key("dataSourceFamily"))
+    );
+}

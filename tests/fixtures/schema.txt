@@ -1,4 +1,4 @@
-user_version 15
+user_version 16
 
 table browser_links
   token TEXT NOT NULL PK1
@@ -57,6 +57,17 @@ table daily_briefs
   updated_at INTEGER NOT NULL
   foreign key user_id REFERENCES users (id)
 
+table health_backfill
+  user_id INTEGER NOT NULL PK1
+  data_type TEXT NOT NULL PK2
+  oldest_date TEXT NOT NULL
+  done INTEGER NOT NULL DEFAULT 0
+  empty_run INTEGER NOT NULL DEFAULT 0
+  last_error TEXT
+  updated_at INTEGER NOT NULL
+  foreign key user_id REFERENCES users (id)
+  unique index (user_id, data_type) from pk
+
 table health_connections
   user_id INTEGER NOT NULL PK1
   encrypted_refresh_token BLOB NOT NULL
@@ -85,6 +96,21 @@ table health_oauth_states
   foreign key user_id REFERENCES users (id)
   index health_states_by_user (user_id) from c
   unique index (state_hash) from pk
+
+table health_points
+  id INTEGER PK1
+  user_id INTEGER NOT NULL
+  data_type TEXT NOT NULL
+  point_key TEXT NOT NULL
+  start_ms INTEGER
+  end_ms INTEGER
+  civil_date TEXT
+  value TEXT NOT NULL
+  source TEXT
+  ingested_at INTEGER NOT NULL
+  foreign key user_id REFERENCES users (id)
+  index health_points_by_time (user_id, data_type, start_ms) from c
+  unique index (user_id, data_type, point_key) from u
 
 table jobs
   id INTEGER PK1

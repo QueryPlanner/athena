@@ -415,6 +415,19 @@ You can delete it from the chat afterwards. The refresh token is stored
 encrypted; the access token is only ever in memory. `/disconnect_health`
 revokes it at Google and deletes it; the daily numbers already synced stay.
 
+It asks for every read-only scope Google offers, so all your data can be
+stored: activity and fitness, health metrics (heart rate, HRV, SpO2, glucose,
+temperature, weight and more), location, nutrition, sleep, reproductive
+health, logged symptoms, mood, ECG and irregular rhythm notifications. Some
+are sensitive; untick any you do not want on Google's consent screen, and
+those data types are skipped. Anyone connected before this must send
+`/connect_health` again. Every data point is stored whole in the database
+(`health_points`), and your history is fetched in the background, a few weeks
+more each day, back three years. That is a lot of rows (minute-level heart rate
+alone is about 525,000 a year): see `plans/contracts.md` for the numbers, and
+note `athena backup` includes it. The model sees per-day totals and summaries,
+not the raw points; `health_summary` can be asked for just some `metrics`.
+
 `athena telegram` syncs the last 14 days once a day, after 05:30 your time
 (`timezone_set`), and `health_sync_now` allows one more an hour. If Google
 stops accepting the connection the bot tells you once to send
