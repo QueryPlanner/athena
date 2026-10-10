@@ -95,8 +95,10 @@ impl<R: Run + 'static, C: Chat> Execute for Jobs<R, C> {
         }
     }
 
-    async fn system(&self, _now: Timestamp) {
+    async fn system(&self, now: Timestamp) {
+        // The sync first, so a brief due this tick reads this morning's data.
         self.app.daily_health(&*self.chat).await;
+        self.app.daily_brief(&*self.chat, &self.tasks, now).await;
     }
 }
 

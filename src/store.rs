@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod brief;
 mod calories;
 mod health;
 mod jobs;
@@ -31,6 +32,7 @@ mod timezone;
 mod user_skills;
 mod workouts;
 
+pub use brief::{Brief, BriefCandidate};
 pub use health::{Candidate, Claim, Connection as HealthConnection};
 pub use jobs::Due;
 
@@ -573,6 +575,25 @@ const MIGRATIONS: &[&str] = &[
          updated_at INTEGER NOT NULL,
          PRIMARY KEY (user_id, date)
      );",
+    // 15: the opt-in daily training brief. One row per user who ever asked
+    // for it. `local_time` is `HH:MM` on the user's wall clock (their zone
+    // is `user_settings.timezone`, read when the brief is due, so it follows
+    // a later `timezone_set` and daylight saving). `last_sent_date` is the
+    // user's local date the brief was last *claimed* for: the scheduler sets
+    // it with a compare-and-set before running the turn, so a day's brief is
+    // started at most once and a crash loses it rather than repeating it.
+    // `last_attempt_at` is that claim's time; `last_error` is why the brief
+    // was switched off (Telegram refusing for good) or could not be planned.
+    "CREATE TABLE daily_briefs (
+         user_id         INTEGER NOT NULL PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE,
+         local_time      TEXT NOT NULL,
+         enabled         INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+         last_sent_date  TEXT,
+         last_attempt_at INTEGER,
+         last_error      TEXT,
+         created_at      INTEGER NOT NULL,
+         updated_at      INTEGER NOT NULL
+     );",
 ];
 
 /// The schema version this build writes.
@@ -623,6 +644,19 @@ const EXPECTED_COLUMNS: &[(&str, &[&str])] = &[
             "created_at",
             "updated_at",
             "deleted_at",
+        ],
+    ),
+    (
+        "daily_briefs",
+        &[
+            "user_id",
+            "local_time",
+            "enabled",
+            "last_sent_date",
+            "last_attempt_at",
+            "last_error",
+            "created_at",
+            "updated_at",
         ],
     ),
     (
@@ -1735,6 +1769,7 @@ mod tests {
                 "browser_states",
                 "calorie_logs",
                 "compactions",
+                "daily_briefs",
                 "health_connections",
                 "health_daily",
                 "health_oauth_states",

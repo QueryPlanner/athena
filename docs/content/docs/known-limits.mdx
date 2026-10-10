@@ -39,6 +39,14 @@ description: What athena does not do yet. Read this before exposing it.
   `health_summary` returns is sent to the model provider and saved in the
   session. A bare code pasted without its URL is not recognised.
 
+- Daily brief: it is a scheduled agent turn like a reminder task. The agent
+  has no cap on model calls per turn, and a scheduled turn still has the
+  agent's write tools (it cannot confirm anything, because it has no user
+  message). The fixed prompt tells the model to call three read tools and to
+  treat their results as data, but that is an instruction, not a filter. A
+  brief lost to a crash or a failed send is not sent again that day. Changing
+  time zone can shift a brief by up to a day.
+
 ## Durability
 
 - A crash mid-turn loses that turn, and so does a second Ctrl-C while

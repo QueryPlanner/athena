@@ -425,6 +425,20 @@ On the VM, a human adds the three variables to `/etc/athena/<env>.env` with
 `sudoedit`, restarts the units, and each user sends `/connect_health` once.
 The redirect URI must be the one registered with the OAuth client.
 
+## Daily brief
+
+Ask in Telegram: "send me a training brief every morning at 6:30". The agent
+calls `daily_brief_set` and each morning at that time on your clock
+(`timezone_set`) `athena telegram` sends a short message: what is due today
+(Push, Pull, Legs, VO2), last session's numbers with what to aim for, your
+last three days of sleep, resting heart rate and steps from Google Health
+(left out when it is not connected), and yesterday's calories. It waits up to
+30 minutes for that morning's Google Health sync. `daily_brief_status` shows
+it and `daily_brief_off` stops it. It is at most one message a day, never
+made up if more than four hours late or while you are mid-conversation past
+that, and it is switched off if Telegram refuses delivery. The brief is a
+turn in your current session, so you can reply to it.
+
 ## Reminders
 
 Persistent agents also expose `reminder_create`, `reminder_confirm`,
@@ -757,6 +771,7 @@ Caddy or Tailscale settings, and never overwrites a file holding secrets.
                        HTTP client, stream parser, quoting and the tools
     src/policy.rs      the tool-call argument-size hook
     src/search.rs      web_search: Exa's search API, when EXA_API_KEY is set
+    src/brief.rs       daily training brief: tools, due time, fixed prompt
     src/health.rs      Google Health: settings, token encryption, the pasted
                        callback; health/ has the Google client, the daily
                        aggregation, the sync and the three tools

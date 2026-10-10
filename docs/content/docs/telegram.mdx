@@ -42,6 +42,24 @@ a restart.
 The commands are registered with Telegram's command menu at startup. Any
 other text is a prompt for the current session.
 
+## Daily training brief
+
+Ask in plain words ("send me a training brief every morning at 6:30") and the
+agent turns it on with `daily_brief_set`; `daily_brief_status` and
+`daily_brief_off` read and stop it. Each morning at that time on your clock
+(`timezone_set`, daylight saving followed) the bot runs one turn in your
+current session and sends you a short brief: what is due today (Push, Pull,
+Legs, VO2), last session's numbers with what to aim for, your last three days
+of sleep, resting heart rate and steps from Google Health (left out if it is
+not connected), and yesterday's calories. It waits up to 30 minutes for that
+morning's Google Health sync. The prompt is fixed in the program, so it needs
+no confirmation code as a reminder task does.
+
+It is at most one a day. If you are mid-turn it waits and tries again every
+30 seconds; more than 4 hours late, that day's brief is skipped, not made up.
+If Telegram refuses the message (you blocked the bot), the brief is switched
+off. Like reminders, only `athena telegram` sends it.
+
 ## Reminders
 
 Ask in plain words ("remind me at 6 to call mum", "every weekday at 7:30
