@@ -18,6 +18,7 @@ pub mod ops;
 pub mod policy;
 pub mod runner;
 pub mod sandbox;
+pub mod search;
 pub mod service;
 pub mod shutdown;
 pub mod store;

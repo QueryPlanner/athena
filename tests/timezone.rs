@@ -219,6 +219,7 @@ async fn the_agent_reads_and_sets_the_users_zone_through_the_real_loop() {
         &athena::custom::Custom::default(),
         &athena::mcp::Mcp::none(),
         store.clone(),
+        None,
     );
     for prompt in ["what day is it?", "I live in Tokyo", "use GMT+9"] {
         service.send(&agent, &user, &s.id, prompt).await.unwrap();

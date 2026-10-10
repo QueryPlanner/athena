@@ -165,7 +165,8 @@ ssh -t "$VM" 'sudoedit /etc/athena/staging.env'   # OPENROUTER_API_KEY (spend-ca
 ssh -t "$VM" 'sudoedit /etc/athena/prod.env'      # OPENROUTER_API_KEY, TELEGRAM_BOT_TOKEN (prod bot)
 ```
 
-Optional in both: `OPEN_SANDBOX_API_KEY` once the sandbox host has one.
+Optional in both: `OPEN_SANDBOX_API_KEY` once the sandbox host has one, and
+`EXA_API_KEY` for the `web_search` tool.
 
 Non-secret settings (`OPEN_SANDBOX_URL`, `ATHENA_SANDBOX_IMAGE`,
 `ATHENA_SANDBOX_TIMEOUT_SECS`, `AGENT_MODEL`) can instead come from GitHub:

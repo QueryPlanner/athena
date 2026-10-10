@@ -1470,7 +1470,14 @@ pub async fn main(model: &str) -> Result<()> {
         Arc::new(Service::new(store.clone(), model, log_warning).with_compactor(compactor));
     let sandboxes = agent::sandboxes_from_env(&store)?;
     let mcp = agent::connect_mcp(&log_warning).await;
-    let agent = agent::build_with(&client, model, service.memory(), sandboxes.clone(), &mcp);
+    let agent = agent::build_with(
+        &client,
+        model,
+        service.memory(),
+        sandboxes.clone(),
+        crate::search::WebSearch::from_env(),
+        &mcp,
+    );
     let app = Arc::new(
         Telegram::new(service, store, agent, Arc::new(log_warning))
             .sandboxes(sandboxes)
