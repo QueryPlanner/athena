@@ -2,6 +2,7 @@
 
 use crate::custom::Custom;
 use crate::custom::skills::ReadSkill;
+use crate::health::Health;
 use crate::mcp::Mcp;
 use crate::media;
 use crate::policy::ToolPolicy;
@@ -46,6 +47,11 @@ sets, weights) and each exercise's suggested progression: 2.5 kg more when the t
 hit its target reps, otherwise one more rep. If today is already logged, add to it with \
 workout_update. Log what they did with workout_log: weights in kg (convert pounds), the \
 exercise names used before, and rowing as distance and time only.
+- Recovery: when the user asks what or how hard to train, how they slept or recovered, \
+or about their activity, call health_summary and use its sleep, resting heart rate and \
+activity alongside the workout log. It is their Google Health data, synced once a day: say \
+when it is missing or old, and use health_status to see why. health_sync_now fetches it \
+now. Give wellness context, not medical advice.
 - The sandbox is this conversation's own Linux machine, with a browser. Files the user \
 sends are saved there, and their message says where.
 - To use a website: agent_browser, the agent-browser CLI. Read its guide first, as its \
@@ -112,6 +118,7 @@ pub fn build(
     mcp: &Mcp,
 ) -> Result<(rig::agent::Agent, Option<Arc<Sandboxes>>)> {
     let sandboxes = sandboxes_from_env(memory.store())?;
+    let health = Health::from_env(memory.store())?;
     Ok((
         build_with(
             client,
@@ -119,6 +126,7 @@ pub fn build(
             memory,
             sandboxes.clone(),
             WebSearch::from_env(),
+            health,
             mcp,
         ),
         sandboxes,
@@ -160,6 +168,8 @@ pub async fn shutdown_on_demand(mcp: OnceCell<Mcp>) {
 pub fn reserved_tool_names() -> Vec<&'static str> {
     // `read_skill` exists only when there are skills, and `web_search` only
     // with EXA_API_KEY, but their names are kept from MCP tools either way.
+    // The Google Health tools are always there; without its settings they
+    // say it is not set up.
     [Add::NAME, ReadSkill::NAME, crate::search::NAME]
         .into_iter()
         .chain(sandbox::tools::NAMES)
@@ -168,6 +178,7 @@ pub fn reserved_tool_names() -> Vec<&'static str> {
         .chain(crate::workouts::NAMES)
         .chain(crate::reminders::NAMES)
         .chain(crate::user_skills::NAMES)
+        .chain(crate::health::NAMES)
         .collect()
 }
 
@@ -175,28 +186,31 @@ pub fn reserved_tool_names() -> Vec<&'static str> {
 /// also puts files in the sandboxes. One [`Sandboxes`] per process: it
 /// serialises each session's sandbox calls. Production passes
 /// [`WebSearch::from_env`]; tests pass `None` so a developer's key is never
-/// used.
+/// used. `health` is Google Health, which production builds from the
+/// environment ([`Health::from_env`]) and shares with the scheduler.
 pub fn build_with(
     client: &Client,
     model: &str,
     memory: SqliteMemory,
     sandboxes: Option<Arc<Sandboxes>>,
     search: Option<WebSearch>,
+    health: Option<Arc<Health>>,
     mcp: &Mcp,
 ) -> rig::agent::Agent {
     // Vision: tools return images (screenshots) that OpenRouter's chat API
     // only takes from the user.
     let model = media::Vision(client.completion_model(model));
     let store = memory.store().clone();
-    configure_persistent(
+    configure_stored(
         rig::agent::AgentBuilder::new(model)
             .memory(memory)
             .additional_params(openrouter_params()),
         sandboxes,
         &Custom::from_env(),
         mcp,
-        store,
+        Some((store, GitHub::default())),
         search,
+        health,
     )
 }
 
@@ -267,11 +281,11 @@ pub fn configure_all(
     custom: &Custom,
     mcp: &Mcp,
 ) -> rig::agent::Agent {
-    configure_stored(builder, sandboxes, custom, mcp, None, None)
+    configure_stored(builder, sandboxes, custom, mcp, None, None, None)
 }
 
-/// Configure a persistent agent with native calorie, workout, time and
-/// reminder tools, the user's own skills (`user_skills`, installed from
+/// Configure a persistent agent with native calorie, workout, time, reminder
+/// and Google Health tools (the last say it is not set up without it), the user's own skills (`user_skills`, installed from
 /// GitHub's public API), and `web_search` when `search` is given: what
 /// [`build_with`] builds.
 /// Use the same store for the builder's memory and the tools.
@@ -290,6 +304,7 @@ pub fn configure_persistent(
         mcp,
         Some((store, GitHub::default())),
         search,
+        None,
     )
 }
 
@@ -307,6 +322,25 @@ pub fn configure_persistent_with_github(
         &Mcp::none(),
         Some((store, github)),
         None,
+        None,
+    )
+}
+
+/// [`configure_persistent`] with Google Health `health`: tests give it one
+/// that talks to a fake Google.
+pub fn configure_persistent_with_health(
+    builder: rig::agent::AgentBuilder,
+    store: crate::store::Store,
+    health: Arc<Health>,
+) -> rig::agent::Agent {
+    configure_stored(
+        builder,
+        None,
+        &Custom::default(),
+        &Mcp::none(),
+        Some((store, GitHub::default())),
+        None,
+        Some(health),
     )
 }
 
@@ -317,6 +351,7 @@ fn configure_stored(
     mcp: &Mcp,
     store: Option<(crate::store::Store, GitHub)>,
     search: Option<WebSearch>,
+    health: Option<Arc<Health>>,
 ) -> rig::agent::Agent {
     let mut preamble = custom.preamble(PREAMBLE);
     if store.is_some() {
@@ -342,6 +377,7 @@ fn configure_stored(
             let builder = crate::workouts::register(builder, store.clone());
             let builder = crate::timezone::register(builder, store.clone());
             let builder = crate::reminders::register(builder, store.clone());
+            let builder = crate::health::tools::register(builder, store.clone(), health);
             crate::user_skills::register(builder, store, github)
         }
         None => builder,
@@ -405,6 +441,7 @@ mod tests {
             Some((store.clone(), GitHub::default())),
             // Registered so its name is checked; the prompt never calls it.
             WebSearch::new("k", "http://127.0.0.1:1/search", crate::search::TIMEOUT),
+            None,
         );
         agent.prompt("hi").await.unwrap();
         std::fs::remove_dir_all(&home).unwrap();

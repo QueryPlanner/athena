@@ -11,6 +11,7 @@ pub mod dotenv;
 pub mod eval;
 pub mod flags;
 pub mod gate;
+pub mod health;
 pub mod http;
 pub mod mcp;
 pub mod media;

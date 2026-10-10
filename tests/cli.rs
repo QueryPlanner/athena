@@ -303,11 +303,56 @@ fn athena_with(
         .env_remove("ATHENA_COMPACT_AT")
         .env_remove("ATHENA_COMPACT_MODEL")
         .env_remove("ATHENA_CONTEXT_TOKENS");
+    for name in GOOGLE_HEALTH_VARS {
+        cmd.env_remove(name);
+    }
     if let Some(db) = db {
         cmd.env("ATHENA_DB", db.path());
     }
     cmd.envs(vars.iter().copied());
     cmd.output().unwrap()
+}
+
+#[test]
+fn a_partly_set_google_health_stops_startup_naming_only_what_is_missing() {
+    // Each case sets some of the three required variables and no others:
+    // the variables set, and the ones that must be named as missing.
+    type Case<'a> = (&'a [(&'a str, &'a str)], &'a [&'a str]);
+    let cases: [Case; 2] = [
+        (
+            &[("GOOGLE_HEALTH_CLIENT_ID", "cid-VALUE-41")],
+            &[
+                "GOOGLE_HEALTH_CLIENT_SECRET",
+                "GOOGLE_HEALTH_TOKEN_ENCRYPTION_KEY",
+            ],
+        ),
+        (
+            &[
+                ("GOOGLE_HEALTH_CLIENT_ID", "cid-VALUE-41"),
+                ("GOOGLE_HEALTH_CLIENT_SECRET", "sec-VALUE-42"),
+            ],
+            &["GOOGLE_HEALTH_TOKEN_ENCRYPTION_KEY"],
+        ),
+    ];
+    for (set, missing) in cases {
+        let tmp = TempDb::new();
+        // `telegram` checks its Google Health settings before it opens the database.
+        let mut vars = vec![("TELEGRAM_BOT_TOKEN", "1:unused-by-this-test")];
+        vars.extend_from_slice(set);
+        let out = athena_with(&WorkDir::new(), Some(&tmp), &["telegram"], &vars);
+
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(!out.status.success(), "{stderr}");
+        for name in missing {
+            assert!(stderr.contains(name), "{name} not named: {stderr}");
+        }
+        // Only what is missing is named, and no value that was set is shown.
+        for (name, value) in set {
+            assert!(!stderr.contains(name), "{stderr}");
+            assert!(!stderr.contains(value), "{stderr}");
+        }
+        assert!(!std::path::Path::new(tmp.path()).exists());
+    }
 }
 
 /// `athena` pointed at a temp database, in an empty directory.

@@ -97,7 +97,7 @@ fn the_production_build_sends_the_environments_instructions_and_skills() {
         let said = warnings.lock().unwrap().clone();
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(said[0].contains("tool `add` skipped"), "{said:?}");
-        let agent = agent::build_with(&client, "m", service.memory(), None, None, &mcp);
+        let agent = agent::build_with(&client, "m", service.memory(), None, None, None, &mcp);
         service.send(&agent, &user, &s.id, "hi").await.unwrap();
         mcp.shutdown().await;
         seen
@@ -138,6 +138,9 @@ fn the_production_build_sends_the_environments_instructions_and_skills() {
             "calorie_update",
             "echo",
             "exercise_progress",
+            "health_status",
+            "health_summary",
+            "health_sync_now",
             "now",
             "read_skill",
             "reminder_cancel",

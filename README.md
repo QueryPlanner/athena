@@ -154,6 +154,8 @@ set it), else the crate version with `-dev`.
 | `ATHENA_INSTRUCTIONS` | all | unset | File of instructions added to the system prompt; see Instructions and skills |
 | `ATHENA_SKILLS_DIR` | all | unset | Directory of Agent Skills; see Instructions and skills |
 | `EXA_API_KEY` | all | unset: no `web_search` tool | Exa API key for the `web_search` tool; see Web search |
+| `GOOGLE_HEALTH_CLIENT_ID`, `GOOGLE_HEALTH_CLIENT_SECRET`, `GOOGLE_HEALTH_TOKEN_ENCRYPTION_KEY` | all | unset: Google Health off | Set all three or none (some is a startup error); see Google Health |
+| `GOOGLE_HEALTH_REDIRECT_URI` | all | `http://127.0.0.1:8080/integrations/google-health/callback` | The redirect URI registered with the Google OAuth client |
 | `TELEGRAM_BOT_TOKEN` | `telegram` | none, required | Bot token from @BotFather |
 | `TELEGRAM_API_URL` | `telegram` | `https://api.telegram.org` | Bot API server; the tests point it at a fake one |
 | `CLOUDFLARE_ACCOUNT_ID` | `telegram` | unset | With `CLOUDFLARE_API_TOKEN`, transcribe voice notes; see Telegram |
@@ -235,6 +237,8 @@ The pick is stored (the `selected_sessions` table), so it survives a restart.
 | `/switch NAME` | Switch to an existing session (`default` always exists). |
 | `/usage` | Turns, model calls and tokens per session. |
 | `/link API_USER_ID` | Bind a never-used API identity to your existing user and sessions. |
+| `/connect_health` | Connect Google Health (read-only): send the link it gives you, then paste back the address Google sends your browser to. See Google Health. |
+| `/disconnect_health` | Revoke Google Health access and delete the stored token; synced daily numbers stay. |
 | `/help`, `/start` | What the bot is, the current session, the commands. |
 
 The commands are registered with Telegram's command menu at startup. Any
@@ -392,6 +396,34 @@ kept from MCP tools.
 
 On the VM, a human adds `EXA_API_KEY=...` to `/etc/athena/<env>.env` with
 `sudoedit` and restarts the units.
+
+## Google Health
+
+With `GOOGLE_HEALTH_CLIENT_ID`, `GOOGLE_HEALTH_CLIENT_SECRET` and
+`GOOGLE_HEALTH_TOKEN_ENCRYPTION_KEY` set (the values Blacki uses), a Telegram
+user can connect their Google Health (the Fitbit successor) read-only, and the
+agent gets `health_status`, `health_summary(days)` and `health_sync_now`. It
+uses them for sleep, recovery and activity when you ask what to train.
+Without the three settings the tools say it is not set up, and setting only
+some stops startup, naming the missing ones.
+
+There is no web callback. Send `/connect_health` in the private chat, open the
+link and approve, then copy the address the browser ends up on (it may not
+load: that is fine) and paste it into the chat. The bot handles that message
+itself: it is never sent to the model, saved in the conversation or logged.
+You can delete it from the chat afterwards. The refresh token is stored
+encrypted; the access token is only ever in memory. `/disconnect_health`
+revokes it at Google and deletes it; the daily numbers already synced stay.
+
+`athena telegram` syncs the last 14 days once a day, after 05:30 your time
+(`timezone_set`), and `health_sync_now` allows one more an hour. If Google
+stops accepting the connection the bot tells you once to send
+`/connect_health` again. Google keeps refresh tokens from an OAuth consent
+screen in "Testing" status for only 7 days (see Known limits).
+
+On the VM, a human adds the three variables to `/etc/athena/<env>.env` with
+`sudoedit`, restarts the units, and each user sends `/connect_health` once.
+The redirect URI must be the one registered with the OAuth client.
 
 ## Reminders
 
@@ -725,6 +757,9 @@ Caddy or Tailscale settings, and never overwrites a file holding secrets.
                        HTTP client, stream parser, quoting and the tools
     src/policy.rs      the tool-call argument-size hook
     src/search.rs      web_search: Exa's search API, when EXA_API_KEY is set
+    src/health.rs      Google Health: settings, token encryption, the pasted
+                       callback; health/ has the Google client, the daily
+                       aggregation, the sync and the three tools
     src/custom.rs      the owner's instructions file and skills; custom/ has
                        the front matter parser and the skills and read_skill
     src/user_skills.rs each user's own skills and their tools; user_skills/

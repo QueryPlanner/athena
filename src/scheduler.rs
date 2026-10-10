@@ -57,6 +57,16 @@ impl Clock for SystemClock {
 /// Runs one claimed job and records its outcome.
 pub trait Execute: Send + Sync + 'static {
     fn execute(&self, job: Due, now: Timestamp) -> impl Future<Output = ()> + Send;
+
+    /// System work, run on every tick beside the users' jobs and not one of
+    /// them: no row, no lease and none of the reminder limits. It decides for
+    /// itself whether anything is due (the Google Health sync claims its own
+    /// attempts in the database), so a tick that finds nothing costs a read.
+    /// A slow run does not hold up the next tick, which may start another:
+    /// it must be safe to overlap. By default there is none.
+    fn system(&self, _now: Timestamp) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 pub struct Scheduler<E> {
@@ -96,6 +106,8 @@ impl<E: Execute> Scheduler<E> {
         let now = self.clock.now();
         let due = self.store.call(move |s| s.claim_jobs(now, BATCH)).await?;
         let started = due.len();
+        let executor = self.executor.clone();
+        running.spawn(async move { executor.system(now).await });
         for job in due {
             let executor = self.executor.clone();
             running.spawn(async move { executor.execute(job, now).await });
@@ -250,5 +262,41 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap().0, slow);
         seen.extend(std::iter::from_fn(|| logged.try_recv().ok()));
         assert!(seen.iter().any(|m| m.contains("task failed")), "{seen:?}");
+    }
+
+    /// Reports the time of each job it runs and of each system run.
+    struct Systemic(mpsc::UnboundedSender<(&'static str, Timestamp)>);
+
+    impl Execute for Systemic {
+        async fn execute(&self, _: Due, now: Timestamp) {
+            self.0.send(("job", now)).unwrap();
+        }
+
+        async fn system(&self, now: Timestamp) {
+            self.0.send(("system", now)).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn every_tick_runs_the_system_work_with_the_ticks_time_jobs_or_not() {
+        let (store, owner, _, log) = setup();
+        insert(&store, owner, "a", "2026-10-10T09:00:00Z");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let now = at("2026-10-10T09:30:00Z");
+        let scheduler = Scheduler::new(store, Systemic(tx), log).clock(Arc::new(Fixed(now)));
+        let mut running = JoinSet::new();
+        // One job is due: it runs, and so does the system work.
+        assert_eq!(scheduler.tick(&mut running).await.unwrap(), 1);
+        // Nothing is due: the system work runs all the same.
+        assert_eq!(scheduler.tick(&mut running).await.unwrap(), 0);
+        while running.join_next().await.is_some() {}
+        let mut seen = vec![
+            rx.recv().await.unwrap(),
+            rx.recv().await.unwrap(),
+            rx.recv().await.unwrap(),
+        ];
+        seen.sort();
+        assert_eq!(seen, [("job", now), ("system", now), ("system", now)]);
+        assert!(rx.try_recv().is_err());
     }
 }

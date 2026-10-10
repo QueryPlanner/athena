@@ -253,6 +253,7 @@ async fn setup_with(script: Vec<Reply>, window: u64, mcp: &Mcp) -> Setup {
         service.memory(),
         None,
         None,
+        None,
         mcp,
     ));
     Setup {

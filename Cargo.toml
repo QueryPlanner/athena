@@ -15,7 +15,12 @@ doc = false
 
 [dependencies]
 anyhow = "1.0.104"
+# URL-safe base64, to decode GOOGLE_HEALTH_TOKEN_ENCRYPTION_KEY (a Fernet key)
+# and to encode the PKCE challenge. The version Cargo.lock already holds.
+base64 = { version = "0.22.1", default-features = false, features = ["std"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "matched-path", "tokio"] }
+# Encrypts the stored Google Health refresh token (src/health.rs).
+chacha20poly1305 = "0.10.1"
 dotenvy = "0.15.7"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 # Time zones and DST for each user's local time (src/timezone.rs). Default

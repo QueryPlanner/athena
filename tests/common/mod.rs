@@ -58,6 +58,15 @@ impl Drop for TempDb {
 
 /// An empty directory to run the binary in, removed on drop.
 ///
+/// The variables that turn Google Health on. A test that runs the binary
+/// removes them, so a developer's shell never switches it on.
+pub const GOOGLE_HEALTH_VARS: [&str; 4] = [
+    "GOOGLE_HEALTH_CLIENT_ID",
+    "GOOGLE_HEALTH_CLIENT_SECRET",
+    "GOOGLE_HEALTH_TOKEN_ENCRYPTION_KEY",
+    "GOOGLE_HEALTH_REDIRECT_URI",
+];
+
 /// The binary loads `.env` from its working directory, so it must never run
 /// in the repository, where a developer's real `.env` holds real keys.
 pub struct WorkDir(PathBuf);

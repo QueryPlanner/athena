@@ -363,6 +363,17 @@ throwaway database.
    that time a fun fact arrives, and `/sessions` counts two more messages in
    the current session. Ask `What reminders do I have?`, then cancel the
    daily one.
+   8d. With `GOOGLE_HEALTH_CLIENT_ID`, `GOOGLE_HEALTH_CLIENT_SECRET` and
+   `GOOGLE_HEALTH_TOKEN_ENCRYPTION_KEY` set (a Fernet key works) and the
+   redirect URI registered with the OAuth client, send `/connect_health`.
+   Open the link, approve, copy the address the browser lands on (it may
+   fail to load) and paste it into the chat: the reply is "Connected" and
+   then "Synced N days". `sqlite3 /tmp/tg.db "SELECT status, last_synced_at
+   FROM health_connections"` shows `connected`, and `SELECT COUNT(*) FROM
+   messages` did not grow for that message. Ask `How did I sleep this
+   week?`: the model calls `health_summary`. `/disconnect_health` says Google
+   confirmed, and the row is gone. This is the one check that real Google
+   accepts the filters, page size, scopes and PKCE; the tests use a fake.
 9. Press Ctrl-C, start the bot again, send `/sessions`: `default` is still
    marked. `/usage` lists both sessions.
 10. Add the bot to a group and send a message there: the bot says nothing,

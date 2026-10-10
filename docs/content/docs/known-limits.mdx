@@ -30,6 +30,15 @@ description: What athena does not do yet. Read this before exposing it.
   Whoever can write that file, or the environment it reads, chooses what
   runs. See [MCP servers](/docs/mcp).
 
+- Google Health: if the Google OAuth consent screen is in "Testing"
+  status, Google expires refresh tokens after 7 days, and each user has to
+  `/connect_health` again every week. Publish the consent screen to avoid it.
+  The URL a user pastes to connect holds a one-time code and stays in their
+  Telegram chat history until they delete it; the bot never passes it to the
+  model or saves it, and the code is useless without the client secret. What
+  `health_summary` returns is sent to the model provider and saved in the
+  session. A bare code pasted without its URL is not recognised.
+
 ## Durability
 
 - A crash mid-turn loses that turn, and so does a second Ctrl-C while

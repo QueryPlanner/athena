@@ -1,4 +1,4 @@
-user_version 13
+user_version 14
 
 table browser_links
   token TEXT NOT NULL PK1
@@ -45,6 +45,35 @@ table compactions
   created_at INTEGER NOT NULL
   foreign key session_id REFERENCES sessions (id)
   unique index (session_id, through_seq) from pk
+
+table health_connections
+  user_id INTEGER NOT NULL PK1
+  encrypted_refresh_token BLOB NOT NULL
+  scopes TEXT NOT NULL
+  status TEXT NOT NULL
+  connected_at INTEGER NOT NULL
+  last_synced_at INTEGER
+  last_attempt_at INTEGER
+  last_sync_error TEXT
+  updated_at INTEGER NOT NULL
+  foreign key user_id REFERENCES users (id)
+
+table health_daily
+  user_id INTEGER NOT NULL PK1
+  date TEXT NOT NULL PK2
+  metrics TEXT NOT NULL
+  updated_at INTEGER NOT NULL
+  foreign key user_id REFERENCES users (id)
+  unique index (user_id, date) from pk
+
+table health_oauth_states
+  state_hash TEXT NOT NULL PK1
+  user_id INTEGER NOT NULL
+  expires_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL
+  foreign key user_id REFERENCES users (id)
+  index health_states_by_user (user_id) from c
+  unique index (state_hash) from pk
 
 table jobs
   id INTEGER PK1

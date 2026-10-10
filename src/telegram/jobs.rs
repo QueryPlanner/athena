@@ -94,6 +94,10 @@ impl<R: Run + 'static, C: Chat> Execute for Jobs<R, C> {
             (self.app.log)(&format!("scheduled job {id}: {e:#}"));
         }
     }
+
+    async fn system(&self, _now: Timestamp) {
+        self.app.daily_health(&*self.chat).await;
+    }
 }
 
 /// The scheduler for `app`'s jobs, delivering through `bot`. `store` is
