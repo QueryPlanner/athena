@@ -1,11 +1,15 @@
 //! The Google Health tools: `health_status`, `health_summary` and
-//! `health_sync_now`. They act for the owner of the host's session, and are
-//! registered whether or not Google Health is configured: without it they
-//! say so.
+//! `health_sync_now`, and the three that reach the raw points
+//! (`health_data_size`, `health_points`, `health_export`: see [`super::data`]).
+//! They act for the owner of the host's session, and are registered whether
+//! or not Google Health is configured: without it they say so (the point
+//! tools simply find no points).
 //!
 //! What `health_summary` returns is the user's personal health data. It goes
 //! to the model and is stored in the conversation like any tool result.
+use super::data;
 use super::sync::{Health, Outcome};
+use crate::sandbox::Sandboxes;
 use crate::scheduler::{Clock, SystemClock};
 use crate::store::Store;
 use crate::timezone::{NoArgs, for_owner};
@@ -34,18 +38,20 @@ struct Ctx {
     clock: Arc<dyn Clock>,
 }
 
-/// Add the three tools. `health` is `None` when Google Health is not
-/// configured.
+/// Add the six tools. `health` is `None` when Google Health is not
+/// configured, and `sandboxes` when there is no sandbox (`health_export`
+/// then says so).
 pub fn register(
     builder: AgentBuilder<WithBuilderTools>,
     store: Store,
     health: Option<Arc<Health>>,
+    sandboxes: Option<Arc<Sandboxes>>,
 ) -> AgentBuilder<WithBuilderTools> {
     let clock = health.as_ref().map_or_else(
         || Arc::new(SystemClock) as Arc<dyn Clock>,
         |h| h.shared_clock(),
     );
-    register_with_clock(builder, store, health, clock)
+    register_with_clock(builder, store, health, sandboxes, clock)
 }
 
 /// [`register`], reading today's date from `clock`: tests set it.
@@ -53,8 +59,14 @@ pub fn register_with_clock(
     builder: AgentBuilder<WithBuilderTools>,
     store: Store,
     health: Option<Arc<Health>>,
+    sandboxes: Option<Arc<Sandboxes>>,
     clock: Arc<dyn Clock>,
 ) -> AgentBuilder<WithBuilderTools> {
+    let points = Arc::new(data::Ctx {
+        store: store.clone(),
+        clock: clock.clone(),
+        sandboxes,
+    });
     let ctx = Ctx {
         store,
         health,
@@ -64,9 +76,12 @@ pub fn register_with_clock(
         .tool(Status(ctx.clone()))
         .tool(Summary(ctx.clone()))
         .tool(SyncNow(ctx))
+        .tool(data::DataSize(points.clone()))
+        .tool(data::Points(points.clone()))
+        .tool(data::Export(points))
 }
 
-fn when(at: jiff::Timestamp, zone: &TimeZone) -> String {
+pub(super) fn when(at: jiff::Timestamp, zone: &TimeZone) -> String {
     at.to_zoned(zone.clone())
         .strftime("%Y-%m-%dT%H:%M%:z")
         .to_string()

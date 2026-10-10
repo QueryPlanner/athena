@@ -36,8 +36,19 @@ description: What athena does not do yet. Read this before exposing it.
   The URL a user pastes to connect holds a one-time code and stays in their
   Telegram chat history until they delete it; the bot never passes it to the
   model or saves it, and the code is useless without the client secret. What
-  `health_summary` returns is sent to the model provider and saved in the
-  session. A bare code pasted without its URL is not recognised.
+  `health_summary` and `health_points` return is sent to the model provider
+  and saved in the session. A bare code pasted without its URL is not
+  recognised.
+  `health_export` copies the points you ask for (at most 128 MiB, so a full
+  history of minute-level heart rate may not fit) into a SQLite file in your
+  conversation's sandbox, so the model can analyse them with code without
+  reading them. That sandbox runs as root with internet access and is
+  reachable by any tailnet device that can reach OpenSandbox, so your health
+  history is exposed as far as the sandbox is until it expires (30 idle
+  minutes, then the file is gone). The tool needs a message you typed: it is
+  refused in the daily brief and in reminder tasks. Page content or files the
+  model reads in the same conversation are untrusted, and could try to make it
+  send that file somewhere.
   Athena asks for every read-only Google Health scope, including sensitive
   ones (location, reproductive health, logged symptoms, mood, ECG, irregular
   rhythm). Users can untick any on Google's consent screen, and that data is
