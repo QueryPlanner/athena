@@ -83,7 +83,7 @@ Claude Code and Claude Desktop use (`src/mcp.rs`).
   A server that fails is a warning; its tools are missing.
 - One connection per server serves every user and session of the process.
 - A tool keeps its server's name. A name that a built-in tool
-  (`agent::reserved_tool_names`: `add`, `read_skill`, the calorie tools, `now`, `timezone_set`, the sandbox tools) or an earlier server (name order) has, that
+  (`agent::reserved_tool_names`: `add`, `read_skill`, `web_search`, the calorie tools, the workout tools, `now`, `timezone_set`, the sandbox tools) or an earlier server (name order) has, that
   is not 1 to 64 of `[A-Za-z0-9_-]`, or an input schema that is not of type
   object, is skipped with a warning, as are a server's tools past the first
   `MAX_TOOLS_PER_SERVER`. Descriptions are cut to `MAX_DESCRIPTION_BYTES`.
@@ -214,6 +214,84 @@ Rust API for later features (workouts, reminders): `Store::timezone(owner)`,
 `at = jiff::Timestamp::now()` in production. "Today" is computed there, never
 supplied by the model. Calorie dates stay model-supplied (`consumed_date`); the
 preamble tells the agent to call `now` before reasoning about dates. No env var.
+
+## Workout persistence
+
+Schema migration 11 adds three tables in `ATHENA_DB`:
+
+- `workout_sessions`: `id` (monotonic AUTOINCREMENT), `user_id` (foreign key
+  to `users.id`), `request_key`, immutable `request_hash`, `session_date`
+  (supplied local `YYYY-MM-DD`), `day_type`, nullable `notes`, `version`,
+  `created_at`, `updated_at`, nullable `deleted_at`. `(user_id, request_key)`
+  is unique; `workouts_by_owner_type_date` covers
+  `(user_id, day_type, session_date, id)`. `day_type` has no SQL CHECK: Rust
+  accepts `push`, `pull`, `legs`, `vo2` and `other`, so a new type needs no
+  table rebuild.
+- `workout_sets`: primary key `(session_id, exercise_index, set_index)`, both
+  1-based; `exercise` as typed, `exercise_key` (lowercased, whitespace
+  collapsed: how lifts match across sessions), `reps` `0..=1000`, `weight_kg`
+  REAL `0..=1000` (kilograms only; 0 is bodyweight or no added load),
+  nullable `target_reps` `1..=1000`, `is_warmup` 0 or 1, nullable `notes`.
+  `workout_sets_by_exercise` covers `(exercise_key, session_id)`.
+- `rowing_results`: `session_id` primary key (one piece per session),
+  `distance_m` `100..=100000` (default 2000), `time_ms`. The 500 m split is
+  derived (`round(time_ms * 500 / distance_m)`), never stored.
+
+Sets and rowing pieces carry no `user_id`. Every read joins an active
+`workout_sessions` row of the owner, and every write to them happens in the
+IMMEDIATE transaction that first inserted or version-checked an owned
+session, so a guessed id never reaches another user's sets. The migration's
+foreign-key check cannot detect a set under the wrong user's session; this
+access rule is what prevents one. No cascade: sessions are only soft-deleted,
+and an update replaces its children explicitly.
+
+Native tools, registered with the calorie tools and reserved the same way:
+`workout_log(request_key, workout)`, `workout_last(day_type, before_date?)`,
+`workout_next()`, `exercise_progress(kind?, exercise?, distance_m?, limit?)`,
+`workout_history(start_date, end_date, limit?, before_id?)`,
+`workout_update(id, expected_version, workout)` and
+`workout_remove(id, expected_version)`. The owner comes from the host's
+`runner::Conversation`, never from arguments.
+
+A workout is `session_date`, `day_type`, optional `notes` (at most 512 bytes),
+`exercises` (0 to 30 blocks of `name`, at most 64 bytes, and 1 to 20 sets of
+`reps`, `weight_kg`, optional `target_reps`, `is_warmup` default false,
+optional `notes` at most 256 bytes) and optional `rowing` (`distance_m`
+default 2000, `time` as `M:SS`, `H:MM:SS`, either with up to 3 decimals). It
+needs an exercise or a rowing piece; a lift may repeat in several blocks. A
+piece whose split is outside 1:00 to 10:00 per 500 m is refused, which
+catches a split entered as the total or minutes entered as hours. Weights are
+rounded to 0.01 kg. Retry keys work as for meals; the hash is of the
+normalized workout (rounded weights, `time_ms`, the default distance filled),
+so `7:05` and `7:05.0` are one original.
+
+"Today" is `Store::today(owner, jiff::Timestamp::now())`, never the model's.
+`workout_last` returns `{"before_date", "session"}`: the newest active
+session of that type dated before `before_date` (exclusive; default today),
+or null. Each of its exercise blocks has `progression`: the top working set
+(warm-ups and zero-rep sets excluded; ranked by Epley estimated 1RM, then
+weight, then reps), `hit_target` (null without a target) and `suggested`:
+2.5 kg more at the target reps when the top set reached its target and
+weighed more than 0, otherwise one more rep at the same weight.
+`workout_next` returns `today`, `next_day_type` (after the newest push, pull
+or legs session dated before today: push → pull → legs → push; push if
+none), `last_lifting`, `vo2` (`due` when no `vo2` session is dated in the
+7 days ending today, `last_date`), `logged_today` (id, type, version of
+today's sessions) and `previous` (as `workout_last` for the type due).
+Sessions dated after today are ignored by both.
+
+`exercise_progress` with `kind` `lift` (default) needs `exercise` and returns
+the newest sessions with that lift (`limit` default 10, at most 50), each
+with its top set and estimated 1RM (`w × (1 + reps/30)`, the weight itself
+for one rep, to 0.1 kg), the all-time `best`, and
+`estimated_1rm_change_kg` from the oldest to the newest in the window. No
+match returns `known_exercises`. `kind` `rowing` takes `distance_m`
+(default 2000) and returns `time`, `split_500m` (to the tenth) and
+`time_change_s` the same way. History is as for meals but returns whole
+sessions, limit 10 by default and at most 20. Corrections replace a session's
+sets and piece; missing, deleted and stale sessions share one conflict
+message; removal keeps the key and does not resurrect on retry. No env var,
+route or authentication change.
 
 ## Compaction
 

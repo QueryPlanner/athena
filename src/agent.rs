@@ -39,6 +39,12 @@ have sandbox tools, use them.
 - You have no clock: call now before reasoning about dates or times (today, yesterday, \
 a weekday, a deadline). When the user says where they are or which time they keep, call \
 timezone_set.
+- Training (Push, Pull, Legs, and a weekly VO2 row): when the user starts a workout or \
+asks what to train, call workout_next. Show the previous session it returns (exercises, \
+sets, weights) and each exercise's suggested progression: 2.5 kg more when the top set \
+hit its target reps, otherwise one more rep. If today is already logged, add to it with \
+workout_update. Log what they did with workout_log: weights in kg (convert pounds), the \
+exercise names used before, and rowing as distance and time only.
 - The sandbox is this conversation's own Linux machine, with a browser. Files the user \
 sends are saved there, and their message says where.
 - To use a website: agent_browser, the agent-browser CLI. Read its guide first, as its \
@@ -150,6 +156,7 @@ pub fn reserved_tool_names() -> Vec<&'static str> {
         .chain(sandbox::tools::NAMES)
         .chain(crate::calories::NAMES)
         .chain(crate::timezone::NAMES)
+        .chain(crate::workouts::NAMES)
         .collect()
 }
 
@@ -252,8 +259,8 @@ pub fn configure_all(
     configure_stored(builder, sandboxes, custom, mcp, None, None)
 }
 
-/// Configure a persistent agent with native calorie and time tools, and
-/// `web_search` when `search` is given: what [`build_with`] builds.
+/// Configure a persistent agent with native calorie, workout and time tools,
+/// and `web_search` when `search` is given: what [`build_with`] builds.
 /// Use the same store for the builder's memory and the tools.
 pub fn configure_persistent(
     builder: rig::agent::AgentBuilder,
@@ -288,7 +295,9 @@ fn configure_stored(
     let builder = custom.register(builder);
     let builder = match store {
         Some(store) => {
-            crate::timezone::register(crate::calories::register(builder, store.clone()), store)
+            let builder = crate::calories::register(builder, store.clone());
+            let builder = crate::workouts::register(builder, store.clone());
+            crate::timezone::register(builder, store)
         }
         None => builder,
     };

@@ -734,3 +734,79 @@ async fn schema_9_gains_user_settings_without_changing_a_row() {
         0
     );
 }
+
+/// Migration 11 only adds the workout tables. Every row of every earlier
+/// table survives, the stored time zone still decides "today", and a turn
+/// and a logged workout append without rewriting anything.
+#[tokio::test]
+async fn schema_10_gains_workouts_without_changing_a_row() {
+    const TABLES: [&str; 12] = [
+        "users",
+        "user_identities",
+        "sessions",
+        "messages",
+        "runs",
+        "selected_sessions",
+        "sandboxes",
+        "browser_links",
+        "browser_states",
+        "compactions",
+        "calorie_logs",
+        "user_settings",
+    ];
+    let tmp = from_fixture(include_str!("fixtures/v10_user_settings.sql"));
+    let before: Vec<_> = TABLES.iter().map(|t| dump(&tmp.raw(), t)).collect();
+    assert_eq!(user_version(&tmp.raw()), 10);
+    let sizes: Vec<usize> = before.iter().map(Vec::len).collect();
+    assert_eq!(sizes, [3, 4, 6, 14, 3, 1, 1, 1, 1, 1, 3, 1]);
+
+    let (service, _) = tmp.service();
+    let db = tmp.raw();
+    assert_eq!(user_version(&db), store::SCHEMA_VERSION as i64);
+    let after: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
+    assert_eq!(after, before);
+    for table in ["workout_sessions", "workout_sets", "rowing_results"] {
+        assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {table}")), 0);
+    }
+
+    // The migrated zone still decides the user's today: 22:30 UTC is
+    // already tomorrow in Kolkata but not in London.
+    let store = tmp.open();
+    let owner = store.user("telegram", "111111").unwrap().id();
+    let at: jiff::Timestamp = "2026-10-09T22:30:00Z".parse().unwrap();
+    let next = store.workout_next(owner, at).unwrap();
+    assert_eq!(next["today"], "2026-10-09");
+    assert_eq!(next["next_day_type"], "push");
+    assert_eq!(next["vo2"]["due"], true);
+    let cli = store.user("cli", "local").unwrap().id();
+    assert_eq!(store.workout_next(cli, at).unwrap()["today"], "2026-10-10");
+
+    // A turn in a migrated session and a logged workout only append.
+    let user = service.user("telegram", "111111").await.unwrap();
+    let notes = store.selected_session(&user).unwrap().unwrap();
+    let (agent, _) = mock_agent(&service, [MockTurn::text("noted")]);
+    service
+        .send(&agent, &user, &notes.id, "hello")
+        .await
+        .unwrap();
+    let workout: athena::workouts::Workout = serde_json::from_value(serde_json::json!({
+        "session_date": "2026-10-09", "day_type": "push",
+        "exercises": [{"name": "Bench Press", "sets": [{"reps": 5, "weight_kg": 80}]}]
+    }))
+    .unwrap();
+    let log = athena::workouts::Log {
+        request_key: "upgrade-1".into(),
+        workout,
+    };
+    store.workout_log(owner, log).unwrap();
+    let now: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
+    for ((table, old), new) in TABLES.iter().zip(&before).zip(&now) {
+        assert_eq!(&new[..old.len()], &old[..], "{table}");
+    }
+    assert_eq!(runs(&db, &notes.id), [run_row(0, 1, 1, "ok")]);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM workout_sets"), 1);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check"),
+        0
+    );
+}

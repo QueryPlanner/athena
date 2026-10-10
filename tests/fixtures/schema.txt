@@ -1,4 +1,4 @@
-user_version 10
+user_version 11
 
 table browser_links
   token TEXT NOT NULL PK1
@@ -51,6 +51,12 @@ table messages
   seq INTEGER NOT NULL PK2
   json TEXT NOT NULL
   unique index (session_id, seq) from pk
+
+table rowing_results
+  session_id INTEGER NOT NULL PK1
+  distance_m INTEGER NOT NULL DEFAULT 2000
+  time_ms INTEGER NOT NULL
+  foreign key session_id REFERENCES workout_sessions (id)
 
 table runs
   run_id TEXT NOT NULL PK1
@@ -122,6 +128,37 @@ table users
   external_id TEXT NOT NULL
   created_at INTEGER NOT NULL
   unique index (transport, external_id) from u
+
+table workout_sessions
+  id INTEGER PK1
+  user_id INTEGER NOT NULL
+  request_key TEXT NOT NULL
+  request_hash TEXT NOT NULL
+  session_date TEXT NOT NULL
+  day_type TEXT NOT NULL
+  notes TEXT
+  version INTEGER NOT NULL DEFAULT 1
+  created_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL
+  deleted_at INTEGER
+  foreign key user_id REFERENCES users (id)
+  index workouts_by_owner_type_date (user_id, day_type, session_date, id) from c
+  unique index (user_id, request_key) from u
+
+table workout_sets
+  session_id INTEGER NOT NULL PK1
+  exercise_index INTEGER NOT NULL PK2
+  set_index INTEGER NOT NULL PK3
+  exercise TEXT NOT NULL
+  exercise_key TEXT NOT NULL
+  reps INTEGER NOT NULL
+  weight_kg REAL NOT NULL
+  target_reps INTEGER
+  is_warmup INTEGER NOT NULL
+  notes TEXT
+  foreign key session_id REFERENCES workout_sessions (id)
+  index workout_sets_by_exercise (exercise_key, session_id) from c
+  unique index (session_id, exercise_index, set_index) from pk
 
 trigger messages_keep_a_session ON messages
   CREATE TRIGGER messages_keep_a_session BEFORE UPDATE OF session_id ON messages WHEN NOT EXISTS (SELECT 1 FROM sessions WHERE id = NEW.session_id) BEGIN SELECT RAISE(ABORT, 'no such session'); END

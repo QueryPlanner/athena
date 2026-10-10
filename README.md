@@ -21,8 +21,8 @@ Edit `src/agent.rs`. That is the only file that changes.
     }
 
 `configure_with` defines the agent without persistent tools (`configure` also
-omits sandbox tools). `configure_persistent` adds native calorie and time tools
-(and `web_search` when given a `WebSearch`) using
+omits sandbox tools). `configure_persistent` adds native calorie, workout and
+time tools (and `web_search` when given a `WebSearch`) using
 the supplied `Store`. Production wraps it around the OpenRouter client;
 tests can wrap it around Rig's mock model. Give the builder conversation
 memory first (`builder.memory(service.memory())`) and use the same store for
@@ -286,6 +286,32 @@ Schema migration 9 adds these records without importing the legacy `tools.db`.
 Library callers can use `agent::configure_persistent` with the same `Store` as
 the builder's memory to expose these tools.
 
+## Workout tools
+
+Persistent agents track a Push / Pull / Legs split and a weekly VO2 session
+(a rowing piece) for the user behind the current session:
+
+| Tool | What it does |
+|---|---|
+| `workout_log(request_key, workout)` | logs a session: its exercises with every set (reps, `weight_kg`, optional `target_reps`, `is_warmup`), or a rowing piece |
+| `workout_last(day_type, before_date?)` | the previous session of that type, before today by default, with every set and a suggestion per exercise |
+| `workout_next()` | today's day in the rotation, whether VO2 is due, what is already logged today, and the previous session of that type |
+| `exercise_progress(kind?, exercise?, distance_m?, limit?)` | a lift's top set and estimated 1RM per session, or rowing times and 500 m splits |
+| `workout_history(start_date, end_date, limit?, before_id?)` | sessions in a date range, paginated like `calorie_history` |
+| `workout_update(id, expected_version, workout)` / `workout_remove(id, expected_version)` | correct or soft-delete a session |
+
+Weights are kilograms only; the agent converts pounds. A rowing piece is its
+distance (default 2000 m) and time (`7:05.3`); the split is derived. When the
+user starts a training day the preamble has the agent call `workout_next`,
+show the previous session of that type, and offer the suggestion it carries:
+2.5 kg more when the top set reached its target reps, otherwise one more rep.
+"Last time" never means today's own session, and "today" is the user's own
+date in their time zone, computed on the server. Exercises match across
+sessions ignoring case and spacing, so the agent reuses earlier names.
+Retries, versions and soft deletion work as for the calorie tools. Schema
+migration 11 adds the `workout_sessions`, `workout_sets` and
+`rowing_results` tables.
+
 ## Time and time zone tools
 
 The model has no clock. Persistent agents expose two tools, registered with the
@@ -334,9 +360,9 @@ On the VM, a human adds `EXA_API_KEY=...` to `/etc/athena/<env>.env` with
 
 Tools that touch a computer run in a sandbox on an
 [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) server, never
-on the machine running athena. Native calorie and time tools access only Athena’s
-SQLite store. Other host tools are `add`, `web_search` (see "Web search") and
-the tools of the MCP servers you list (see "Tools from MCP servers").
+on the machine running athena. Native calorie, workout and time tools access only
+Athena’s SQLite store. Other host tools are `add`, `web_search` (see "Web
+search") and the tools of the MCP servers you list (see "Tools from MCP servers").
 
 | Tool | What it does |
 |---|---|
