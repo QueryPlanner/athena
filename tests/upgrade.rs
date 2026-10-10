@@ -1005,7 +1005,7 @@ async fn schema_13_gains_google_health_without_changing_a_row() {
     let (service, _) = tmp.service();
     let db = tmp.raw();
     assert_eq!(user_version(&db), store::SCHEMA_VERSION as i64);
-    assert_eq!(store::SCHEMA_VERSION, 15);
+    assert_eq!(store::SCHEMA_VERSION, 16);
     let after: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
     assert_eq!(after, before);
     for table in NEW {
@@ -1165,6 +1165,127 @@ async fn schema_14_gains_daily_briefs_without_changing_a_row() {
     let all_runs = runs(&db, &session.id);
     assert_eq!(all_runs.len(), runs_before + 1);
     assert_eq!(all_runs.last(), Some(&run_row(4, 7, 2, "ok")));
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check"),
+        0
+    );
+}
+
+/// Migration 16 only adds the Google Health point and history tables. Every
+/// row of every earlier table, the Google Health connection, its day and the
+/// daily brief of the schema 15 fixture included, survives; a migrated user
+/// stores points and a history cursor and reads them back; a turn still
+/// appends.
+#[tokio::test]
+async fn schema_15_gains_health_points_without_changing_a_row() {
+    const TABLES: [&str; 22] = [
+        "users",
+        "user_identities",
+        "sessions",
+        "messages",
+        "runs",
+        "selected_sessions",
+        "sandboxes",
+        "browser_links",
+        "browser_states",
+        "compactions",
+        "calorie_logs",
+        "user_settings",
+        "workout_sessions",
+        "workout_sets",
+        "rowing_results",
+        "jobs",
+        "user_skills",
+        "user_skill_files",
+        "skill_previews",
+        "health_connections",
+        "health_daily",
+        "daily_briefs",
+    ];
+    const NEW: [&str; 2] = ["health_points", "health_backfill"];
+    let tmp = from_fixture(include_str!("fixtures/v15_daily_brief.sql"));
+    let before: Vec<_> = TABLES.iter().map(|t| dump(&tmp.raw(), t)).collect();
+    assert_eq!(user_version(&tmp.raw()), 15);
+    let sizes: Vec<usize> = before.iter().map(Vec::len).collect();
+    assert_eq!(
+        sizes,
+        [
+            3, 4, 6, 14, 3, 1, 1, 1, 1, 1, 3, 1, 2, 4, 1, 4, 2, 1, 0, 1, 1, 1
+        ]
+    );
+
+    let (service, _) = tmp.service();
+    let db = tmp.raw();
+    assert_eq!(user_version(&db), store::SCHEMA_VERSION as i64);
+    assert_eq!(store::SCHEMA_VERSION, 16);
+    let after: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
+    assert_eq!(after, before);
+    for table in NEW {
+        assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {table}")), 0);
+    }
+
+    // The user who was connected before the upgrade keeps the connection and
+    // the day it synced, and the brief that was set.
+    let store = tmp.open();
+    let user = service.user("telegram", "111111").await.unwrap();
+    let connection = store.health_connection(user.id()).unwrap().unwrap();
+    assert_eq!(connection.status, "connected");
+    assert_eq!(
+        store
+            .health_days(user.id(), "2026-10-01", "2026-10-31")
+            .unwrap(),
+        [(
+            "2026-10-09".to_string(),
+            r#"{"steps":5412,"sleep_min":452,"resting_hr":52}"#.to_string()
+        )]
+    );
+
+    // A migrated user stores a point, stores it again without a change, and
+    // keeps a history cursor.
+    let now: jiff::Timestamp = "2026-10-10T10:00:00Z".parse().unwrap();
+    let rows = [store::PointRow {
+        key: "users/me/dataTypes/steps/dataPoints/1".into(),
+        start_ms: Some(1),
+        end_ms: Some(2),
+        civil_date: Some("2026-10-09".into()),
+        value: "{}".into(),
+        source: None,
+    }];
+    assert_eq!(
+        store
+            .health_points_put(user.id(), "steps", &rows, now)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .health_points_put(user.id(), "steps", &rows, now)
+            .unwrap(),
+        0
+    );
+    let cursor = store::Backfill {
+        data_type: "steps".into(),
+        oldest: "2026-09-20".into(),
+        done: false,
+        empty_run: 0,
+    };
+    store
+        .health_backfill_save(user.id(), &cursor, None, now)
+        .unwrap();
+    assert_eq!(store.health_backfill(user.id()).unwrap(), [cursor]);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM health_points"), 1);
+
+    let notes = store.selected_session(&user).unwrap().unwrap();
+    let (agent, _) = mock_agent(&service, [MockTurn::text("noted")]);
+    service
+        .send(&agent, &user, &notes.id, "hello")
+        .await
+        .unwrap();
+    let now: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
+    for ((table, old), new) in TABLES.iter().zip(&before).zip(&now) {
+        assert_eq!(&new[..old.len()], &old[..], "{table}");
+    }
+    assert_eq!(runs(&db, &notes.id), [run_row(0, 1, 1, "ok")]);
     assert_eq!(
         count(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check"),
         0

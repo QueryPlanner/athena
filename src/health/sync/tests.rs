@@ -967,3 +967,366 @@ async fn the_service_is_built_from_the_environment_or_a_config() {
     assert!(before <= now && now <= Timestamp::now());
     assert!(production.shared_clock().now() >= before);
 }
+
+// ---- the rest of a sync: refusals, storage, page caps ----
+
+fn stored_points(w: &World, data_type: &str) -> i64 {
+    w.store
+        .db_for_tests()
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM health_points WHERE user_id = {} AND data_type = '{data_type}'",
+                w.owner
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+fn backfill_of(w: &World, data_type: &str) -> Backfill {
+    w.store
+        .health_backfill(w.owner)
+        .unwrap()
+        .into_iter()
+        .find(|b| b.data_type == data_type)
+        .unwrap()
+}
+
+/// The requests for `data_type` that are not its window: the history chunks
+/// of a daily pass, whose filters end before the window starts.
+fn history_requests(w: &World, data_type: &str) -> Vec<String> {
+    w.data_requests()
+        .into_iter()
+        .filter(|s| s.path.contains(&format!("/{data_type}/")))
+        .map(|s| s.query["filter"].clone())
+        .skip(1)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_refused_optional_type_is_reported_with_its_status_and_the_sync_succeeds() {
+    let w = world().await;
+    w.connect(w.owner).await;
+    w.fake.answer(
+        "ovulation-test",
+        400,
+        r#"{"error":{"status":"INVALID_ARGUMENT"}}"#,
+    );
+    w.fake.answer("moods", 404, "{}");
+    let outcome = w.health.sync(w.owner).await;
+    assert_eq!(
+        outcome,
+        Outcome::Synced {
+            days: 0,
+            // In catalog order: ovulation-test is read before moods.
+            unavailable: vec![
+                "ovulation-test (HTTP 400)".into(),
+                "moods (HTTP 404)".into()
+            ]
+        }
+    );
+    assert_eq!(w.connection().error, None);
+}
+
+#[tokio::test]
+async fn a_refused_core_type_fails_the_sync_and_says_why() {
+    let w = world().await;
+    w.connect(w.owner).await;
+    w.fake
+        .answer("steps", 400, r#"{"error":{"status":"INVALID_ARGUMENT"}}"#);
+    let outcome = w.health.sync(w.owner).await;
+    let Outcome::Failed(why) = outcome else {
+        panic!("{outcome:?}")
+    };
+    assert_eq!(why, "Google answered HTTP 400 (INVALID_ARGUMENT)");
+    assert_eq!(w.connection().error.as_deref(), Some(why.as_str()));
+    assert_eq!(w.connection().status, "connected");
+}
+
+#[tokio::test]
+async fn each_page_is_stored_as_it_arrives() {
+    let w = world().await;
+    w.connect(w.owner).await;
+    w.fake.answer(
+        "steps",
+        200,
+        &page(&[steps("2026-10-08T08:00:00Z", 1)], Some("p2")),
+    );
+    w.fake.answer(
+        "steps",
+        200,
+        &page(&[steps("2026-10-08T09:00:00Z", 2)], None),
+    );
+    w.health.sync(w.owner).await;
+    // Two distinct points, one per page, each with its own key.
+    assert_eq!(stored_points(&w, "steps"), 2);
+    assert_eq!(w.days(), [("2026-10-08".into(), json!({"steps": 3}))]);
+}
+
+#[tokio::test]
+async fn a_page_cap_keeps_the_points_already_read() {
+    let w = world().await;
+    w.connect(w.owner).await;
+    for i in 0..MAX_PAGES {
+        w.fake.answer(
+            "steps",
+            200,
+            // A different count on each page, so each point is a new row.
+            &page(
+                &[steps("2026-10-08T08:00:00Z", i as i64 + 1)],
+                Some("again"),
+            ),
+        );
+    }
+    let outcome = w.health.sync(w.owner).await;
+    assert!(
+        matches!(outcome, Outcome::Failed(ref why) if why.contains("more pages")),
+        "{outcome:?}"
+    );
+    // Every page that was read is stored, though the sync did not finish.
+    assert_eq!(stored_points(&w, "steps"), MAX_PAGES as i64);
+    assert!(w.days().is_empty());
+}
+
+#[tokio::test]
+async fn a_failure_to_store_the_points_fails_the_sync_with_a_safe_message() {
+    let w = world().await;
+    w.connect(w.owner).await;
+    w.break_table("health_points");
+    let outcome = w.health.sync(w.owner).await;
+    assert_eq!(
+        outcome,
+        Outcome::Failed("the data points could not be saved".into())
+    );
+    assert_eq!(w.connection().status, "connected");
+}
+
+// ---- the history fetch, in the daily pass only ----
+
+#[tokio::test]
+async fn a_manual_sync_fetches_no_history() {
+    let w = world().await;
+    w.connect(w.owner).await;
+    w.health.sync(w.owner).await;
+    assert!(history_requests(&w, "steps").is_empty());
+    assert!(w.store.health_backfill(w.owner).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_daily_pass_fetches_three_seven_day_chunks_backwards_and_saves_the_cursor() {
+    let w = world().await;
+    w.connect(w.owner).await;
+    // The window ends 10 October (Kolkata); its history starts 27 September.
+    let ran = w.health.run_due().await.unwrap();
+    assert_eq!(ran.len(), 1);
+    // Each chunk ends where the previous began (local midnight, UTC+5:30).
+    assert_eq!(
+        history_requests(&w, "steps")
+            .iter()
+            .map(|f| f
+                .split("< \"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
+                .to_string())
+            .collect::<Vec<_>>(),
+        [
+            "2026-09-26T18:30:00Z",
+            "2026-09-19T18:30:00Z",
+            "2026-09-12T18:30:00Z"
+        ]
+    );
+    let steps = backfill_of(&w, "steps");
+    assert_eq!(
+        (steps.oldest.as_str(), steps.done, steps.empty_run),
+        ("2026-09-06", false, 3)
+    );
+}
+
+#[tokio::test]
+async fn history_stops_at_the_three_year_floor() {
+    let w = world().await;
+    w.connect(w.owner).await;
+    let today: Date = "2026-10-10".parse().unwrap();
+    let floor = today.saturating_sub(BACKFILL_FLOOR_DAYS.days());
+    // Three days above the floor: one chunk, clamped to the floor, finishes it.
+    let near = Backfill {
+        data_type: "steps".into(),
+        oldest: floor.saturating_add(3.days()).to_string(),
+        done: false,
+        empty_run: 0,
+    };
+    w.store
+        .health_backfill_save(w.owner, &near, None, T0.parse().unwrap())
+        .unwrap();
+    w.health.run_due().await.unwrap();
+    assert_eq!(history_requests(&w, "steps").len(), 1);
+    let steps = backfill_of(&w, "steps");
+    assert_eq!(
+        (steps.done, steps.oldest.as_str()),
+        (true, floor.to_string().as_str())
+    );
+}
+
+#[tokio::test]
+async fn history_stops_after_twelve_empty_chunks_in_a_row() {
+    let w = world().await;
+    w.connect(w.owner).await;
+    let eleven = Backfill {
+        data_type: "steps".into(),
+        oldest: "2026-09-27".into(),
+        done: false,
+        empty_run: 11,
+    };
+    w.store
+        .health_backfill_save(w.owner, &eleven, None, T0.parse().unwrap())
+        .unwrap();
+    w.health.run_due().await.unwrap();
+    // One empty chunk is the twelfth: nothing more is asked for.
+    assert_eq!(history_requests(&w, "steps").len(), 1);
+    let steps = backfill_of(&w, "steps");
+    assert_eq!((steps.done, steps.empty_run), (true, 12));
+}
+
+#[tokio::test]
+async fn a_refused_type_is_done_for_good_after_one_chunk() {
+    let w = world().await;
+    w.connect(w.owner).await;
+    // The window's answer is an empty page; the first history chunk is refused.
+    w.fake.answer("sleep", 200, "{}");
+    w.fake.answer("sleep", 403, "{}");
+    w.health.run_due().await.unwrap();
+    assert_eq!(history_requests(&w, "sleep").len(), 1);
+    let sleep = backfill_of(&w, "sleep");
+    assert!(sleep.done);
+}
+
+#[tokio::test]
+async fn ecg_history_is_fetched_in_one_go_back_to_the_floor() {
+    let w = world().await;
+    w.connect(w.owner).await;
+    w.health.run_due().await.unwrap();
+    let history = history_requests(&w, "electrocardiogram");
+    assert_eq!(history.len(), 1, "{history:?}");
+    assert!(history[0].starts_with("electrocardiogram.interval.start_time >= "));
+    // ECG has no upper bound to page through, so its one request is final.
+    let ecg = backfill_of(&w, "electrocardiogram");
+    assert!(ecg.done);
+}
+
+#[tokio::test]
+async fn a_chunk_that_hits_the_page_cap_is_kept_as_partial_and_the_cursor_moves_on() {
+    let w = world().await;
+    w.connect(w.owner).await;
+    // Window: one page. First two history chunks: empty. Third: endless.
+    w.fake.answer(
+        "steps",
+        200,
+        &page(&[steps("2026-10-09T08:00:00Z", 1)], None),
+    );
+    w.fake.answer("steps", 200, "{}");
+    w.fake.answer("steps", 200, "{}");
+    for _ in 0..MAX_PAGES {
+        w.fake.answer(
+            "steps",
+            200,
+            &page(&[steps("2026-09-15T08:00:00Z", 1)], Some("again")),
+        );
+    }
+    w.health.run_due().await.unwrap();
+    // Two empty chunks, then the third chunk's MAX_PAGES pages.
+    assert_eq!(history_requests(&w, "steps").len(), 2 + MAX_PAGES);
+    let steps = backfill_of(&w, "steps");
+    assert_eq!(
+        (steps.oldest.as_str(), steps.done, steps.empty_run),
+        ("2026-09-06", false, 0)
+    );
+    let note: Option<String> = w
+        .store
+        .db_for_tests()
+        .query_row(
+            &format!(
+                "SELECT last_error FROM health_backfill WHERE user_id = {} AND data_type = 'steps'",
+                w.owner
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(note.unwrap().starts_with("partial: "));
+}
+
+#[tokio::test]
+async fn a_transport_error_in_history_ends_the_pass_and_keeps_the_sync() {
+    let w = world().await;
+    w.connect(w.owner).await;
+    w.fake.answer(
+        "steps",
+        200,
+        &page(&[steps("2026-10-09T08:00:00Z", 1)], None),
+    );
+    w.fake.answer("steps", 500, "{}");
+    let ran = w.health.run_due().await.unwrap();
+    assert!(
+        matches!(ran[0].outcome, Outcome::Synced { .. }),
+        "{:?}",
+        ran[0].outcome
+    );
+    // The cursor stays where it was, the chunk's error is kept, and no other
+    // type's history was asked for.
+    let steps = backfill_of(&w, "steps");
+    assert_eq!((steps.oldest.as_str(), steps.done), ("2026-09-27", false));
+    assert_eq!(w.data_requests().len(), TYPES.len() + 1);
+    assert_eq!(w.connection().status, "connected");
+    assert_eq!(w.connection().error, None);
+}
+
+#[tokio::test]
+async fn an_unreadable_history_cursor_skips_the_history_and_keeps_the_sync() {
+    let w = world().await;
+    w.connect(w.owner).await;
+    w.break_table("health_backfill");
+    let ran = w.health.run_due().await.unwrap();
+    assert!(
+        matches!(ran[0].outcome, Outcome::Synced { .. }),
+        "{:?}",
+        ran[0].outcome
+    );
+    assert!(history_requests(&w, "steps").is_empty());
+    assert_eq!(w.connection().status, "connected");
+}
+
+#[tokio::test]
+async fn a_history_cursor_that_cannot_be_saved_ends_the_pass_and_keeps_the_sync() {
+    let w = world().await;
+    w.connect(w.owner).await;
+    // The table goes away while the first history chunk is in flight, so
+    // its cursor cannot be saved. The window's own request is left alone.
+    let store = w.store.clone();
+    w.fake.on_request(move |s| {
+        let history = s.path.contains("/steps/")
+            && s.query
+                .get("filter")
+                .is_some_and(|f| !f.contains(r#"< "2026-10-10T18:30:00Z""#));
+        if history {
+            store
+                .db_for_tests()
+                .execute_batch("ALTER TABLE health_backfill RENAME TO health_backfill_gone")
+                .unwrap();
+        }
+    });
+    let ran = w.health.run_due().await.unwrap();
+    assert!(
+        matches!(ran[0].outcome, Outcome::Synced { .. }),
+        "{:?}",
+        ran[0].outcome
+    );
+    // One history chunk was asked for, and then the pass stopped.
+    assert_eq!(history_requests(&w, "steps").len(), 1);
+    assert_eq!(w.data_requests().len(), TYPES.len() + 1);
+    assert_eq!(w.connection().status, "connected");
+    assert_eq!(w.connection().error, None);
+}

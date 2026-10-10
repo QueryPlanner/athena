@@ -7,16 +7,21 @@
 //! cached in memory until a minute before it expires; it is never stored.
 //! Only `invalid_grant` revokes a connection: any other failure is recorded
 //! in `last_sync_error` and tried again.
-use super::client::{Endpoints, Error, Google, MAX_PAGES, Window};
+use super::catalog::{self, Filter};
+#[cfg(test)]
+use super::client::MAX_PAGES;
+use super::client::{Endpoints, Error, Google, Window};
 use super::normalize::{Days, TYPES};
+use super::points;
 use super::{
-    Callback, Cipher, Config, MANUAL_COOLDOWN, SCOPES, STATE_TTL, Secret, WINDOW_DAYS, due,
-    hash_state, new_state, verifier,
+    BACKFILL_CHUNKS_PER_PASS, BACKFILL_DAYS, BACKFILL_EMPTY_CHUNKS, BACKFILL_FLOOR_DAYS, Callback,
+    Cipher, Config, MANUAL_COOLDOWN, SCOPES, STATE_TTL, Secret, WINDOW_DAYS, due, hash_state,
+    new_state, verifier,
 };
 use crate::scheduler::{Clock, SystemClock};
-use crate::store::{Candidate, Claim, Store};
+use crate::store::{Backfill, Candidate, Claim, Store};
 use anyhow::Result;
-use jiff::{SignedDuration, Timestamp, ToSpan, civil::Date};
+use jiff::{SignedDuration, Timestamp, ToSpan, civil::Date, tz::TimeZone};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use url::Url;
@@ -283,7 +288,7 @@ impl Health {
         if !matches!(claimed, Ok(true)) {
             return None;
         }
-        let outcome = self.sync(owner).await;
+        let outcome = self.run_sync(owner, true).await;
         Some(Ran {
             owner,
             chat: c.chat,
@@ -294,6 +299,13 @@ impl Health {
     /// Sync the user's last [`WINDOW_DAYS`] days now. The caller has
     /// claimed the attempt.
     pub async fn sync(&self, owner: i64) -> Outcome {
+        self.run_sync(owner, false).await
+    }
+
+    /// [`Self::sync`], and, if `backfill`, then a pass of the history
+    /// fetch. Only the daily pass backfills: a user's own request stays
+    /// quick.
+    async fn run_sync(&self, owner: i64, backfill: bool) -> Outcome {
         if !lock(&self.running).insert(owner) {
             return Outcome::Running;
         }
@@ -301,10 +313,10 @@ impl Health {
             set: self.running.clone(),
             user: owner,
         };
-        self.sync_claimed(owner).await
+        self.sync_claimed(owner, backfill).await
     }
 
-    async fn sync_claimed(&self, owner: i64) -> Outcome {
+    async fn sync_claimed(&self, owner: i64, backfill: bool) -> Outcome {
         let connection = match self.store.call(move |s| s.health_connection(owner)).await {
             Ok(Some(connection)) => connection,
             Ok(None) => return Outcome::NotConnected,
@@ -324,12 +336,15 @@ impl Health {
         let now = self.now();
         let today = now.to_zoned(zone.clone()).date();
         let window = window(today, &zone);
-        let mut days = Days::new(zone);
+        let mut days = Days::new(zone.clone());
         let mut unavailable = Vec::new();
-        for (data_type, _) in TYPES {
-            match self.read(&access, data_type, &window, &mut days).await {
-                Ok(true) => {}
-                Ok(false) => unavailable.push(data_type.to_string()),
+        for (data_type, _) in TYPES.iter().copied() {
+            let read = self
+                .read(owner, &access, data_type, &window, &zone, Some(&mut days))
+                .await;
+            match read {
+                Ok((_, None)) => {}
+                Ok((_, Some(reason))) => unavailable.push(reason),
                 Err(e) => {
                     if e == Error::Unauthorized {
                         lock(&self.access).remove(&owner);
@@ -338,7 +353,7 @@ impl Health {
                 }
             }
         }
-        let (start, end) = (window.start_date, window.end_date);
+        let (start, end) = (window.start_date.clone(), window.end_date.clone());
         let rows = days.finish(start.parse().expect("a date"), end.parse().expect("a date"));
         let count = rows.len();
         let stored = self
@@ -346,44 +361,178 @@ impl Health {
             .call(move |s| s.health_store_sync(owner, &start, &end, &rows, now))
             .await;
         match stored {
-            Ok(true) => Outcome::Synced {
-                days: count,
-                unavailable,
-            },
+            Ok(true) => {
+                if backfill {
+                    self.backfill(owner, &access, &zone, &window.start_date, today)
+                        .await;
+                }
+                Outcome::Synced {
+                    days: count,
+                    unavailable,
+                }
+            }
             Ok(false) => Outcome::NotConnected,
             Err(e) => self.fail(owner, format!("{e:#}")).await,
         }
     }
 
-    /// All pages of `data_type` into `days`. `false`: Google will not give
-    /// this grant that type.
+    /// All pages of `data_type` in `window`, each stored as it arrives (and
+    /// folded into `days`, if given), so only one page is in memory. The
+    /// answer is how many points were read, and `Some(why)` if Google will
+    /// not give this grant that type; `why` names it for the report: a 403
+    /// (scope not granted) for any type, and, for a type added after the
+    /// first release, an HTTP 400 or 404 with its status, so a wrong filter
+    /// shows up in the report instead of failing every user's sync.
     async fn read(
         &self,
+        owner: i64,
         access: &Secret,
         data_type: &str,
         window: &Window,
-        days: &mut Days,
-    ) -> Result<bool, Error> {
+        zone: &TimeZone,
+        mut days: Option<&mut Days>,
+    ) -> Result<(usize, Option<String>), Error> {
+        let spec = catalog::of(data_type);
         let mut page: Option<String> = None;
-        for _ in 0..MAX_PAGES {
+        let mut read = 0;
+        for _ in 0..spec.max_pages {
             let got = match self
                 .google
                 .data_page(access, data_type, window, page.as_deref())
                 .await
             {
                 Ok(got) => got,
-                Err(Error::Forbidden) => return Ok(false),
+                Err(Error::Forbidden) => return Ok((read, Some(data_type.to_string()))),
+                Err(Error::Http { status, .. }) if spec.optional && matches!(status, 400 | 404) => {
+                    return Ok((read, Some(format!("{data_type} (HTTP {status})"))));
+                }
                 Err(e) => return Err(e),
             };
-            days.add(data_type, &got.points);
+            read += got.points.len();
+            let (name, rows, now) = (
+                data_type.to_string(),
+                points::rows(data_type, &got.points, zone),
+                self.now(),
+            );
+            self.store
+                .call(move |s| s.health_points_put(owner, &name, &rows, now))
+                .await
+                .map_err(|_| Error::Storage("the data points could not be saved"))?;
+            if let Some(days) = days.as_deref_mut() {
+                days.add(data_type, &got.points);
+            }
             match got.next {
                 Some(next) => page = Some(next),
-                None => return Ok(true),
+                None => return Ok((read, None)),
             }
         }
         Err(Error::TooMuch(
             "Google sent more pages than this build reads",
         ))
+    }
+
+    /// One pass of the history fetch for `owner`: for each data type not
+    /// yet done, up to [`BACKFILL_CHUNKS_PER_PASS`] chunks of
+    /// [`BACKFILL_DAYS`] days, working backwards from the oldest day
+    /// fetched so far (at first, the start of the recent window). A type is
+    /// done at [`BACKFILL_FLOOR_DAYS`] back, after [`BACKFILL_EMPTY_CHUNKS`]
+    /// empty chunks in a row, or when Google refuses it. A failure leaves
+    /// the cursor where it was (the pass ends for a transport or server
+    /// error; it never fails the sync, which has already been stored).
+    async fn backfill(
+        &self,
+        owner: i64,
+        access: &Secret,
+        zone: &TimeZone,
+        window_start: &str,
+        today: Date,
+    ) {
+        let Ok(progress) = self.store.call(move |s| s.health_backfill(owner)).await else {
+            return;
+        };
+        let floor = today.saturating_sub(BACKFILL_FLOOR_DAYS.days());
+        for (data_type, _) in TYPES.iter().copied() {
+            let mut cur = progress
+                .iter()
+                .find(|p| p.data_type == data_type)
+                .cloned()
+                .unwrap_or_else(|| Backfill {
+                    data_type: data_type.into(),
+                    oldest: window_start.into(),
+                    done: false,
+                    empty_run: 0,
+                });
+            for _ in 0..BACKFILL_CHUNKS_PER_PASS {
+                if cur.done {
+                    break;
+                }
+                match self
+                    .backfill_chunk(owner, access, zone, &mut cur, floor)
+                    .await
+                {
+                    Chunk::Next => {}
+                    Chunk::Stop => break,
+                    Chunk::Abort => return,
+                }
+            }
+        }
+    }
+
+    /// Fetch the chunk before `cur.oldest` and move the cursor. The
+    /// cursor is saved either way.
+    async fn backfill_chunk(
+        &self,
+        owner: i64,
+        access: &Secret,
+        zone: &TimeZone,
+        cur: &mut Backfill,
+        floor: Date,
+    ) -> Chunk {
+        let data_type = cur.data_type.clone();
+        let spec = catalog::of(&data_type);
+        let oldest: Date = cur.oldest.parse().unwrap_or(floor);
+        // ECG can only be filtered by a start time, with no upper bound, so
+        // its history is fetched in one go, back to the floor.
+        let start = if spec.filter == Filter::EcgStart {
+            floor
+        } else {
+            oldest.saturating_sub(BACKFILL_DAYS.days()).max(floor)
+        };
+        let chunk = window_between(start, oldest, zone);
+        let read = self
+            .read(owner, access, &data_type, &chunk, zone, None)
+            .await;
+        let (note, outcome) = match read {
+            Ok((_, Some(why))) => {
+                cur.done = true;
+                (Some(why), Chunk::Stop)
+            }
+            Ok((n, None)) => {
+                cur.empty_run = if n == 0 { cur.empty_run + 1 } else { 0 };
+                cur.oldest = start.to_string();
+                cur.done = start <= floor
+                    || cur.empty_run >= BACKFILL_EMPTY_CHUNKS
+                    || spec.filter == Filter::EcgStart;
+                (None, Chunk::Next)
+            }
+            // Too many pages: keep what was read and move on.
+            Err(e @ Error::TooMuch(_)) => {
+                cur.empty_run = 0;
+                cur.oldest = start.to_string();
+                cur.done = start <= floor || spec.filter == Filter::EcgStart;
+                (Some(format!("partial: {e}")), Chunk::Next)
+            }
+            Err(e) => (Some(e.to_string()), Chunk::Abort),
+        };
+        let (progress, now) = (cur.clone(), self.now());
+        let saved = self
+            .store
+            .call(move |s| s.health_backfill_save(owner, &progress, note.as_deref(), now))
+            .await;
+        if saved.is_err() {
+            return Chunk::Abort;
+        }
+        outcome
     }
 
     /// A valid access token for `owner`: the cached one, or a new one from
@@ -455,9 +604,23 @@ impl Health {
 /// The last [`WINDOW_DAYS`] local days ending with `today`, as dates and as
 /// the instants they start at. The end is the start of tomorrow: a day with
 /// a clock change is its real length, never "24 hours".
-fn window(today: Date, zone: &jiff::tz::TimeZone) -> Window {
+fn window(today: Date, zone: &TimeZone) -> Window {
     let start = today.saturating_sub((WINDOW_DAYS - 1).days());
-    let end = today.saturating_add(1.days());
+    window_between(start, today.saturating_add(1.days()), zone)
+}
+
+/// What a chunk of the history fetch came to.
+enum Chunk {
+    /// Go on with the next chunk of this type.
+    Next,
+    /// This type is done for this pass; go on to the next type.
+    Stop,
+    /// Something is wrong that the other types will meet too: end the pass.
+    Abort,
+}
+
+/// The local days from `start` up to but not including `end`.
+fn window_between(start: Date, end: Date, zone: &TimeZone) -> Window {
     let at = |date: Date| {
         date.to_zoned(zone.clone())
             .expect("the start of a real day exists")

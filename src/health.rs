@@ -23,8 +23,10 @@
 //! `Debug` output: they are [`Secret`]s, and every error built from a
 //! failed request leaves out the URL and the response body.
 
+pub mod catalog;
 pub mod client;
 pub mod normalize;
+pub mod points;
 pub mod sync;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -53,11 +55,22 @@ pub const API_BASE: &str = "https://health.googleapis.com";
 pub const DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:8080/integrations/google-health/callback";
 
 /// The read-only scopes asked for: no `writeonly` one.
-pub const SCOPES: [&str; 4] = [
+///
+/// Every readable kind of data is asked for, sensitive ones included
+/// (`location`, `reproductive_health`, `logged_symptoms`, `mindfulness`,
+/// `ecg`, `irn`). The user can untick any on Google's consent screen; a data
+/// type whose scope was not granted is skipped by the sync.
+pub const SCOPES: [&str; 10] = [
     "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly",
     "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly",
-    "https://www.googleapis.com/auth/googlehealth.sleep.readonly",
+    "https://www.googleapis.com/auth/googlehealth.location.readonly",
     "https://www.googleapis.com/auth/googlehealth.nutrition.readonly",
+    "https://www.googleapis.com/auth/googlehealth.sleep.readonly",
+    "https://www.googleapis.com/auth/googlehealth.reproductive_health.readonly",
+    "https://www.googleapis.com/auth/googlehealth.logged_symptoms.readonly",
+    "https://www.googleapis.com/auth/googlehealth.mindfulness.readonly",
+    "https://www.googleapis.com/auth/googlehealth.ecg.readonly",
+    "https://www.googleapis.com/auth/googlehealth.irn.readonly",
 ];
 
 /// How long a consent link works.
@@ -70,6 +83,14 @@ pub const SYNC_AT: (i8, i8) = (5, 30);
 pub const RETRY_AFTER: SignedDuration = SignedDuration::from_hours(1);
 /// Days synced on each run, today included.
 pub const WINDOW_DAYS: i64 = 14;
+/// Days of history fetched in one backfill chunk, per data type.
+pub const BACKFILL_DAYS: i64 = 7;
+/// Chunks fetched per data type in each daily pass.
+pub const BACKFILL_CHUNKS_PER_PASS: usize = 3;
+/// How far back history is looked for (Google sets no limit): three years.
+pub const BACKFILL_FLOOR_DAYS: i64 = 3 * 365;
+/// A data type is done after this many empty chunks in a row (12 weeks).
+pub const BACKFILL_EMPTY_CHUNKS: i64 = 12;
 
 /// The names of the three tools. `agent::reserved_tool_names` includes them
 /// whether or not Google Health is configured.

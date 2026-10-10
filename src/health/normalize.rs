@@ -3,27 +3,48 @@
 //! A point is placed on a day by its civil time when Google gives one, else
 //! by its instant converted to the user's time zone. Missing values stay
 //! missing: a day has a key only for what Google reported. A sync feeds each
-//! page of points through [`Days::add`] and keeps only the totals, so memory
-//! holds one page at a time.
+//! page of points through [`Days::add`] and keeps only running aggregates,
+//! so memory holds one page at a time and a day's record stays small:
+//!
+//! - interval counts are summed (`steps`, `floors`, `distance_m`, ...);
+//! - samples keep `{min, avg, max, n}` (`heart_rate`, `hrv_ms`, ...);
+//! - body measurements keep the latest (`weight_kg`, `height_cm`, ...);
+//! - daily summaries are kept as Google computed them (`hrv_daily`, ...);
+//! - sessions keep a short summary each, with a cap per day (`workouts`,
+//!   `sleep`);
+//! - ECG, irregular rhythm, mood, symptom, ovulation and period records keep
+//!   a count and labels only. No waveform, heart-beat series or
+//!   minute-level series goes into a day's record; the raw points, ECG
+//!   waveforms included, are kept whole in `health_points` (see
+//!   [`super::points`]).
+use super::catalog::{self, Filter};
 use jiff::{Timestamp, civil::Date, tz::TimeZone};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The data types a sync reads, with the field of each point that holds its
-/// values.
-pub const TYPES: [(&str, &str); 12] = [
-    ("steps", "steps"),
-    ("distance", "distance"),
-    ("active-energy-burned", "activeEnergyBurned"),
-    ("active-minutes", "activeMinutes"),
-    ("active-zone-minutes", "activeZoneMinutes"),
-    ("exercise", "exercise"),
-    ("sleep", "sleep"),
-    ("daily-resting-heart-rate", "dailyRestingHeartRate"),
-    ("daily-heart-rate-zones", "dailyHeartRateZones"),
-    ("time-in-heart-rate-zone", "timeInHeartRateZone"),
-    ("weight", "weight"),
-    ("body-fat", "bodyFat"),
+pub use super::catalog::TYPES;
+
+/// The most workouts kept for one day; later ones are counted in
+/// `workouts_omitted`.
+const MAX_WORKOUTS: usize = 8;
+/// The most sleep sessions (a night and naps) kept for one day.
+const MAX_SLEEPS: usize = 4;
+/// The most labels kept in one tally (moods, symptoms, ECG classes).
+const MAX_LABELS: usize = 12;
+/// The most bytes of JSON stored for one day.
+pub const MAX_DAY_BYTES: usize = 4 * 1024;
+/// What is dropped, first to last, from a day over [`MAX_DAY_BYTES`]: the
+/// least useful to the model first.
+const DROP_ORDER: [&str; 9] = [
+    "hr_zones",
+    "activity_level_min",
+    "hr_zone_minutes",
+    "moods",
+    "symptoms",
+    "ovulation_tests",
+    "swim",
+    "workouts",
+    "sleep",
 ];
 
 /// A number in JSON, or in a string (Google writes 64-bit integers as
@@ -44,7 +65,7 @@ fn round(n: f64, places: i32) -> f64 {
     (n * scale).round() / scale
 }
 
-fn text(value: &Value) -> Option<String> {
+pub(super) fn text(value: &Value) -> Option<String> {
     value
         .as_str()
         .map(str::trim)
@@ -61,7 +82,7 @@ fn civil(value: &Value) -> Option<Date> {
     parts(value).or_else(|| parts(&value["date"]))
 }
 
-fn instant(value: &Value) -> Option<Timestamp> {
+pub(super) fn instant(value: &Value) -> Option<Timestamp> {
     value.as_str()?.parse().ok()
 }
 
@@ -93,17 +114,18 @@ fn duration_seconds(value: &Value) -> Option<f64> {
 }
 
 /// The day a point belongs to: sleep goes on the day it ended.
-fn day_of(component: &Value, data_type: &str, zone: &TimeZone) -> Option<Date> {
-    let daily = matches!(
-        data_type,
-        "daily-resting-heart-rate" | "daily-heart-rate-zones"
-    );
-    if daily && let Some(date) = date_of(&component["date"], zone) {
+pub(super) fn day_of(component: &Value, filter: Filter, zone: &TimeZone) -> Option<Date> {
+    if filter == Filter::DailyDate
+        && let Some(date) = date_of(&component["date"], zone)
+    {
         return Some(date);
     }
     let interval = &component["interval"];
-    let order = if data_type == "sleep" {
+    let order = if filter == Filter::SleepEnd {
         ["civilEndTime", "endTime", "civilStartTime", "startTime"]
+    } else if filter == Filter::EcgStart {
+        // Old ECGs have no UTC offset, so their civil time is UTC's.
+        ["startTime", "civilStartTime", "endTime", "civilEndTime"]
     } else {
         ["civilStartTime", "startTime", "civilEndTime", "endTime"]
     };
@@ -114,20 +136,93 @@ fn day_of(component: &Value, data_type: &str, zone: &TimeZone) -> Option<Date> {
         .or_else(|| date_of(&component["sampleTime"]["physicalTime"], zone))
 }
 
+/// Count, sum and range of the samples of one day.
+struct Stat {
+    n: u64,
+    sum: f64,
+    min: f64,
+    max: f64,
+}
+
+impl Stat {
+    fn new(first: f64) -> Self {
+        Self {
+            n: 1,
+            sum: first,
+            min: first,
+            max: first,
+        }
+    }
+
+    fn push(&mut self, value: f64) {
+        self.n += 1;
+        self.sum += value;
+        self.min = self.min.min(value);
+        self.max = self.max.max(value);
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "min": round(self.min, 1),
+            "avg": round(self.sum / self.n as f64, 1),
+            "max": round(self.max, 1),
+            "n": self.n,
+        })
+    }
+}
+
+/// Sums that are whole numbers: counts of steps, minutes, events.
+fn is_whole(key: &str) -> bool {
+    matches!(
+        key,
+        "steps"
+            | "floors"
+            | "active_min"
+            | "zone_min"
+            | "sedentary_min"
+            | "swim.lengths"
+            | "swim.strokes"
+            | "nutrition.entries"
+            | "menstrual_period_started"
+            | "ecg.count"
+            | "irn.count"
+            | "moods.count"
+            | "symptoms.count"
+    ) || key.starts_with("activity_level_min.")
+}
+
+/// Put `value` at `key`, where a dot goes one object deeper.
+fn put(map: &mut Map<String, Value>, key: &str, value: Value) {
+    match key.split_once('.') {
+        Some((head, rest)) => {
+            let child = map.entry(head).or_insert_with(|| Value::Object(Map::new()));
+            if let Value::Object(inner) = child {
+                put(inner, rest, value);
+            }
+        }
+        None => {
+            map.insert(key.into(), value);
+        }
+    }
+}
+
 #[derive(Default)]
 struct Day {
-    steps: Option<i64>,
-    distance_m: Option<f64>,
-    active_kcal: Option<f64>,
-    active_min: Option<i64>,
-    zone_min: Option<i64>,
-    resting_hr: Option<i64>,
+    /// Totals by key; see [`is_whole`] for the integers.
+    sums: BTreeMap<String, f64>,
+    stats: BTreeMap<&'static str, Stat>,
+    /// Body measurements: the latest, with the time it was taken.
+    latest: BTreeMap<&'static str, (String, f64)>,
+    /// Daily summaries as Google computed them; the last one wins.
+    scalars: BTreeMap<&'static str, Value>,
+    /// How many times each label was seen.
+    tallies: BTreeMap<&'static str, BTreeMap<String, u64>>,
     zone_minutes: BTreeMap<String, i64>,
     zones: Vec<Value>,
-    weight: Option<(String, f64)>,
-    body_fat: Option<(String, f64)>,
     workouts: Vec<Value>,
+    workouts_omitted: u32,
     sleep: Vec<Value>,
+    sleeps_omitted: u32,
     /// The points already counted, so a repeated page or point is not added
     /// twice.
     seen: BTreeSet<String>,
@@ -136,79 +231,311 @@ struct Day {
 impl Day {
     fn to_json(&self) -> Value {
         let mut m = Map::new();
-        let mut put = |key: &str, value: Option<Value>| {
-            if let Some(value) = value {
-                m.insert(key.into(), value);
-            }
-        };
-        put("steps", self.steps.map(Value::from));
-        put("distance_m", self.distance_m.map(|n| json!(round(n, 1))));
-        put("active_kcal", self.active_kcal.map(|n| json!(round(n, 1))));
-        put("active_min", self.active_min.map(Value::from));
-        put("zone_min", self.zone_min.map(Value::from));
-        put("resting_hr", self.resting_hr.map(Value::from));
-        put(
-            "hr_zone_minutes",
-            (!self.zone_minutes.is_empty()).then(|| json!(self.zone_minutes)),
-        );
-        put(
-            "hr_zones",
-            (!self.zones.is_empty()).then(|| json!(self.zones)),
-        );
-        put(
-            "weight_kg",
-            self.weight.as_ref().map(|w| json!(round(w.1, 2))),
-        );
-        put(
-            "body_fat_pct",
-            self.body_fat.as_ref().map(|w| json!(round(w.1, 1))),
-        );
-        put(
-            "workouts",
-            (!self.workouts.is_empty()).then(|| json!(self.workouts)),
-        );
-        put("sleep", (!self.sleep.is_empty()).then(|| json!(self.sleep)));
+        for (key, total) in &self.sums {
+            let value = if is_whole(key) {
+                json!(total.round() as i64)
+            } else {
+                json!(round(*total, 1))
+            };
+            put(&mut m, key, value);
+        }
+        for (key, stat) in &self.stats {
+            put(&mut m, key, stat.to_json());
+        }
+        for (key, (_, value)) in &self.latest {
+            let places = if *key == "weight_kg" { 2 } else { 1 };
+            put(&mut m, key, json!(round(*value, places)));
+        }
+        for (key, value) in &self.scalars {
+            put(&mut m, key, value.clone());
+        }
+        for (key, labels) in &self.tallies {
+            put(&mut m, key, json!(top_labels(labels)));
+        }
+        if !self.zone_minutes.is_empty() {
+            m.insert("hr_zone_minutes".into(), json!(self.zone_minutes));
+        }
+        if !self.zones.is_empty() {
+            m.insert("hr_zones".into(), json!(self.zones));
+        }
+        if !self.workouts.is_empty() {
+            m.insert("workouts".into(), json!(self.workouts));
+        }
+        if self.workouts_omitted > 0 {
+            m.insert("workouts_omitted".into(), self.workouts_omitted.into());
+        }
+        if !self.sleep.is_empty() {
+            m.insert("sleep".into(), json!(self.sleep));
+        }
+        if self.sleeps_omitted > 0 {
+            m.insert("sleeps_omitted".into(), self.sleeps_omitted.into());
+        }
+        shrink(&mut m);
         Value::Object(m)
     }
 
+    fn sum(&mut self, key: &str, value: Option<f64>) {
+        if let Some(value) = value {
+            *self.sums.entry(key.into()).or_default() += value;
+        }
+    }
+
+    fn stat(&mut self, key: &'static str, value: Option<f64>) {
+        let Some(value) = value else { return };
+        match self.stats.get_mut(key) {
+            Some(stat) => stat.push(value),
+            None => {
+                self.stats.insert(key, Stat::new(value));
+            }
+        }
+    }
+
+    /// Keep the measurement with the latest time.
+    fn latest(&mut self, key: &'static str, c: &Value, point: &Value, value: Option<f64>) {
+        let Some(value) = value.map(|v| v.max(0.0)) else {
+            return;
+        };
+        let when = text(&c["sampleTime"]["physicalTime"])
+            .or_else(|| text(&point["name"]))
+            .unwrap_or_default();
+        if self
+            .latest
+            .get(key)
+            .is_none_or(|(before, _)| when >= *before)
+        {
+            self.latest.insert(key, (when, value));
+        }
+    }
+
+    fn tally(&mut self, key: &'static str, label: Option<String>) {
+        if let Some(label) = label {
+            *self
+                .tallies
+                .entry(key)
+                .or_default()
+                .entry(label)
+                .or_default() += 1;
+        }
+    }
+
+    /// Keep a summary object of the numbers that are present, rounded to two
+    /// places; nothing if none is.
+    fn object(&mut self, key: &'static str, fields: &[(&str, Option<f64>)]) {
+        let object: Map<String, Value> = fields
+            .iter()
+            .filter_map(|(name, value)| Some(((*name).to_string(), json!(round((*value)?, 2)))))
+            .collect();
+        if !object.is_empty() {
+            self.scalars.insert(key, Value::Object(object));
+        }
+    }
+
     fn add(&mut self, data_type: &str, c: &Value, point: &Value) {
+        let milli = |v: &Value| num(v).map(|n| n.max(0.0) / 1000.0);
+        let kcal = |v: &Value| num(v).map(|n| n.max(0.0));
         match data_type {
-            "steps" => add(&mut self.steps, whole(&c["count"])),
-            "distance" => {
-                let meters = num(&c["millimeters"]).map(|n| n.max(0.0) / 1000.0);
-                add_f(&mut self.distance_m, meters);
-            }
-            "active-energy-burned" => {
-                add_f(&mut self.active_kcal, num(&c["kcal"]).map(|n| n.max(0.0)))
-            }
+            "steps" => self.sum("steps", whole(&c["count"]).map(|n| n as f64)),
+            "floors" => self.sum("floors", whole(&c["count"]).map(|n| n as f64)),
+            "distance" => self.sum("distance_m", milli(&c["millimeters"])),
+            // Google's value is a delta that may be negative: the day's sum is
+            // the net change, not the climb.
+            "altitude" => self.sum(
+                "elevation_change_m",
+                num(&c["gainMillimeters"]).map(|n| n / 1000.0),
+            ),
+            "active-energy-burned" => self.sum("active_kcal", kcal(&c["kcal"])),
+            "basal-energy-burned" => self.sum("basal_kcal", kcal(&c["kcal"])),
             "active-minutes" => {
                 let levels = c["activeMinutesByActivityLevel"].as_array();
-                let total =
-                    levels.map(|l| l.iter().filter_map(|r| whole(&r["activeMinutes"])).sum());
-                add(&mut self.active_min, total);
+                let total = levels.map(|l| {
+                    l.iter()
+                        .filter_map(|r| whole(&r["activeMinutes"]))
+                        .sum::<i64>() as f64
+                });
+                self.sum("active_min", total);
             }
-            "active-zone-minutes" => add(&mut self.zone_min, whole(&c["activeZoneMinutes"])),
+            "active-zone-minutes" => {
+                self.sum("zone_min", whole(&c["activeZoneMinutes"]).map(|n| n as f64))
+            }
+            "activity-level" => {
+                let minutes = interval_seconds(&c["interval"]).map(|s| s / 60.0);
+                if let Some(kind) = label_of(&c["activityLevelType"]) {
+                    self.sum(&format!("activity_level_min.{kind}"), minutes);
+                }
+            }
+            "sedentary-period" => self.sum(
+                "sedentary_min",
+                interval_seconds(&c["interval"]).map(|s| s / 60.0),
+            ),
+            "swim-lengths-data" => {
+                if self.first_time(point) {
+                    self.sum("swim.lengths", Some(1.0));
+                    self.sum("swim.strokes", whole(&c["strokeCount"]).map(|n| n as f64));
+                }
+            }
             "time-in-heart-rate-zone" => {
                 let minutes = interval_seconds(&c["interval"]).map(|s| (s / 60.0).round() as i64);
-                if let (Some(zone), Some(minutes)) = (text(&c["heartRateZoneType"]), minutes) {
+                if let (Some(zone), Some(minutes)) = (label_of(&c["heartRateZoneType"]), minutes) {
                     *self.zone_minutes.entry(zone).or_default() += minutes;
                 }
             }
-            "daily-resting-heart-rate" => {
-                if let Some(bpm) = whole(&c["beatsPerMinute"]) {
-                    self.resting_hr = Some(bpm);
+            "hydration-log" => {
+                if self.first_time(point) {
+                    self.sum("hydration_ml", kcal(&c["amountConsumed"]["milliliters"]));
                 }
             }
-            "daily-heart-rate-zones" => self.thresholds(c),
-            "exercise" => self.exercise(c, point),
-            "sleep" => self.sleep(c, point),
-            "weight" => latest(
-                &mut self.weight,
+            "nutrition-log" => self.nutrition(c, point),
+            "heart-rate" => self.stat("heart_rate", num(&c["beatsPerMinute"]).filter(|n| *n > 0.0)),
+            "heart-rate-variability" => self.stat(
+                "hrv_ms",
+                num(&c["rootMeanSquareOfSuccessiveDifferencesMilliseconds"]),
+            ),
+            "oxygen-saturation" => self.stat("spo2_pct", num(&c["percentage"])),
+            "respiratory-rate-sleep-summary" => self.stat(
+                "resp_rate_sleep",
+                num(&c["fullSleepStats"]["breathsPerMinute"]),
+            ),
+            "core-body-temperature" => self.stat("core_temp_c", num(&c["temperatureCelsius"])),
+            "blood-glucose" => self.stat(
+                "glucose_mgdl",
+                num(&c["bloodGlucoseMilligramsPerDeciliter"]),
+            ),
+            "weight" => self.latest(
+                "weight_kg",
                 c,
                 point,
                 num(&c["weightGrams"]).map(|g| g / 1000.0),
             ),
-            _ => latest(&mut self.body_fat, c, point, num(&c["percentage"])),
+            "body-fat" => self.latest("body_fat_pct", c, point, num(&c["percentage"])),
+            "height" => self.latest(
+                "height_cm",
+                c,
+                point,
+                num(&c["heightMillimeters"]).map(|m| m / 10.0),
+            ),
+            "vo2-max" => self.latest("vo2max", c, point, num(&c["vo2Max"])),
+            "run-vo2-max" => self.latest("run_vo2max", c, point, num(&c["runVo2Max"])),
+            "daily-resting-heart-rate" => {
+                if let Some(bpm) = whole(&c["beatsPerMinute"]) {
+                    self.scalars.insert("resting_hr", bpm.into());
+                }
+            }
+            "daily-heart-rate-variability" => self.object(
+                "hrv_daily",
+                &[
+                    ("avg_ms", num(&c["averageHeartRateVariabilityMilliseconds"])),
+                    (
+                        "deep_rmssd_ms",
+                        num(&c["deepSleepRootMeanSquareOfSuccessiveDifferencesMilliseconds"]),
+                    ),
+                    ("non_rem_hr", num(&c["nonRemHeartRateBeatsPerMinute"])),
+                    ("entropy", num(&c["entropy"])),
+                ],
+            ),
+            "daily-oxygen-saturation" => self.object(
+                "spo2_daily",
+                &[
+                    ("avg", num(&c["averagePercentage"])),
+                    ("min", num(&c["lowerBoundPercentage"])),
+                    ("max", num(&c["upperBoundPercentage"])),
+                ],
+            ),
+            "daily-respiratory-rate" => {
+                if let Some(rate) = num(&c["breathsPerMinute"]) {
+                    self.scalars
+                        .insert("resp_rate_daily", json!(round(rate, 1)));
+                }
+            }
+            "daily-sleep-temperature-derivations" => self.object(
+                "sleep_temp",
+                &[
+                    ("nightly_c", num(&c["nightlyTemperatureCelsius"])),
+                    ("baseline_c", num(&c["baselineTemperatureCelsius"])),
+                    (
+                        "rel_stddev_30d_c",
+                        num(&c["relativeNightlyStddev30dCelsius"]),
+                    ),
+                ],
+            ),
+            "daily-vo2-max" => self.daily_vo2_max(c),
+            "daily-heart-rate-zones" => self.thresholds(c),
+            "exercise" => self.exercise(c, point),
+            "sleep" => self.sleep(c, point),
+            "electrocardiogram" => {
+                if self.first_time(point) {
+                    self.sum("ecg.count", Some(1.0));
+                    self.tally("ecg.classes", label_of(&c["resultClassification"]));
+                }
+            }
+            "irregular-rhythm-notification" => {
+                if self.first_time(point) {
+                    self.sum("irn.count", Some(1.0));
+                }
+            }
+            "moods" => self.labelled(("moods.count", "moods.labels"), c, "moods", point),
+            "symptoms" => {
+                self.labelled(("symptoms.count", "symptoms.labels"), c, "symptoms", point)
+            }
+            "ovulation-test" => {
+                if self.first_time(point) {
+                    self.tally("ovulation_tests", label_of(&c["result"]));
+                }
+            }
+            "menstrual-period" if self.first_time(point) => {
+                self.sum("menstrual_period_started", Some(1.0));
+            }
+            _ => {}
+        }
+    }
+
+    /// A record of labels (moods, symptoms): how many records, and how many
+    /// times each label was logged. `list` is the name of the label list in
+    /// the point.
+    fn labelled(&mut self, keys: (&str, &'static str), c: &Value, list: &str, point: &Value) {
+        if !self.first_time(point) {
+            return;
+        }
+        self.sum(keys.0, Some(1.0));
+        for label in c[list].as_array().into_iter().flatten() {
+            self.tally(keys.1, label_of(label));
+        }
+    }
+
+    /// One logged meal or snack: energy, carbohydrate, fat and a few
+    /// nutrients, summed over the day.
+    fn nutrition(&mut self, c: &Value, point: &Value) {
+        if !self.first_time(point) {
+            return;
+        }
+        self.sum("nutrition.entries", Some(1.0));
+        self.sum("nutrition.kcal", num(&c["energy"]["kcal"]));
+        self.sum("nutrition.carbs_g", num(&c["totalCarbohydrate"]["grams"]));
+        self.sum("nutrition.fat_g", num(&c["totalFat"]["grams"]));
+        for item in c["nutrients"].as_array().into_iter().flatten() {
+            let grams = num(&item["quantity"]["grams"]).map(|g| g.max(0.0));
+            match item["nutrient"].as_str() {
+                Some("PROTEIN") => self.sum("nutrition.protein_g", grams),
+                Some("DIETARY_FIBER") => self.sum("nutrition.fiber_g", grams),
+                Some("SUGAR") => self.sum("nutrition.sugar_g", grams),
+                Some("SODIUM") => self.sum("nutrition.sodium_mg", grams.map(|g| g * 1000.0)),
+                _ => {}
+            }
+        }
+    }
+
+    fn daily_vo2_max(&mut self, c: &Value) {
+        let mut object = Map::new();
+        if let Some(value) = num(&c["vo2Max"]) {
+            object.insert("value".into(), json!(round(value, 1)));
+        }
+        if let Some(level) = text(&c["cardioFitnessLevel"]) {
+            object.insert("level".into(), level.into());
+        }
+        if let Some(estimated) = c["estimated"].as_bool() {
+            object.insert("estimated".into(), estimated.into());
+        }
+        if !object.is_empty() {
+            self.scalars.insert("vo2max_daily", Value::Object(object));
         }
     }
 
@@ -243,6 +570,10 @@ impl Day {
         if !self.first_time(point) {
             return;
         }
+        if self.workouts.len() >= MAX_WORKOUTS {
+            self.workouts_omitted += 1;
+            return;
+        }
         let kind = text(&c["displayName"])
             .or_else(|| text(&c["exerciseType"]))
             .unwrap_or_else(|| "Workout".into());
@@ -252,6 +583,12 @@ impl Day {
         workout.insert("minutes".into(), ((seconds / 60.0).round() as i64).into());
         if let Some(kcal) = num(&summary["caloriesKcal"]) {
             workout.insert("kcal".into(), round(kcal.max(0.0), 1).into());
+        }
+        if let Some(mm) = num(&summary["distanceMillimeters"]) {
+            workout.insert("distance_m".into(), round(mm.max(0.0) / 1000.0, 1).into());
+        }
+        if let Some(bpm) = whole(&summary["averageHeartRateBeatsPerMinute"]).filter(|b| *b > 0) {
+            workout.insert("avg_hr".into(), bpm.into());
         }
         if let Some(zone) = whole(&summary["activeZoneMinutes"]) {
             workout.insert("zone_min".into(), zone.into());
@@ -267,6 +604,10 @@ impl Day {
         if !self.first_time(point) {
             return;
         }
+        if self.sleep.len() >= MAX_SLEEPS {
+            self.sleeps_omitted += 1;
+            return;
+        }
         let stages: Vec<Value> = summary["stagesSummary"]
             .as_array()
             .into_iter()
@@ -275,37 +616,56 @@ impl Day {
                 Some(json!({"type": text(&s["type"])?, "minutes": whole(&s["minutes"])?}))
             })
             .collect();
-        self.sleep.push(json!({
+        let mut sleep = json!({
             "minutes": minutes,
             "start": text(&c["interval"]["startTime"]),
             "end": text(&c["interval"]["endTime"]),
             "stages": stages,
-        }));
+        });
+        if c["metadata"]["nap"] == true {
+            sleep["nap"] = true.into();
+        }
+        self.sleep.push(sleep);
     }
 }
 
-fn add(total: &mut Option<i64>, value: Option<i64>) {
-    if let Some(value) = value {
-        *total = Some(total.unwrap_or(0) + value);
-    }
+/// The `MAX_LABELS` most frequent labels (ties by name) with their counts.
+fn top_labels(labels: &BTreeMap<String, u64>) -> BTreeMap<&str, u64> {
+    let mut all: Vec<(&String, &u64)> = labels.iter().collect();
+    all.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    all.into_iter()
+        .take(MAX_LABELS)
+        .map(|(label, n)| (label.as_str(), *n))
+        .collect()
 }
 
-fn add_f(total: &mut Option<f64>, value: Option<f64>) {
-    if let Some(value) = value {
-        *total = Some(total.unwrap_or(0.0) + value);
-    }
+/// A label from an enum-valued field: upper-case letters, digits and
+/// underscores, at most 40. Google may add values, and what is stored is
+/// shown to the model, so anything else is not kept.
+fn label_of(value: &Value) -> Option<String> {
+    let label = text(value)?;
+    let ok = label.len() <= 40
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+    ok.then_some(label)
 }
 
-/// Keep the measurement with the latest time.
-fn latest(slot: &mut Option<(String, f64)>, c: &Value, point: &Value, value: Option<f64>) {
-    let Some(value) = value.map(|v| v.max(0.0)) else {
-        return;
-    };
-    let when = text(&c["sampleTime"]["physicalTime"])
-        .or_else(|| text(&point["name"]))
-        .unwrap_or_default();
-    if slot.as_ref().is_none_or(|(before, _)| when >= *before) {
-        *slot = Some((when, value));
+/// Drop keys, least useful first, until `map` is within [`MAX_DAY_BYTES`].
+/// What was dropped is named in `dropped`, so a missing key is not read as
+/// "no data".
+fn shrink(map: &mut Map<String, Value>) {
+    let mut dropped = Vec::new();
+    for key in DROP_ORDER {
+        if Value::Object(map.clone()).to_string().len() <= MAX_DAY_BYTES {
+            break;
+        }
+        if map.remove(key).is_some() {
+            dropped.push(key);
+        }
+    }
+    if !dropped.is_empty() {
+        map.insert("dropped".into(), json!(dropped));
     }
 }
 
@@ -326,15 +686,15 @@ impl Days {
     /// Fold `points` of `data_type` in. Points without a usable value or
     /// date, and types this build does not know, are skipped.
     pub fn add(&mut self, data_type: &str, points: &[Value]) {
-        let Some((_, field)) = TYPES.iter().find(|(name, _)| *name == data_type) else {
+        let Some(spec) = catalog::find(data_type) else {
             return;
         };
         for point in points {
-            let component = &point[*field];
+            let component = &point[spec.field];
             if !component.is_object() {
                 continue;
             }
-            if let Some(date) = day_of(component, data_type, &self.zone) {
+            if let Some(date) = day_of(component, spec.filter, &self.zone) {
                 self.days
                     .entry(date)
                     .or_default()
@@ -620,5 +980,589 @@ mod tests {
             kept,
             [("2026-10-05".to_string(), r#"{"steps":2}"#.to_string())]
         );
+    }
+}
+
+/// One fixture per type family, in the shapes the code documents: a point
+/// is `{name?, <field>: {...}}`, and each family's component is read from
+/// the fields Google's v4 `DataPoint` union gives it.
+#[cfg(test)]
+mod family_tests {
+    use super::*;
+
+    fn paris() -> TimeZone {
+        TimeZone::get("Europe/Paris").unwrap()
+    }
+
+    /// The days the points of each type make, for 1 to 19 October 2026.
+    fn days_of(types: &[(&str, Vec<Value>)]) -> Vec<(String, Value)> {
+        let mut days = Days::new(paris());
+        for (data_type, points) in types {
+            days.add(data_type, points);
+        }
+        days.finish("2026-10-01".parse().unwrap(), "2026-10-20".parse().unwrap())
+            .into_iter()
+            .map(|(date, metrics)| (date, serde_json::from_str(&metrics).unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn a_negative_altitude_change_is_kept_so_the_day_shows_the_net_change() {
+        let change = |t: &str, mm: &str| json!({"altitude": {"interval": {"startTime": t}, "gainMillimeters": mm}});
+        let rows = days_of(&[(
+            "altitude",
+            vec![
+                change("2026-10-09T08:00:00Z", "12000"),
+                change("2026-10-09T09:00:00Z", "-2500"),
+            ],
+        )]);
+        assert_eq!(
+            rows,
+            [("2026-10-09".to_string(), json!({"elevation_change_m": 9.5}))]
+        );
+    }
+
+    /// A logged meal with the nutrients the day keeps. `sodium` is in grams,
+    /// as Google gives it.
+    fn meal(name: &str, time: &str, protein: f64, sodium: f64) -> Value {
+        json!({"name": name, "nutritionLog": {
+        "interval": {"startTime": time},
+        "energy": {"kcal": "300"},
+        "totalCarbohydrate": {"grams": 40},
+        "totalFat": {"grams": 10.5},
+        "nutrients": [
+            {"nutrient": "PROTEIN", "quantity": {"grams": protein}},
+            {"nutrient": "DIETARY_FIBER", "quantity": {"grams": "5"}},
+            {"nutrient": "SUGAR", "quantity": {"grams": 12}},
+            {"nutrient": "SODIUM", "quantity": {"grams": sodium}},
+            {"nutrient": "CALCIUM", "quantity": {"grams": 1}},
+            {"nutrient": "PROTEIN"}
+        ]}})
+    }
+
+    #[test]
+    fn nutrition_sums_the_meals_of_a_day_and_converts_sodium_to_milligrams() {
+        let rows = days_of(&[(
+            "nutrition-log",
+            vec![
+                meal("n1", "2026-10-09T06:00:00Z", 20.0, 0.5),
+                // The same point again, as a second page would bring it.
+                meal("n1", "2026-10-09T06:00:00Z", 20.0, 0.5),
+                meal("n2", "2026-10-09T18:00:00Z", 10.0, 0.25),
+            ],
+        )]);
+        assert_eq!(rows[0].0, "2026-10-09");
+        assert_eq!(
+            rows[0].1["nutrition"],
+            json!({
+                "entries": 2,
+                "kcal": 600.0,
+                "carbs_g": 80.0,
+                "fat_g": 21.0,
+                "protein_g": 30.0,
+                "fiber_g": 10.0,
+                "sugar_g": 24.0,
+                "sodium_mg": 750.0,
+            })
+        );
+    }
+
+    #[test]
+    fn sleep_keeps_four_nights_on_a_day_and_counts_the_rest() {
+        let night = |n: i64| {
+            json!({"name": format!("s{n}"), "sleep": {
+                "interval": {"startTime": format!("2026-10-09T0{n}:00:00Z"),
+                             "endTime": "2026-10-10T06:00:00Z"},
+                "summary": {"minutesAsleep": 100 + n}}})
+        };
+        let rows = days_of(&[("sleep", (1..=5).map(night).collect())]);
+        assert_eq!(rows[0].0, "2026-10-10");
+        assert_eq!(rows[0].1["sleeps_omitted"], 1);
+        let kept: Vec<i64> = rows[0].1["sleep"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["minutes"].as_i64().unwrap())
+            .collect();
+        assert_eq!(kept, [101, 102, 103, 104]);
+    }
+
+    #[test]
+    fn workouts_keep_eight_a_day_and_count_the_rest() {
+        let run = |n: u32| {
+            json!({"name": format!("w{n}"), "exercise": {
+                "interval": {"startTime": format!("2026-10-09T{n:02}:00:00Z")},
+                "activeDuration": "600s",
+                "exerciseType": "RUNNING"}})
+        };
+        let rows = days_of(&[("exercise", (1..=9).map(run).collect())]);
+        assert_eq!(rows[0].1["workouts_omitted"], 1);
+        let workouts = rows[0].1["workouts"].as_array().unwrap();
+        assert_eq!(workouts.len(), 8);
+        assert!(
+            workouts
+                .iter()
+                .all(|w| w == &json!({"type": "RUNNING", "minutes": 10}))
+        );
+    }
+
+    #[test]
+    fn mood_labels_must_be_upper_case_and_short_and_only_the_top_twelve_are_listed() {
+        let mood = |name: &str, day: &str, labels: Vec<String>| {
+            json!({"name": name, "moods": {
+                "sampleTime": {"physicalTime": format!("{day}T08:00:00Z")},
+                "moods": labels}})
+        };
+        // A label with a lower-case letter, a dash, or more than 40 bytes is
+        // not kept.
+        let bad = vec![
+            "calm".to_string(),
+            "STRESSED-OUT".to_string(),
+            "A".repeat(41),
+            "ANXIOUS".to_string(),
+        ];
+        // Label `L<n>` is logged n times, on distinct records: thirteen
+        // labels, of which the twelve most frequent are listed.
+        let mut many = Vec::new();
+        for n in 1..=13 {
+            for k in 0..n {
+                many.push(mood(
+                    &format!("L{n}-{k}"),
+                    "2026-10-09",
+                    vec![format!("L{n:02}")],
+                ));
+            }
+        }
+        let rows = days_of(&[
+            ("moods", vec![mood("bad", "2026-10-10", bad)]),
+            ("moods", many),
+        ]);
+        let by_day = |d: &str| rows.iter().find(|(date, _)| date == d).unwrap().1.clone();
+        assert_eq!(
+            by_day("2026-10-10")["moods"],
+            json!({"count": 1, "labels": {"ANXIOUS": 1}})
+        );
+        let top: serde_json::Map<String, Value> =
+            (2..=13).map(|n| (format!("L{n:02}"), json!(n))).collect();
+        assert_eq!(
+            by_day("2026-10-09")["moods"],
+            json!({"count": 91, "labels": top})
+        );
+    }
+
+    #[test]
+    fn an_ecg_is_placed_by_its_start_in_the_users_zone_and_kept_as_a_count() {
+        let ecg = |name: &str, start: &str, class: &str| {
+            json!({"name": name, "electrocardiogram": {
+                "interval": {"startTime": start},
+                "resultClassification": class,
+                "waveformSamples": [1, 2, 3]}})
+        };
+        let rows = days_of(&[(
+            "electrocardiogram",
+            vec![
+                // 19:00 UTC is 21:00 in Paris on the 9th.
+                ecg("e1", "2026-10-09T19:00:00Z", "SINUS_RHYTHM"),
+                // 23:30 UTC is 01:30 on the 10th in Paris.
+                ecg("e2", "2026-10-09T23:30:00Z", "AFIB"),
+                ecg("e2", "2026-10-09T23:30:00Z", "AFIB"),
+            ],
+        )]);
+        assert_eq!(
+            rows,
+            [
+                (
+                    "2026-10-09".to_string(),
+                    json!({"ecg": {"count": 1, "classes": {"SINUS_RHYTHM": 1}}})
+                ),
+                (
+                    "2026-10-10".to_string(),
+                    json!({"ecg": {"count": 1, "classes": {"AFIB": 1}}})
+                ),
+            ]
+        );
+        assert!(!rows[0].1.to_string().contains("waveform"));
+    }
+
+    #[test]
+    fn a_point_without_an_object_is_skipped_and_an_unknown_type_adds_nothing() {
+        let rows = days_of(&[
+            (
+                "steps",
+                vec![json!({"steps": 5}), json!({"other": {"count": 3}})],
+            ),
+            (
+                "not-a-type",
+                vec![json!({"not-a-type": {
+                    "interval": {"startTime": "2026-10-09T08:00:00Z"}, "count": 3}})],
+            ),
+        ]);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn a_day_over_four_kib_drops_the_least_useful_keys_and_names_them() {
+        // Eighty HR-zone limits (over 4 KiB alone) and eight workouts with
+        // 600-character names. `hr_zones` goes first; that is not enough, so
+        // `workouts` goes too, and nothing else is touched.
+        let zones: Vec<Value> = (0..80)
+            .map(|i| {
+                json!({"heartRateZoneType": "ZONE_NAME",
+                       "minBeatsPerMinute": 100 + i, "maxBeatsPerMinute": 101 + i})
+            })
+            .collect();
+        let zones_point = json!({"name": "z", "dailyHeartRateZones": {
+            "date": "2026-10-09", "heartRateZones": zones}});
+        let run = |n: u32| {
+            json!({"name": format!("w{n}"), "exercise": {
+                "interval": {"startTime": format!("2026-10-09T{n:02}:00:00Z")},
+                "activeDuration": "600s",
+                "displayName": "R".repeat(600)}})
+        };
+        let rows = days_of(&[
+            ("daily-heart-rate-zones", vec![zones_point]),
+            ("exercise", (1..=8).map(run).collect()),
+        ]);
+        let day = &rows[0].1;
+        assert_eq!(day["dropped"], json!(["hr_zones", "workouts"]));
+        assert!(day.get("hr_zones").is_none());
+        assert!(day.get("workouts").is_none());
+        assert!(day.to_string().len() <= MAX_DAY_BYTES);
+    }
+}
+
+#[cfg(test)]
+mod more_family_tests {
+    use super::*;
+
+    fn paris() -> TimeZone {
+        TimeZone::get("Europe/Paris").unwrap()
+    }
+
+    /// The days the points of each type make, for 1 to 19 October 2026.
+    fn days_of(types: &[(&str, Vec<Value>)]) -> Vec<(String, Value)> {
+        let mut days = Days::new(paris());
+        for (data_type, points) in types {
+            days.add(data_type, points);
+        }
+        days.finish("2026-10-01".parse().unwrap(), "2026-10-20".parse().unwrap())
+            .into_iter()
+            .map(|(date, metrics)| (date, serde_json::from_str(&metrics).unwrap()))
+            .collect()
+    }
+
+    /// The one day of `rows`, which must have exactly one.
+    fn only(rows: Vec<(String, Value)>) -> Value {
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        rows.into_iter().next().unwrap().1
+    }
+
+    #[test]
+    fn samples_keep_their_range_average_and_count_and_skip_zero_heart_rates() {
+        let sample = |name: &str, field: &str, value: Value| {
+            json!({"name": name, field: {
+                "sampleTime": {"physicalTime": "2026-10-09T08:00:00Z"},
+                "beatsPerMinute": value}})
+        };
+        let heart = vec![
+            json!({"name": "h1", "heartRate": {
+                "sampleTime": {"physicalTime": "2026-10-09T08:00:00Z"}, "beatsPerMinute": "60"}}),
+            json!({"name": "h2", "heartRate": {
+                "sampleTime": {"physicalTime": "2026-10-09T08:01:00Z"}, "beatsPerMinute": 90}}),
+            // A zero is no reading.
+            sample("h3", "heartRate", json!(0)),
+        ];
+        let rows = days_of(&[
+            ("heart-rate", heart),
+            (
+                "heart-rate-variability",
+                vec![json!({"name": "v", "heartRateVariability": {
+                    "sampleTime": {"physicalTime": "2026-10-09T08:00:00Z"},
+                    "rootMeanSquareOfSuccessiveDifferencesMilliseconds": 42.5}})],
+            ),
+            (
+                "oxygen-saturation",
+                vec![json!({"name": "o", "oxygenSaturation": {
+                    "sampleTime": {"physicalTime": "2026-10-09T08:00:00Z"}, "percentage": 97.0}})],
+            ),
+            (
+                "respiratory-rate-sleep-summary",
+                vec![json!({"name": "r", "respiratoryRateSleepSummary": {
+                    "sampleTime": {"physicalTime": "2026-10-09T08:00:00Z"},
+                    "fullSleepStats": {"breathsPerMinute": 14}}})],
+            ),
+            (
+                "core-body-temperature",
+                vec![json!({"name": "t", "coreBodyTemperature": {
+                    "sampleTime": {"physicalTime": "2026-10-09T08:00:00Z"},
+                    "temperatureCelsius": 36.6}})],
+            ),
+            (
+                "blood-glucose",
+                vec![json!({"name": "g", "bloodGlucose": {
+                    "sampleTime": {"physicalTime": "2026-10-09T08:00:00Z"},
+                    "bloodGlucoseMilligramsPerDeciliter": 95}})],
+            ),
+        ]);
+        assert_eq!(
+            only(rows),
+            json!({
+                "heart_rate": {"min": 60.0, "avg": 75.0, "max": 90.0, "n": 2},
+                "hrv_ms": {"min": 42.5, "avg": 42.5, "max": 42.5, "n": 1},
+                "spo2_pct": {"min": 97.0, "avg": 97.0, "max": 97.0, "n": 1},
+                "resp_rate_sleep": {"min": 14.0, "avg": 14.0, "max": 14.0, "n": 1},
+                "core_temp_c": {"min": 36.6, "avg": 36.6, "max": 36.6, "n": 1},
+                "glucose_mgdl": {"min": 95.0, "avg": 95.0, "max": 95.0, "n": 1},
+            })
+        );
+    }
+
+    #[test]
+    fn activity_minutes_and_energy_by_level_and_period() {
+        let span = |start: &str, end: &str| json!({"startTime": start, "endTime": end});
+        let rows = days_of(&[
+            (
+                "activity-level",
+                vec![
+                    json!({"name": "a1", "activityLevel": {
+                        "interval": span("2026-10-09T08:00:00Z", "2026-10-09T08:30:00Z"),
+                        "activityLevelType": "LIGHTLY_ACTIVE"}}),
+                    json!({"name": "a2", "activityLevel": {
+                        "interval": span("2026-10-09T09:00:00Z", "2026-10-09T09:15:00Z"),
+                        "activityLevelType": "LIGHTLY_ACTIVE"}}),
+                    // A level Google might add in lower case is not kept.
+                    json!({"name": "a3", "activityLevel": {
+                        "interval": span("2026-10-09T10:00:00Z", "2026-10-09T10:05:00Z"),
+                        "activityLevelType": "lightly active"}}),
+                ],
+            ),
+            (
+                "sedentary-period",
+                vec![json!({"name": "s", "sedentaryPeriod": {
+                    "interval": span("2026-10-09T10:00:00Z", "2026-10-09T11:00:00Z")}})],
+            ),
+            (
+                "swim-lengths-data",
+                vec![
+                    json!({"name": "w1", "swimLengthsData": {
+                        "interval": span("2026-10-09T06:00:00Z", "2026-10-09T06:05:00Z"),
+                        "strokeCount": "20"}}),
+                    json!({"name": "w2", "swimLengthsData": {
+                        "interval": span("2026-10-09T06:05:00Z", "2026-10-09T06:10:00Z"),
+                        "strokeCount": 15}}),
+                    // The first length again, as a second page would bring it.
+                    json!({"name": "w1", "swimLengthsData": {
+                        "interval": span("2026-10-09T06:00:00Z", "2026-10-09T06:05:00Z"),
+                        "strokeCount": "20"}}),
+                ],
+            ),
+            (
+                "hydration-log",
+                vec![json!({"name": "hy", "hydrationLog": {
+                    "interval": span("2026-10-09T07:00:00Z", "2026-10-09T07:01:00Z"),
+                    "amountConsumed": {"milliliters": "250"}}})],
+            ),
+            (
+                "basal-energy-burned",
+                vec![json!({"name": "b", "basalEnergyBurned": {
+                    "interval": span("2026-10-09T00:00:00Z", "2026-10-09T23:59:00Z"),
+                    "kcal": 1500.5}})],
+            ),
+            (
+                "floors",
+                vec![json!({"name": "f", "floors": {
+                    "interval": span("2026-10-09T08:00:00Z", "2026-10-09T08:10:00Z"),
+                    "count": 3}})],
+            ),
+        ]);
+        assert_eq!(
+            only(rows),
+            json!({
+                "activity_level_min": {"LIGHTLY_ACTIVE": 45},
+                "sedentary_min": 60,
+                "swim": {"lengths": 2, "strokes": 35},
+                "hydration_ml": 250.0,
+                "basal_kcal": 1500.5,
+                "floors": 3,
+            })
+        );
+    }
+
+    #[test]
+    fn body_measurements_and_fitness_keep_the_latest_or_the_daily_summary() {
+        let at = |time: &str| json!({"physicalTime": time});
+        let rows = days_of(&[
+            (
+                "height",
+                vec![json!({"name": "ht", "height": {
+                    "sampleTime": at("2026-10-09T06:00:00Z"), "heightMillimeters": 1750}})],
+            ),
+            (
+                "vo2-max",
+                vec![json!({"name": "v", "vo2Max": {
+                    "sampleTime": at("2026-10-09T06:00:00Z"), "vo2Max": 45.678}})],
+            ),
+            (
+                "run-vo2-max",
+                vec![json!({"name": "rv", "runVo2Max": {
+                    "sampleTime": at("2026-10-09T06:00:00Z"), "runVo2Max": 50.0}})],
+            ),
+            (
+                "daily-vo2-max",
+                vec![json!({"name": "dv", "dailyVo2Max": {
+                    "date": "2026-10-09", "vo2Max": 44.44,
+                    "cardioFitnessLevel": "ABOVE_AVERAGE", "estimated": true}})],
+            ),
+            (
+                "daily-oxygen-saturation",
+                vec![json!({"name": "do", "dailyOxygenSaturation": {
+                    "date": "2026-10-09", "averagePercentage": 96.5,
+                    "lowerBoundPercentage": 92.0, "upperBoundPercentage": 99.0}})],
+            ),
+            (
+                "daily-respiratory-rate",
+                vec![json!({"name": "dr", "dailyRespiratoryRate": {
+                    "date": "2026-10-09", "breathsPerMinute": 14.0}})],
+            ),
+            (
+                "daily-sleep-temperature-derivations",
+                vec![json!({"name": "st", "dailySleepTemperatureDerivations": {
+                    "date": "2026-10-09", "nightlyTemperatureCelsius": 0.3,
+                    "baselineTemperatureCelsius": -0.1,
+                    "relativeNightlyStddev30dCelsius": 0.25}})],
+            ),
+            (
+                "daily-heart-rate-variability",
+                vec![json!({"name": "dh", "dailyHeartRateVariability": {
+                    "date": "2026-10-09",
+                    "averageHeartRateVariabilityMilliseconds": 40.0,
+                    "deepSleepRootMeanSquareOfSuccessiveDifferencesMilliseconds": 45.5,
+                    "nonRemHeartRateBeatsPerMinute": 55,
+                    "entropy": 1.23456}})],
+            ),
+        ]);
+        assert_eq!(
+            only(rows),
+            json!({
+                "height_cm": 175.0,
+                "vo2max": 45.7,
+                "run_vo2max": 50.0,
+                "vo2max_daily": {"value": 44.4, "level": "ABOVE_AVERAGE", "estimated": true},
+                "spo2_daily": {"avg": 96.5, "min": 92.0, "max": 99.0},
+                "resp_rate_daily": 14.0,
+                "sleep_temp": {"nightly_c": 0.3, "baseline_c": -0.1, "rel_stddev_30d_c": 0.25},
+                "hrv_daily": {"avg_ms": 40.0, "deep_rmssd_ms": 45.5, "non_rem_hr": 55.0, "entropy": 1.23},
+            })
+        );
+    }
+
+    #[test]
+    fn cycle_symptom_and_rhythm_records_are_counted_once_each() {
+        let at = |time: &str| json!({"physicalTime": time});
+        let rows = days_of(&[
+            (
+                "irregular-rhythm-notification",
+                vec![
+                    json!({"name": "i1", "irregularRhythmNotification": {
+                        "interval": {"startTime": "2026-10-09T08:00:00Z"}}}),
+                    json!({"name": "i2", "irregularRhythmNotification": {
+                        "interval": {"startTime": "2026-10-09T09:00:00Z"}}}),
+                ],
+            ),
+            (
+                "symptoms",
+                vec![
+                    json!({"name": "sy", "symptoms": {
+                        "sampleTime": at("2026-10-09T08:00:00Z"),
+                        "symptoms": ["CRAMPS", "headache"]}}),
+                    // The same record again, as a second page would bring it.
+                    json!({"name": "sy", "symptoms": {
+                        "sampleTime": at("2026-10-09T08:00:00Z"),
+                        "symptoms": ["CRAMPS", "headache"]}}),
+                ],
+            ),
+            (
+                "ovulation-test",
+                vec![json!({"name": "ov", "ovulationTest": {
+                    "sampleTime": at("2026-10-09T08:00:00Z"), "result": "POSITIVE"}})],
+            ),
+            (
+                "menstrual-period",
+                vec![json!({"name": "mp", "menstrualPeriod": {
+                    "interval": {"startTime": "2026-10-09T00:00:00Z"}}})],
+            ),
+        ]);
+        assert_eq!(
+            only(rows),
+            json!({
+                "irn": {"count": 2},
+                "symptoms": {"count": 1, "labels": {"CRAMPS": 1}},
+                "ovulation_tests": {"POSITIVE": 1},
+                "menstrual_period_started": 1,
+            })
+        );
+    }
+
+    #[test]
+    fn a_workout_keeps_its_distance_heart_rate_and_zone_minutes_when_given() {
+        let rows = days_of(&[(
+            "exercise",
+            vec![
+                json!({"name": "r1", "exercise": {
+                    "interval": {"startTime": "2026-10-09T08:00:00Z"},
+                    "activeDuration": "1200s", "displayName": "Ride",
+                    "metricsSummary": {
+                        "caloriesKcal": 200,
+                        "distanceMillimeters": 15200000,
+                        "averageHeartRateBeatsPerMinute": "140",
+                        "activeZoneMinutes": 20}}}),
+                // A heart rate of zero is not kept.
+                json!({"name": "r2", "exercise": {
+                    "interval": {"startTime": "2026-10-09T12:00:00Z"},
+                    "activeDuration": "60s",
+                    "metricsSummary": {"averageHeartRateBeatsPerMinute": 0}}}),
+            ],
+        )]);
+        assert_eq!(
+            only(rows)["workouts"],
+            json!([
+                {"type": "Ride", "minutes": 20, "kcal": 200.0, "distance_m": 15200.0,
+                 "avg_hr": 140, "zone_min": 20},
+                {"type": "Workout", "minutes": 1},
+            ])
+        );
+    }
+
+    #[test]
+    fn a_nap_is_marked_and_its_length_comes_from_the_interval_without_a_summary() {
+        let rows = days_of(&[(
+            "sleep",
+            vec![json!({"name": "nap", "sleep": {
+                "interval": {"startTime": "2026-10-09T13:00:00Z", "endTime": "2026-10-09T13:45:00Z"},
+                "metadata": {"nap": true},
+                "summary": {"stagesSummary": [{"type": "LIGHT", "minutes": 30}, {"type": "BAD"}]}}})],
+        )]);
+        assert_eq!(
+            only(rows)["sleep"],
+            json!([{
+                "minutes": 45,
+                "start": "2026-10-09T13:00:00Z",
+                "end": "2026-10-09T13:45:00Z",
+                "stages": [{"type": "LIGHT", "minutes": 30}],
+                "nap": true,
+            }])
+        );
+    }
+}
+
+#[cfg(test)]
+mod unknown_type_tests {
+    use super::*;
+
+    #[test]
+    fn a_day_ignores_a_type_it_does_not_know() {
+        let mut day = Day::default();
+        day.add("not-a-type", &json!({"count": 3}), &json!({"name": "p"}));
+        assert_eq!(day.to_json(), json!({}));
     }
 }

@@ -38,6 +38,16 @@ description: What athena does not do yet. Read this before exposing it.
   model or saves it, and the code is useless without the client secret. What
   `health_summary` returns is sent to the model provider and saved in the
   session. A bare code pasted without its URL is not recognised.
+  Athena asks for every read-only Google Health scope, including sensitive
+  ones (location, reproductive health, logged symptoms, mood, ECG, irregular
+  rhythm). Users can untick any on Google's consent screen, and that data is
+  then skipped. Stored points are plain rows in the database (only the
+  refresh token is encrypted), grow by gigabytes over years (minute-level
+  heart rate is about 525,000 rows a year), stay after
+  `/disconnect_health`, and are in `athena backup`. Users connected before
+  the extra scopes were added must `/connect_health` again. The OAuth app
+  needs Google's verification for sensitive scopes before it leaves
+  "Testing" status.
 
 - Daily brief: it is a scheduled agent turn like a reminder task. The agent
   has no cap on model calls per turn, and a scheduled turn still has the

@@ -33,7 +33,7 @@ mod user_skills;
 mod workouts;
 
 pub use brief::{Brief, BriefCandidate};
-pub use health::{Candidate, Claim, Connection as HealthConnection};
+pub use health::{Backfill, Candidate, Claim, Connection as HealthConnection, PointRow};
 pub use jobs::Due;
 
 /// One turn: the model calls it made and what they cost.
@@ -594,6 +594,41 @@ const MIGRATIONS: &[&str] = &[
          created_at      INTEGER NOT NULL,
          updated_at      INTEGER NOT NULL
      );",
+    // 16: every Google Health data point, as Google returned it. `value` is
+    // the data point's JSON, whole. `point_key` is Google's `name`, or a
+    // hash of the point when it has none, so a point fetched twice is one
+    // row. `start_ms` and `end_ms` are the point's instants (a sample has
+    // both the same; a daily summary starts at its date's local midnight);
+    // `civil_date` is the user's local day it belongs to. `source` is the
+    // platform and device. `health_backfill` is where the history fetch
+    // for each data type has got to: it works backwards one chunk of days
+    // per pass, `oldest_date` being the earliest day fetched so far, `done`
+    // once there is nothing older to look for. The rows outlive a
+    // disconnect.
+    "CREATE TABLE health_points (
+         id          INTEGER PRIMARY KEY,
+         user_id     INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+         data_type   TEXT NOT NULL,
+         point_key   TEXT NOT NULL,
+         start_ms    INTEGER,
+         end_ms      INTEGER,
+         civil_date  TEXT,
+         value       TEXT NOT NULL,
+         source      TEXT,
+         ingested_at INTEGER NOT NULL,
+         UNIQUE (user_id, data_type, point_key)
+     );
+     CREATE INDEX health_points_by_time ON health_points (user_id, data_type, start_ms);
+     CREATE TABLE health_backfill (
+         user_id     INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+         data_type   TEXT NOT NULL,
+         oldest_date TEXT NOT NULL,
+         done        INTEGER NOT NULL DEFAULT 0 CHECK (done IN (0, 1)),
+         empty_run   INTEGER NOT NULL DEFAULT 0,
+         last_error  TEXT,
+         updated_at  INTEGER NOT NULL,
+         PRIMARY KEY (user_id, data_type)
+     );",
 ];
 
 /// The schema version this build writes.
@@ -657,6 +692,33 @@ const EXPECTED_COLUMNS: &[(&str, &[&str])] = &[
             "last_error",
             "created_at",
             "updated_at",
+        ],
+    ),
+    (
+        "health_backfill",
+        &[
+            "user_id",
+            "data_type",
+            "oldest_date",
+            "done",
+            "empty_run",
+            "last_error",
+            "updated_at",
+        ],
+    ),
+    (
+        "health_points",
+        &[
+            "id",
+            "user_id",
+            "data_type",
+            "point_key",
+            "start_ms",
+            "end_ms",
+            "civil_date",
+            "value",
+            "source",
+            "ingested_at",
         ],
     ),
     (
@@ -1770,9 +1832,11 @@ mod tests {
                 "calorie_logs",
                 "compactions",
                 "daily_briefs",
+                "health_backfill",
                 "health_connections",
                 "health_daily",
                 "health_oauth_states",
+                "health_points",
                 "jobs",
                 "messages",
                 "rowing_results",

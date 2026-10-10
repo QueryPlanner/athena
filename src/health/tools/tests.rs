@@ -439,3 +439,147 @@ fn the_range_is_inclusive_of_today() {
         ("2026-10-10".to_string(), "2026-10-10".to_string())
     );
 }
+
+// ---- metrics, averages, the size cap ----
+
+#[test]
+fn asking_for_metrics_keeps_them_with_the_date_the_drop_note_and_their_omitted_counts() {
+    let rows = vec![(
+        "2026-10-09".to_string(),
+        json!({
+            "steps": 5,
+            "workouts": [{"type": "Run", "minutes": 30}],
+            "workouts_omitted": 2,
+            "dropped": ["hr_zones"],
+            "weight_kg": 80.0,
+        })
+        .to_string(),
+    )];
+    let out = summarize_metrics(&rows, &["workouts".to_string()]);
+    assert_eq!(
+        out["days"],
+        json!([{
+            "date": "2026-10-09",
+            "workouts": [{"type": "Run", "minutes": 30}],
+            "workouts_omitted": 2,
+            "dropped": ["hr_zones"],
+        }])
+    );
+}
+
+#[test]
+fn the_metrics_enum_names_what_a_day_can_carry() {
+    // Every key a day can carry is a name the model may ask for.
+    assert!(METRICS.contains(&"sleep_min"));
+    assert!(METRICS.contains(&"workouts"));
+    assert!(
+        !METRICS.contains(&"hr_zones"),
+        "a dropped day key is not a metric"
+    );
+    assert_eq!(METRICS.len(), 40);
+}
+
+#[test]
+fn averages_are_over_the_days_that_have_the_value_and_rounded_to_a_tenth() {
+    let rows = vec![
+        ("2026-10-08".to_string(), json!({"steps": 100}).to_string()),
+        (
+            "2026-10-09".to_string(),
+            json!({"steps": 201, "heart_rate": {"min": 50, "avg": 70.25, "max": 150, "n": 9}})
+                .to_string(),
+        ),
+        (
+            "2026-10-10".to_string(),
+            json!({"active_min": 30}).to_string(),
+        ),
+    ];
+    let out = summarize(&rows);
+    assert_eq!(
+        out["averages"]["steps"],
+        json!({"average": 150.5, "days_with_data": 2})
+    );
+    assert_eq!(
+        out["averages"]["active_min"],
+        json!({"average": 30.0, "days_with_data": 1})
+    );
+    assert_eq!(
+        out["averages"]["heart_rate_avg"],
+        json!({"average": 70.3, "days_with_data": 1})
+    );
+    assert!(out["averages"].get("resting_hr").is_none());
+}
+
+#[test]
+fn distance_is_shown_in_kilometres_to_two_places() {
+    let rows = vec![(
+        "2026-10-09".to_string(),
+        json!({"distance_m": 6543.2, "hr_zones": [{"type": "X"}]}).to_string(),
+    )];
+    let day = &summarize(&rows)["days"][0];
+    assert_eq!(day["distance_km"], 6.54);
+    assert!(day.get("distance_m").is_none());
+    // The heart-rate zone limits are not sent to the model.
+    assert!(day.get("hr_zones").is_none());
+}
+
+#[test]
+fn over_the_size_cap_the_oldest_days_are_left_out_and_counted() {
+    let big = json!({"note": "x".repeat(3500)}).to_string();
+    let rows: Vec<(String, String)> = (1..=30)
+        .map(|d| (format!("2026-10-{d:02}"), big.clone()))
+        .collect();
+    let out = summarize(&rows);
+    let kept = out["days"].as_array().unwrap();
+    let cut = out["truncated_days"].as_u64().unwrap() as usize;
+    assert!(cut > 0);
+    assert_eq!(kept.len() + cut, 30);
+    assert!(out.to_string().len() <= SUMMARY_BYTES);
+    // The newest days are the ones kept.
+    assert_eq!(kept.last().unwrap()["date"], "2026-10-30");
+    assert_eq!(kept[0]["date"], format!("2026-10-{:02}", cut + 1));
+}
+
+#[test]
+fn thirty_maximal_days_stay_under_the_result_limit_after_summarising() {
+    // A day is at most 4 KiB when stored (see normalize); 30 of them, asked
+    // for in full, must still fit the tool result the agent may return.
+    let full =
+        json!({"note": "x".repeat(crate::health::normalize::MAX_DAY_BYTES - 40)}).to_string();
+    let rows: Vec<(String, String)> = (1..=30)
+        .map(|d| (format!("2026-10-{d:02}"), full.clone()))
+        .collect();
+    let out = summarize_metrics(&rows, &[]);
+    assert!(out.to_string().len() <= crate::policy::MAX_RESULT_BYTES);
+    assert!(out.to_string().len() <= SUMMARY_BYTES);
+}
+
+#[test]
+fn summary_arguments_refuse_fields_they_do_not_name() {
+    let ok: SummaryArgs = serde_json::from_value(json!({"days": 3, "metrics": ["steps"]})).unwrap();
+    assert_eq!(ok.days, Some(3));
+    assert!(serde_json::from_value::<SummaryArgs>(json!({"days": 3, "bogus": true})).is_err());
+    assert!(serde_json::from_value::<SummaryArgs>(json!({"day": 3})).is_err());
+}
+
+#[tokio::test]
+async fn an_unknown_metric_is_refused_and_the_error_lists_the_names() {
+    let r = rig().await;
+    r.connect().await;
+    let got = r
+        .configured(&[("health_summary", json!({"metrics": ["steps", "nope"]}))])
+        .await;
+    let text = got[0].as_str().unwrap();
+    assert!(text.contains("unknown metric `nope`"), "{text}");
+    assert!(text.contains("steps, floors"), "{text}");
+}
+
+#[test]
+fn the_scopes_are_ten_distinct_read_only_google_health_scopes() {
+    let mut unique: Vec<&str> = crate::health::SCOPES.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), 10);
+    assert!(crate::health::SCOPES.iter().all(|s| {
+        s.starts_with("https://www.googleapis.com/auth/googlehealth.") && s.ends_with(".readonly")
+    }));
+}

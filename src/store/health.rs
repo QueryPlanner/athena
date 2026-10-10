@@ -46,6 +46,31 @@ pub struct Candidate {
     pub failed: bool,
 }
 
+/// One Google Health data point to store: Google's JSON, whole, and what
+/// is needed to find it again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PointRow {
+    pub key: String,
+    pub start_ms: Option<i64>,
+    pub end_ms: Option<i64>,
+    /// The user's local day, `YYYY-MM-DD`.
+    pub civil_date: Option<String>,
+    pub value: String,
+    pub source: Option<String>,
+}
+
+/// How far the history fetch of one data type has got.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Backfill {
+    pub data_type: String,
+    /// The earliest local day fetched so far, `YYYY-MM-DD`.
+    pub oldest: String,
+    /// Nothing older is looked for.
+    pub done: bool,
+    /// Chunks in a row that held no data.
+    pub empty_run: i64,
+}
+
 /// What claiming a manual sync came to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Claim {
@@ -105,7 +130,9 @@ impl Store {
         scopes: &str,
         now: Timestamp,
     ) -> Result<()> {
-        self.db().execute(
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             "INSERT INTO health_connections
                  (user_id, encrypted_refresh_token, scopes, status, connected_at, updated_at)
              VALUES (?1, ?2, ?3, 'connected', ?4, ?4)
@@ -115,6 +142,10 @@ impl Store {
                  updated_at = ?4",
             params![owner, token, scopes, ms(now)],
         )?;
+        // New scopes may open data types that were refused: look for history
+        // again from the start. Stored points are not duplicated by that.
+        tx.execute("DELETE FROM health_backfill WHERE user_id = ?1", [owner])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -324,6 +355,96 @@ impl Store {
         }
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Store `rows` of `data_type` in one transaction. A point already
+    /// stored (same key) is updated only if Google's version differs, so
+    /// re-reading the recent window does not rewrite the table. Returns the
+    /// number of rows inserted or changed.
+    pub fn health_points_put(
+        &self,
+        owner: i64,
+        data_type: &str,
+        rows: &[PointRow],
+        now: Timestamp,
+    ) -> Result<usize> {
+        let mut db = self.db();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut changed = 0;
+        {
+            let mut put = tx.prepare_cached(
+                "INSERT INTO health_points
+                     (user_id, data_type, point_key, start_ms, end_ms, civil_date, value,
+                      source, ingested_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT (user_id, data_type, point_key) DO UPDATE SET
+                     start_ms = excluded.start_ms, end_ms = excluded.end_ms,
+                     civil_date = excluded.civil_date, value = excluded.value,
+                     source = excluded.source, ingested_at = excluded.ingested_at
+                 WHERE health_points.value IS NOT excluded.value",
+            )?;
+            for row in rows {
+                changed += put.execute(params![
+                    owner,
+                    data_type,
+                    row.key,
+                    row.start_ms,
+                    row.end_ms,
+                    row.civil_date,
+                    row.value,
+                    row.source,
+                    ms(now),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Where the history fetch of each data type has got to for `owner`.
+    pub fn health_backfill(&self, owner: i64) -> Result<Vec<Backfill>> {
+        let db = self.db();
+        let mut q = db.prepare(
+            "SELECT data_type, oldest_date, done, empty_run FROM health_backfill
+             WHERE user_id = ?1",
+        )?;
+        let rows = q.query_map([owner], |r| {
+            Ok(Backfill {
+                data_type: r.get(0)?,
+                oldest: r.get(1)?,
+                done: r.get::<_, i64>(2)? == 1,
+                empty_run: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Record how far the history fetch of `progress.data_type` has got.
+    /// `error` is why it stopped early, if it did.
+    pub fn health_backfill_save(
+        &self,
+        owner: i64,
+        progress: &Backfill,
+        error: Option<&str>,
+        now: Timestamp,
+    ) -> Result<()> {
+        self.db().execute(
+            "INSERT INTO health_backfill
+                 (user_id, data_type, oldest_date, done, empty_run, last_error, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (user_id, data_type) DO UPDATE SET
+                 oldest_date = ?3, done = ?4, empty_run = ?5, last_error = ?6, updated_at = ?7",
+            params![
+                owner,
+                progress.data_type,
+                progress.oldest,
+                progress.done as i64,
+                progress.empty_run,
+                error.map(short),
+                ms(now)
+            ],
+        )?;
+        Ok(())
     }
 
     /// The synced days from `start` to `end` inclusive, oldest first, as
@@ -656,5 +777,221 @@ mod tests {
             .unwrap();
         let err = store.health_connection(owner).unwrap_err().to_string();
         assert!(err.contains("out of range"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod points_and_backfill_tests {
+    use super::*;
+
+    fn at(s: &str) -> Timestamp {
+        s.parse().unwrap()
+    }
+
+    fn setup() -> (Store, i64) {
+        let store = Store::open_in_memory().unwrap();
+        let owner = store.user("telegram", "7").unwrap().id();
+        (store, owner)
+    }
+
+    const NOW: &str = "2026-10-10T10:00:00Z";
+    const LATER: &str = "2026-10-11T10:00:00Z";
+
+    fn point(key: &str, value: &str) -> PointRow {
+        PointRow {
+            key: key.into(),
+            start_ms: Some(1),
+            end_ms: Some(2),
+            civil_date: Some("2026-10-09".into()),
+            value: value.into(),
+            source: None,
+        }
+    }
+
+    /// `(point_key, value, ingested_at)` of every stored point of `data_type`.
+    fn stored(store: &Store, data_type: &str) -> Vec<(String, String, i64)> {
+        store
+            .db_for_tests()
+            .prepare(
+                "SELECT point_key, value, ingested_at FROM health_points
+                 WHERE data_type = ?1 ORDER BY point_key",
+            )
+            .unwrap()
+            .query_map([data_type], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn storing_the_same_points_twice_changes_nothing_and_keeps_their_time() {
+        let (store, owner) = setup();
+        let rows = [point("a", "{}"), point("b", r#"{"x":1}"#)];
+        assert_eq!(
+            store
+                .health_points_put(owner, "steps", &rows, at(NOW))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .health_points_put(owner, "steps", &rows, at(LATER))
+                .unwrap(),
+            0
+        );
+        let now = at(NOW).as_millisecond();
+        assert_eq!(
+            stored(&store, "steps"),
+            [
+                ("a".to_string(), "{}".to_string(), now),
+                ("b".to_string(), r#"{"x":1}"#.to_string(), now),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_changed_point_is_updated_and_only_that_one() {
+        let (store, owner) = setup();
+        store
+            .health_points_put(
+                owner,
+                "steps",
+                &[point("a", "{}"), point("b", "{}")],
+                at(NOW),
+            )
+            .unwrap();
+        let changed = [point("a", r#"{"v":2}"#), point("b", "{}")];
+        assert_eq!(
+            store
+                .health_points_put(owner, "steps", &changed, at(LATER))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            stored(&store, "steps"),
+            [
+                (
+                    "a".to_string(),
+                    r#"{"v":2}"#.to_string(),
+                    at(LATER).as_millisecond()
+                ),
+                ("b".to_string(), "{}".to_string(), at(NOW).as_millisecond()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_point_key_is_unique_per_user_and_data_type() {
+        let (store, owner) = setup();
+        let other = store.user("telegram", "8").unwrap().id();
+        let rows = [point("a", "{}")];
+        assert_eq!(
+            store
+                .health_points_put(owner, "steps", &rows, at(NOW))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .health_points_put(owner, "weight", &rows, at(NOW))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .health_points_put(other, "steps", &rows, at(NOW))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .health_points_put(owner, "steps", &[], at(NOW))
+                .unwrap(),
+            0
+        );
+        // `stored` reads every user's rows: one steps row each, and one weight row.
+        assert_eq!(stored(&store, "steps").len(), 2);
+        assert_eq!(stored(&store, "weight").len(), 1);
+    }
+
+    #[test]
+    fn stored_points_outlive_a_disconnect() {
+        let (store, owner) = setup();
+        store.health_connect(owner, b"t", "s", at(NOW)).unwrap();
+        store
+            .health_points_put(owner, "steps", &[point("a", "{}")], at(NOW))
+            .unwrap();
+        store.health_disconnect(owner).unwrap();
+        assert_eq!(stored(&store, "steps").len(), 1);
+    }
+
+    #[test]
+    fn the_history_cursor_of_each_type_is_saved_and_read_back() {
+        let (store, owner) = setup();
+        assert!(store.health_backfill(owner).unwrap().is_empty());
+        let mut progress = Backfill {
+            data_type: "steps".into(),
+            oldest: "2026-09-27".into(),
+            done: false,
+            empty_run: 2,
+        };
+        store
+            .health_backfill_save(owner, &progress, None, at(NOW))
+            .unwrap();
+        assert_eq!(store.health_backfill(owner).unwrap(), [progress.clone()]);
+
+        // A later chunk moves the cursor; a failure is kept, cut to 200 characters.
+        progress.oldest = "2026-09-20".into();
+        progress.empty_run = 0;
+        progress.done = true;
+        let long = "e".repeat(300);
+        store
+            .health_backfill_save(owner, &progress, Some(&long), at(LATER))
+            .unwrap();
+        assert_eq!(store.health_backfill(owner).unwrap(), [progress.clone()]);
+        let kept: String = store
+            .db_for_tests()
+            .query_row(
+                "SELECT last_error FROM health_backfill WHERE user_id = ?1",
+                [owner],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept.len(), ERROR_CHARS);
+
+        // A clean save clears the error.
+        store
+            .health_backfill_save(owner, &progress, None, at(LATER))
+            .unwrap();
+        let cleared: Option<String> = store
+            .db_for_tests()
+            .query_row(
+                "SELECT last_error FROM health_backfill WHERE user_id = ?1",
+                [owner],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cleared, None);
+    }
+
+    #[test]
+    fn reconnecting_starts_the_history_fetch_again() {
+        let (store, owner) = setup();
+        let other = store.user("telegram", "8").unwrap().id();
+        let progress = Backfill {
+            data_type: "sleep".into(),
+            oldest: "2025-01-01".into(),
+            done: true,
+            empty_run: 0,
+        };
+        for id in [owner, other] {
+            store
+                .health_backfill_save(id, &progress, None, at(NOW))
+                .unwrap();
+        }
+        store.health_connect(owner, b"t", "s", at(LATER)).unwrap();
+        assert!(store.health_backfill(owner).unwrap().is_empty());
+        // Another user's cursor is not touched.
+        assert_eq!(store.health_backfill(other).unwrap(), [progress]);
     }
 }
