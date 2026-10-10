@@ -810,3 +810,75 @@ async fn schema_10_gains_workouts_without_changing_a_row() {
         0
     );
 }
+
+/// Migration 12 only adds `jobs`. Every row of every earlier table,
+/// workouts included, survives; a migrated Telegram user can schedule a
+/// reminder, which runs at their stored zone's wall-clock time; a turn still
+/// appends.
+#[tokio::test]
+async fn schema_11_gains_jobs_without_changing_a_row() {
+    const TABLES: [&str; 15] = [
+        "users",
+        "user_identities",
+        "sessions",
+        "messages",
+        "runs",
+        "selected_sessions",
+        "sandboxes",
+        "browser_links",
+        "browser_states",
+        "compactions",
+        "calorie_logs",
+        "user_settings",
+        "workout_sessions",
+        "workout_sets",
+        "rowing_results",
+    ];
+    let tmp = from_fixture(include_str!("fixtures/v11_workouts.sql"));
+    let before: Vec<_> = TABLES.iter().map(|t| dump(&tmp.raw(), t)).collect();
+    assert_eq!(user_version(&tmp.raw()), 11);
+    let sizes: Vec<usize> = before.iter().map(Vec::len).collect();
+    assert_eq!(sizes, [3, 4, 6, 14, 3, 1, 1, 1, 1, 1, 3, 1, 2, 4, 1]);
+
+    let (service, _) = tmp.service();
+    let db = tmp.raw();
+    assert_eq!(user_version(&db), store::SCHEMA_VERSION as i64);
+    assert_eq!(store::SCHEMA_VERSION, 12);
+    let after: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
+    assert_eq!(after, before);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM jobs"), 0);
+
+    // telegram:111111 keeps Europe/London: 09:00 there is 08:00 UTC in summer.
+    let store = tmp.open();
+    let owner = store.user("telegram", "111111").unwrap().id();
+    let args: athena::reminders::Create = serde_json::from_value(serde_json::json!({
+        "kind": "notify", "text": "stretch", "repeat": "daily", "time": "09:00"
+    }))
+    .unwrap();
+    let now: jiff::Timestamp = "2026-07-01T12:00:00Z".parse().unwrap();
+    let shown = store.create_reminder(owner, "s", &args, now).unwrap();
+    assert_eq!(shown["next_run"]["datetime"], "2026-07-02T09:00+01:00");
+    assert_eq!(shown["next_run"]["timezone"], "Europe/London");
+    // cli:local has no Telegram chat to deliver to.
+    let cli = store.user("cli", "local").unwrap().id();
+    let refused = store.create_reminder(cli, "s", &args, now).unwrap_err();
+    assert!(refused.to_string().contains("Telegram"), "{refused}");
+
+    let user = service.user("telegram", "111111").await.unwrap();
+    let notes = store.selected_session(&user).unwrap().unwrap();
+    let (agent, _) = mock_agent(&service, [MockTurn::text("noted")]);
+    service
+        .send(&agent, &user, &notes.id, "hello")
+        .await
+        .unwrap();
+    let now: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
+    for ((table, old), new) in TABLES.iter().zip(&before).zip(&now) {
+        assert_eq!(&new[..old.len()], &old[..], "{table}");
+    }
+    assert_eq!(runs(&db, &notes.id), [run_row(0, 1, 1, "ok")]);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM jobs"), 1);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check"),
+        0
+    );
+}

@@ -83,7 +83,7 @@ Claude Code and Claude Desktop use (`src/mcp.rs`).
   A server that fails is a warning; its tools are missing.
 - One connection per server serves every user and session of the process.
 - A tool keeps its server's name. A name that a built-in tool
-  (`agent::reserved_tool_names`: `add`, `read_skill`, `web_search`, the calorie tools, the workout tools, `now`, `timezone_set`, the sandbox tools) or an earlier server (name order) has, that
+  (`agent::reserved_tool_names`: `add`, `read_skill`, `web_search`, the calorie tools, the workout tools, `now`, `timezone_set`, the reminder tools, the sandbox tools) or an earlier server (name order) has, that
   is not 1 to 64 of `[A-Za-z0-9_-]`, or an input schema that is not of type
   object, is skipped with a warning, as are a server's tools past the first
   `MAX_TOOLS_PER_SERVER`. Descriptions are cut to `MAX_DESCRIPTION_BYTES`.
@@ -292,6 +292,90 @@ sessions, limit 10 by default and at most 20. Corrections replace a session's
 sets and piece; missing, deleted and stale sessions share one conflict
 message; removal keeps the key and does not resurrect on retry. No env var,
 route or authentication change.
+
+## Scheduler and reminders
+
+Schema migration 12 adds `jobs(id, user_id, kind, payload, next_run_at,
+recurrence, status, lease_until, attempts, sent_at, last_error, created_at,
+updated_at, confirm_code, confirm_session, confirm_expires_at)`, `user_id` a
+foreign key to `users.id`, times in UTC milliseconds, with indexes
+`jobs_due (status, next_run_at)` and `jobs_by_owner (user_id, status)`. `kind`
+(`notify`, `agent_task`) and `status` (`pending`, `active`, `done`,
+`cancelled`, `failed`) are checked in Rust, not
+by a CHECK, so a later kind (system jobs) needs no table rebuild; a kind
+this build does not know is marked failed when claimed. `recurrence` is NULL
+(once), `daily@HH:MM` or `weekly:mon,wed@HH:MM`. `next_run_at` stays an
+occurrence's due time while it is retried or deferred; `lease_until` is when
+the row may be claimed again. `sent_at` is the last run that was delivered
+or started, kept after the row ends.
+
+Native tools, registered with the calorie and time tools and reserved the
+same way; the owner comes from the host's `runner::Conversation`:
+
+| Tool | Arguments | Result |
+|---|---|---|
+| `reminder_create` | `kind`, `text`, `repeat` (`once` default, `daily`, `weekly`); once: exactly one of `at` (local `YYYY-MM-DDTHH:MM`) or `in_minutes`; daily: `time` (`HH:MM`); weekly: `time` and `weekdays` (`mon`..`sun`) | the reminder: `id`, `kind`, `text`, `repeat`, `status`, `last_error`, `next_run {datetime, weekday, timezone}` on the user's clock; for an `agent_task` also `confirmation_code` and `next_step` |
+| `reminder_confirm` | `id`, `code` | the task, now `active`, with `"confirmed": true` |
+| `reminder_list` | none | `{"active": [...], "awaiting_confirmation": [...], "failed": [...]}`: active soonest first, tasks whose code still works, failed in the last 7 days |
+| `reminder_cancel` | `id` | `{"cancelled": id}`, for an active or pending reminder; any other id is an error |
+
+Confirmation: a `notify` is `active` at once. An `agent_task` runs a prompt
+with the user's authority, so `reminder_create` stores it `pending` (never
+claimed) with a fresh 8-character code (`A-Z` and `2-9` without `O`, `I`,
+`0`, `1`), bound to the user, the session it was created in and that task's
+id, expiring after 10 minutes (`reminders::CONFIRM_WINDOW`). It returns the
+preview: the whole text, the schedule and the code. `reminder_confirm`
+activates it only if the run's `runner::UserText`, the text the user sent
+to start this turn, contains the code and the id as whole words (any case,
+`#12` and `12` alike), in the same session, before expiry; the code then
+stops working. A one-off whose time passed meanwhile is refused; a repeat
+moves to its next run. `runner::UserText` is the same type as the per-user
+skills PR (#42) adds to the tool context: `runner::tool_context(conversation,
+text, outbox)` inserts it, from `Request::user_text()`, which is empty for a
+turn the scheduler starts (`Request::scheduled`), so a scheduled task can
+never confirm one.
+
+Times are the user's wall clock (`Store::timezone`). A one-off is stored as
+the instant it names; a local time a daylight-saving change skips is
+refused, one that happens twice is its first occurrence. A repeat's next run
+is computed in the user's zone when the previous one ends, as the first
+occurrence strictly after now (a skipped time runs an hour later, a doubled
+one once); `timezone_set` recomputes the user's active repeats. Missed runs
+are not made up: a run more than 5 minutes late is sent once with a
+"(late)" note, then the repeat waits for its next time.
+
+Limits per user (pending tasks whose code still works count as active): 50
+active reminders, 10 of them `agent_task`; 100 created in
+any 24 hours (cancelled ones count); text 1000 bytes (`notify`) or 2000
+(`agent_task`), nonblank, no control characters but line breaks; first run in
+the future and at most 366 days ahead. At most 20 `agent_task` runs start in
+any 24 hours (counted from `sent_at`, whatever became of the reminder); past
+that a run is skipped and the user told. The repeats on offer are daily at
+the shortest, so one task runs at most once a day (23 hours apart on a
+clock-change day). Only users with a Telegram identity can create reminders.
+
+Delivery: only `athena telegram` runs the scheduler (`athena serve` and the
+CLI only create rows), so **staging runs reminders only if `staging.env` has
+its own `TELEGRAM_BOT_TOKEN`**. Every 30 s it leases up to 20 due rows for
+10 minutes and runs each in its own task. The chat is the owner's Telegram
+user id (`user_identities`, transport `telegram`, oldest first); a user
+without one fails the job.
+
+- `notify` sends `Reminder: <text>`; the run is recorded right after
+  Telegram accepts it (at-least-once: a crash between the two repeats it).
+- `agent_task` runs `<text>` as a turn in the user's currently selected
+  session, through `Service` (session lock) and the bot's one-turn-per-user
+  slot, at most 4 at once across users, and sends the reply as any turn's.
+  If the user is mid-turn it waits a minute at a time, and is skipped once
+  it is 30 minutes late. The run is recorded before the turn (at-most-once:
+  a paid turn never runs twice; a crash mid-turn loses it). While it runs,
+  the user's own messages get the usual "still working" reply.
+- Telegram refusing for good (blocked, deactivated, chat not found, any
+  `Forbidden`) fails the job, including a repeating task whose reply cannot
+  be delivered. Other send failures retry after 1, 2, 4 and 8 minutes, then
+  fail.
+- SIGINT or SIGTERM stops claiming when it stops polling (or when polling
+  ends for any other reason); jobs already started finish before exit.
 
 ## Compaction
 

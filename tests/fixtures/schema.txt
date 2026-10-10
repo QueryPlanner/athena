@@ -1,4 +1,4 @@
-user_version 11
+user_version 12
 
 table browser_links
   token TEXT NOT NULL PK1
@@ -45,6 +45,27 @@ table compactions
   created_at INTEGER NOT NULL
   foreign key session_id REFERENCES sessions (id)
   unique index (session_id, through_seq) from pk
+
+table jobs
+  id INTEGER PK1
+  user_id INTEGER NOT NULL
+  kind TEXT NOT NULL
+  payload TEXT NOT NULL
+  next_run_at INTEGER NOT NULL
+  recurrence TEXT
+  status TEXT NOT NULL
+  lease_until INTEGER
+  attempts INTEGER NOT NULL DEFAULT 0
+  sent_at INTEGER
+  last_error TEXT
+  created_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL
+  confirm_code TEXT
+  confirm_session TEXT
+  confirm_expires_at INTEGER
+  foreign key user_id REFERENCES users (id)
+  index jobs_by_owner (user_id, status) from c
+  index jobs_due (status, next_run_at) from c
 
 table messages
   session_id TEXT NOT NULL PK1

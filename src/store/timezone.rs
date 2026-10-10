@@ -32,7 +32,8 @@ impl Store {
 
     /// Store `name` as the user's time zone. Returns the name it replaced
     /// (the default if they had none) and the zone now in force, under its
-    /// database name. An invalid name writes nothing.
+    /// database name. An invalid name writes nothing. The user's repeating
+    /// reminders next run at their time of day in the new zone.
     pub fn set_timezone(&self, owner: i64, name: &str) -> Result<(String, TimeZone)> {
         let zone = timezone::parse(name)?;
         let mut db = self.db();
@@ -43,6 +44,8 @@ impl Store {
              ON CONFLICT (user_id) DO UPDATE SET timezone = ?2, updated_at = ?3",
             params![owner, timezone::name(&zone), now_millis()],
         )?;
+        // Repeating reminders keep their wall-clock time in the new zone.
+        Store::reschedule(&tx, owner, &zone, Timestamp::now())?;
         tx.commit()?;
         Ok((previous, zone))
     }

@@ -25,8 +25,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod calories;
+mod jobs;
 mod timezone;
 mod workouts;
+
+pub use jobs::Due;
 
 /// One turn: the model calls it made and what they cost.
 ///
@@ -464,6 +467,36 @@ const MIGRATIONS: &[&str] = &[
          distance_m INTEGER NOT NULL DEFAULT 2000 CHECK (distance_m BETWEEN 100 AND 100000),
          time_ms INTEGER NOT NULL CHECK (time_ms > 0)
      );",
+    // 12: scheduled work: reminders now, system jobs later. `kind` and
+    // `status` are checked in Rust, not by a CHECK, so a later kind needs no
+    // table rebuild. Times are UTC milliseconds. `next_run_at` stays the
+    // occurrence's due time while it is retried or deferred; `lease_until`
+    // is when the row may be claimed again. `sent_at` is the last delivered
+    // run, kept after the row is done or cancelled: it is what the daily
+    // cap on `agent_task` runs counts. An `agent_task` starts `pending`,
+    // never claimed, until the user's own message confirms it: the
+    // `confirm_*` columns hold the code they must send, the session it was
+    // shown in and when it expires, and are cleared once it is confirmed.
+    "CREATE TABLE jobs (
+         id          INTEGER PRIMARY KEY AUTOINCREMENT,
+         user_id     INTEGER NOT NULL REFERENCES users (id),
+         kind        TEXT NOT NULL,
+         payload     TEXT NOT NULL,
+         next_run_at INTEGER NOT NULL,
+         recurrence  TEXT,
+         status      TEXT NOT NULL,
+         lease_until INTEGER,
+         attempts    INTEGER NOT NULL DEFAULT 0,
+         sent_at     INTEGER,
+         last_error  TEXT,
+         created_at  INTEGER NOT NULL,
+         updated_at  INTEGER NOT NULL,
+         confirm_code       TEXT,
+         confirm_session    TEXT,
+         confirm_expires_at INTEGER
+     );
+     CREATE INDEX jobs_due ON jobs (status, next_run_at);
+     CREATE INDEX jobs_by_owner ON jobs (user_id, status);",
 ];
 
 /// The schema version this build writes.
@@ -514,6 +547,27 @@ const EXPECTED_COLUMNS: &[(&str, &[&str])] = &[
             "created_at",
             "updated_at",
             "deleted_at",
+        ],
+    ),
+    (
+        "jobs",
+        &[
+            "id",
+            "user_id",
+            "kind",
+            "payload",
+            "next_run_at",
+            "recurrence",
+            "status",
+            "lease_until",
+            "attempts",
+            "sent_at",
+            "last_error",
+            "created_at",
+            "updated_at",
+            "confirm_code",
+            "confirm_session",
+            "confirm_expires_at",
         ],
     ),
     ("messages", &["session_id", "seq", "json"]),
@@ -1554,6 +1608,7 @@ mod tests {
                 "browser_states",
                 "calorie_logs",
                 "compactions",
+                "jobs",
                 "messages",
                 "rowing_results",
                 "runs",

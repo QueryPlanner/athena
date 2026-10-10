@@ -355,6 +355,14 @@ throwaway database.
    an audio file. Each is answered as if typed; `/sessions` counts two more
    messages for each. This is the one check that real Telegram audio
    formats are accepted by Cloudflare; the tests use a fake.
+8c. Send `Remind me in 1 minute to stretch.` The reply names a local time a
+   minute ahead; a minute or so later `Reminder: stretch` arrives. Send
+   `Every day at <a minute from now> tell me a fun fact.` (an agent task):
+   the reply shows the task and a code and schedules nothing. Send `yes` (no
+   code): it is still not scheduled. Send `confirm #<id> <code>`: it is. At
+   that time a fun fact arrives, and `/sessions` counts two more messages in
+   the current session. Ask `What reminders do I have?`, then cancel the
+   daily one.
 9. Press Ctrl-C, start the bot again, send `/sessions`: `default` is still
    marked. `/usage` lists both sessions.
 10. Add the bot to a group and send a message there: the bot says nothing,

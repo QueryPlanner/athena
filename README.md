@@ -21,8 +21,8 @@ Edit `src/agent.rs`. That is the only file that changes.
     }
 
 `configure_with` defines the agent without persistent tools (`configure` also
-omits sandbox tools). `configure_persistent` adds native calorie, workout and
-time tools (and `web_search` when given a `WebSearch`) using
+omits sandbox tools). `configure_persistent` adds native calorie, workout,
+time and reminder tools (and `web_search` when given a `WebSearch`) using
 the supplied `Store`. Production wraps it around the OpenRouter client;
 tests can wrap it around Rig's mock model. Give the builder conversation
 memory first (`builder.memory(service.memory())`) and use the same store for
@@ -356,13 +356,44 @@ kept from MCP tools.
 On the VM, a human adds `EXA_API_KEY=...` to `/etc/athena/<env>.env` with
 `sudoedit` and restarts the units.
 
+## Reminders
+
+Persistent agents also expose `reminder_create`, `reminder_confirm`,
+`reminder_list` and `reminder_cancel`, acting for the user behind the current session. A reminder
+is one of two kinds:
+
+- `notify`: at the time, the bot sends you the text ("Reminder: water the
+  plants").
+- `agent_task`: at the time, the agent runs the text as a task in your
+  current Telegram session ("every morning at 7:30, summarise the news") and
+  sends you its reply, as if you had asked then. Because it acts with your
+  authority, it is only scheduled once you confirm it: the agent shows you
+  the whole task, when it runs and a code, and you reply `confirm #<id>
+  <code>` within 10 minutes (`reminder_confirm` checks your own message for
+  both). A page or file the agent reads cannot schedule one.
+
+A reminder runs once (at a local date and time, or in N minutes), daily at a
+time, or weekly on given weekdays at a time, on your wall clock: it keeps its
+time across daylight saving and follows `timezone_set`. The preamble tells the
+agent to call `now` first, turn "tomorrow at 9" into a local time, and repeat
+the scheduled time back to you.
+
+Reminders are delivered in Telegram by `athena telegram`, which checks for due
+ones every 30 seconds; `athena serve` never sends them. A late run (the bot was
+down) is sent once, marked late; missed repeats are not made up. If you are
+mid-conversation when a task falls due, it waits for you, for up to 30
+minutes. If you block the bot, your reminders stop. Limits: 50 active
+reminders, 10 of them tasks, and 20 task runs a day. The full contract is in
+`plans/contracts.md`, "Scheduler and reminders".
+
 ## Sandbox and browser tools
 
 Tools that touch a computer run in a sandbox on an
 [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) server, never
-on the machine running athena. Native calorie, workout and time tools access only
-Athena’s SQLite store. Other host tools are `add`, `web_search` (see "Web
-search") and the tools of the MCP servers you list (see "Tools from MCP servers").
+on the machine running athena. Native calorie, workout, time and reminder
+tools access only Athena’s SQLite store. Other host tools are `add`,
+`web_search` (see "Web search") and the tools of the MCP servers you list
+(see "Tools from MCP servers").
 
 | Tool | What it does |
 |---|---|
@@ -663,7 +694,10 @@ Caddy or Tailscale settings, and never overwrites a file holding secrets.
                        stripping images from transcripts
     src/cli.rs         the CLI transport: arguments, output, REPL
     src/http.rs        the HTTP transport: JSON API, SSE streaming, `serve`
-    src/telegram.rs    the Telegram transport: commands, sessions, the bot
+    src/telegram.rs    the Telegram transport: commands, sessions, the bot;
+                       telegram/jobs.rs delivers reminders
+    src/reminders.rs   the reminder tools and their schedules
+    src/scheduler.rs   the loop that claims and runs due jobs
     src/ops.rs         deployment: version, online backup, absolute ATHENA_DB
     src/telemetry.rs   tracing and OpenTelemetry; telemetry/ has the JSONL
                        files exporter

@@ -58,7 +58,15 @@ description: What athena does not do yet. Read this before exposing it.
   `/compact` command and no token cap below the percentage yet. See
   [Compaction](/docs/compaction).
 - Turns on one session are serialized within a process. Across processes the
-  second to finish is refused with `Conflict`.
+  second to finish is refused with `Conflict`; that includes a scheduled task
+  in the bot racing an HTTP turn on the same session.
+- Reminders: a `notify` is sent at least once (a crash right after Telegram
+  accepts it sends it again); an `agent_task` runs at most once (a crash
+  mid-turn loses that run). A scheduled task's reply follows the same rules
+  as any turn's. A scheduled task only runs once the user has replied with
+  its id and confirmation code, so a page or file cannot schedule one by
+  itself; but a user who confirms a task without reading the preview gives
+  it the same authority as their own message, every time it runs.
 - Axum answers some malformed requests itself, outside the JSON error
   shape: unknown paths (`404`), wrong methods (`405`), bodies over 2 MB
   (`413`).

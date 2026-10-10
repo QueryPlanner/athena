@@ -929,6 +929,7 @@ async fn a_picture_counts_as_a_picture_and_not_as_its_bytes() {
             saved: Err("no sandbox".into()),
         }],
         outbox: None,
+        scheduled: false,
     };
     // The same history twice: 6 900 tokens at the end of the last turn. The
     // reply and a plain prompt make 7 000: under the line. A photo adds

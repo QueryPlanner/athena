@@ -40,6 +40,25 @@ a restart.
 The commands are registered with Telegram's command menu at startup. Any
 other text is a prompt for the current session.
 
+## Reminders
+
+Ask in plain words ("remind me at 6 to call mum", "every weekday at 7:30
+summarise the news for me") and the agent schedules it with its reminder tools.
+A `notify` reminder sends you its text; an `agent_task` runs its text as a
+task in your current session and sends you the reply. A task is only
+scheduled once you confirm it: the agent shows it with a code, and you reply
+`confirm #<id> <code>` within 10 minutes. They repeat once, daily
+or weekly on given days, at a time on your clock, and follow your time zone
+(`timezone_set`) and daylight saving.
+
+The bot process checks for due reminders every 30 seconds; the HTTP server
+never sends them, so a staging environment runs them only if it has its own
+`TELEGRAM_BOT_TOKEN`. A run that comes late (the bot was down) is sent once
+and says so; missed repeats are not made up. A task that falls due while you
+are mid-turn waits for you for up to 30 minutes, then is skipped with a note.
+If you block the bot, your reminders stop. Limits: 50 active reminders, 10 of
+them tasks, 20 task runs a day.
+
 ## Behaviour
 
 - While the model works the bot shows "typing...".

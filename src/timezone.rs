@@ -66,7 +66,7 @@ pub fn register(
 }
 
 /// Run `f` for the owner of the host's session, off the async executor.
-async fn for_owner<T: Send + 'static>(
+pub(crate) async fn for_owner<T: Send + 'static>(
     store: &Store,
     context: &mut ToolContext,
     f: impl FnOnce(&Store, i64) -> Result<T> + Send + 'static,
