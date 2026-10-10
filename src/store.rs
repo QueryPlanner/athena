@@ -25,11 +25,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod calories;
+mod health;
 mod jobs;
 mod timezone;
 mod user_skills;
 mod workouts;
 
+pub use health::{Candidate, Claim, Connection as HealthConnection};
 pub use jobs::Due;
 
 /// One turn: the model calls it made and what they cost.
@@ -537,6 +539,40 @@ const MIGRATIONS: &[&str] = &[
          expires_at INTEGER NOT NULL,
          PRIMARY KEY (user_id, preview_id)
      );",
+    // 14: the Google Health connection and what it synced. The refresh
+    // token is stored encrypted (`health::Cipher`: version, nonce, then
+    // ciphertext, bound to the user) and kept when the connection is
+    // `revoked`, so a lost key can be restored. `health_oauth_states` holds the hash of
+    // each pending consent link's `state`: single use, bound to the user,
+    // short-lived. `last_attempt_at` is the last sync that was started,
+    // successful or not: the daily schedule and the manual cooldown both
+    // claim it. `health_daily.metrics` is one local day's JSON; the rows
+    // outlive a disconnect.
+    "CREATE TABLE health_connections (
+         user_id                 INTEGER NOT NULL PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE,
+         encrypted_refresh_token BLOB NOT NULL,
+         scopes                  TEXT NOT NULL,
+         status                  TEXT NOT NULL CHECK (status IN ('connected', 'revoked')),
+         connected_at            INTEGER NOT NULL,
+         last_synced_at          INTEGER,
+         last_attempt_at         INTEGER,
+         last_sync_error         TEXT,
+         updated_at              INTEGER NOT NULL
+     );
+     CREATE TABLE health_oauth_states (
+         state_hash TEXT NOT NULL PRIMARY KEY,
+         user_id    INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+         expires_at INTEGER NOT NULL,
+         created_at INTEGER NOT NULL
+     );
+     CREATE INDEX health_states_by_user ON health_oauth_states (user_id);
+     CREATE TABLE health_daily (
+         user_id    INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+         date       TEXT NOT NULL,
+         metrics    TEXT NOT NULL,
+         updated_at INTEGER NOT NULL,
+         PRIMARY KEY (user_id, date)
+     );",
 ];
 
 /// The schema version this build writes.
@@ -588,6 +624,28 @@ const EXPECTED_COLUMNS: &[(&str, &[&str])] = &[
             "updated_at",
             "deleted_at",
         ],
+    ),
+    (
+        "health_connections",
+        &[
+            "user_id",
+            "encrypted_refresh_token",
+            "scopes",
+            "status",
+            "connected_at",
+            "last_synced_at",
+            "last_attempt_at",
+            "last_sync_error",
+            "updated_at",
+        ],
+    ),
+    (
+        "health_daily",
+        &["user_id", "date", "metrics", "updated_at"],
+    ),
+    (
+        "health_oauth_states",
+        &["state_hash", "user_id", "expires_at", "created_at"],
     ),
     (
         "jobs",
@@ -1677,6 +1735,9 @@ mod tests {
                 "browser_states",
                 "calorie_logs",
                 "compactions",
+                "health_connections",
+                "health_daily",
+                "health_oauth_states",
                 "jobs",
                 "messages",
                 "rowing_results",

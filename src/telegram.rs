@@ -38,11 +38,13 @@
 //!   reply shows what was understood, and the transcript is in the session.
 //!   The audio is never stored, and one note is transcribed at a time.
 
+pub mod health;
 pub mod jobs;
 pub mod render;
 pub mod voice;
 
 use crate::agent;
+use crate::health::Health;
 use crate::media::{self, Attachment, File, Kind, Outbox};
 use crate::runner::{Request, Run};
 use crate::sandbox::Sandboxes;
@@ -148,6 +150,14 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "link",
         "Share your sessions with the API: /link API_USER_ID",
     ),
+    (
+        "connect_health",
+        "Connect Google Health (sleep, activity, heart rate)",
+    ),
+    (
+        "disconnect_health",
+        "Disconnect Google Health and delete its token",
+    ),
     ("help", "What this bot is and its commands"),
 ];
 
@@ -239,6 +249,10 @@ pub enum Input<'a> {
     Usage,
     /// `/link [API_USER_ID]`, handled directly, never sent to the model.
     Link(Option<&'a str>),
+    /// `/connect_health`, handled directly.
+    ConnectHealth,
+    /// `/disconnect_health`, handled directly.
+    DisconnectHealth,
     /// A well-formed command this bot does not have.
     Unknown(&'a str),
     /// Anything else: a prompt for the model.
@@ -270,6 +284,8 @@ pub fn parse(text: &str) -> Input<'_> {
         "switch" => Input::Switch(arg),
         "usage" => Input::Usage,
         "link" => Input::Link(arg),
+        "connect_health" => Input::ConnectHealth,
+        "disconnect_health" => Input::DisconnectHealth,
         _ => Input::Unknown(word),
     }
 }
@@ -528,6 +544,9 @@ pub struct Telegram<R> {
     downloads: Arc<Semaphore>,
     /// Transcribes voice notes; none without Cloudflare settings.
     whisper: Option<Arc<Whisper>>,
+    /// Google Health; none without its settings. The same service the
+    /// agent's tools use.
+    health: Option<Arc<Health>>,
     /// Permits for [`VOICES`].
     voices: Arc<Semaphore>,
     log: Log,
@@ -595,6 +614,7 @@ impl<R: Run + 'static> Telegram<R> {
             sandboxes: None,
             downloads: Arc::new(Semaphore::new(DOWNLOADS)),
             whisper: None,
+            health: None,
             voices: Arc::new(Semaphore::new(VOICES)),
             log,
             typing_every: TYPING_EVERY,
@@ -616,6 +636,13 @@ impl<R: Run + 'static> Telegram<R> {
     /// prompts.
     pub fn voice(mut self, whisper: Option<Arc<Whisper>>) -> Self {
         self.whisper = whisper;
+        self
+    }
+
+    /// Connect and sync Google Health with `health`; without it the
+    /// commands say it is not set up.
+    pub fn health(mut self, health: Option<Arc<Health>>) -> Self {
+        self.health = health;
         self
     }
 
@@ -695,6 +722,17 @@ impl<R: Run + 'static> Telegram<R> {
         user_id: u64,
         incoming: Incoming,
     ) -> Result<Option<String>, service::Error> {
+        // First of all, and whatever else the message carries: a pasted
+        // Google callback URL holds a one-time code and is not a prompt, a
+        // caption or a command.
+        let redirect = self.health.as_ref().map(|h| h.redirect());
+        let pasted = incoming
+            .text
+            .as_deref()
+            .and_then(|text| crate::health::find_callback(text, redirect));
+        if let Some(callback) = pasted {
+            return self.paste(chat, user_id, callback).await;
+        }
         if let Some(voice) = incoming.voice {
             // Like a file's caption, a voice note's is never a command.
             if self.whisper.is_none() {
@@ -750,6 +788,8 @@ impl<R: Run + 'static> Telegram<R> {
                     "Linked. Send `X-Athena-User: {id}` with API requests to access your sessions. Saved browser sign-ins are shared too. This trusts the private network; the header is not authentication."
                 )
             }
+            Input::ConnectHealth => self.connect_health(&user).await?,
+            Input::DisconnectHealth => self.disconnect_health(&user).await?,
             Input::Unknown(cmd) => format!("Unknown command /{cmd}.\n\n{}", command_list()),
             Input::Text(prompt) => {
                 return self
@@ -1486,8 +1526,10 @@ pub async fn main(model: &str) -> Result<()> {
     let stop = shutdown::listen()?;
     let config = Config::from_env()?;
     let whisper = Whisper::from_env()?.map(Arc::new);
+    let health = crate::health::Config::from_env()?;
     let client = agent::client()?;
     let store = Store::open(&store::path())?;
+    let health = health.map(|config| Health::production(config, &store));
     let compactor = crate::compaction::from_env(model)?;
     let service =
         Arc::new(Service::new(store.clone(), model, log_warning).with_compactor(compactor));
@@ -1499,12 +1541,14 @@ pub async fn main(model: &str) -> Result<()> {
         service.memory(),
         sandboxes.clone(),
         crate::search::WebSearch::from_env(),
+        health.clone(),
         &mcp,
     );
     let app = Arc::new(
         Telegram::new(service, store.clone(), agent, Arc::new(log_warning))
             .sandboxes(sandboxes)
-            .voice(whisper),
+            .voice(whisper)
+            .health(health),
     );
     let bot = config.bot();
     let mut dispatcher = dispatcher(bot.clone(), app.clone());
@@ -1934,7 +1978,16 @@ mod tests {
     }
 
     fn harness_with<R: Run + 'static>(make: impl FnOnce(&Service) -> R) -> Harness<R> {
-        let store = Store::open_in_memory().unwrap();
+        harness_over(Store::open_in_memory().unwrap(), make, None)
+    }
+
+    /// [`harness_with`] on `store`, with Google Health `health` (built on
+    /// the same store).
+    fn harness_over<R: Run + 'static>(
+        store: Store,
+        make: impl FnOnce(&Service) -> R,
+        health: Option<Arc<Health>>,
+    ) -> Harness<R> {
         let service = Service::new(store.clone(), "test/model", |_| {});
         let agent = make(&service);
         let logged = Logged::default();
@@ -1944,7 +1997,8 @@ mod tests {
         // Albums close quickly, so their tests do not wait two seconds.
         let app = Telegram::new(Arc::new(service), store.clone(), agent, log)
             .typing_every(Duration::from_secs(3600))
-            .album_wait(Duration::from_millis(200));
+            .album_wait(Duration::from_millis(200))
+            .health(health);
         Harness {
             app: Arc::new(app),
             store,
@@ -3535,5 +3589,473 @@ mod tests {
             logged[0].starts_with("scheduled job 1: storage: "),
             "{logged:?}"
         );
+    }
+
+    // ---- Google Health ----
+
+    use crate::health::sync::Outcome;
+    use crate::health::testing::{CLIENT_SECRET, FakeGoogle, SetClock};
+    use crate::telegram::health as tg_health;
+
+    const CODE: &str = "4/SECRET-AUTH-CODE-77";
+    /// The fake Google's token values, which must never reach a reply or a log.
+    const TOKENS: [&str; 2] = ["rt-1", "at-1"];
+    const CALLBACK: &str = "http://127.0.0.1:8080/integrations/google-health/callback";
+
+    struct Fit {
+        h: Harness<Agent>,
+        model: MockCompletionModel,
+        fake: FakeGoogle,
+        clock: Arc<SetClock>,
+        health: Arc<Health>,
+    }
+
+    async fn fit(turns: Vec<MockTurn>) -> Fit {
+        let store = Store::open_in_memory().unwrap();
+        let fake = FakeGoogle::start().await;
+        let clock = SetClock::at("2026-10-10T10:00:00Z");
+        let health = crate::health::testing::health(&store, &fake, clock.clone());
+        let model = MockCompletionModel::new(turns);
+        let given = model.clone();
+        let h = harness_over(
+            store,
+            move |s| agent::configure(AgentBuilder::new(given).memory(s.memory())),
+            Some(health.clone()),
+        );
+        Fit {
+            h,
+            model,
+            fake,
+            clock,
+            health,
+        }
+    }
+
+    /// The consent link in a `/connect_health` reply, and its `state`.
+    fn link_in(reply: &str) -> (String, String) {
+        let link = reply
+            .split_whitespace()
+            .find(|w| w.starts_with("https://accounts.google.com/"))
+            .expect("a link");
+        let url = url::Url::parse(link).unwrap();
+        let state = url
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        (link.to_string(), state)
+    }
+
+    fn callback_url(state: &str) -> String {
+        let code = CODE.replace('/', "%2F");
+        format!("{CALLBACK}?state={state}&code={code}&scope=sleep")
+    }
+
+    /// Nothing sent back holds the pasted code, the client secret or a token.
+    fn assert_no_secrets_in(events: &[Event]) {
+        let shown = format!("{events:?}");
+        for secret in [CODE, CLIENT_SECRET].into_iter().chain(TOKENS) {
+            assert!(!shown.contains(secret), "{shown}");
+        }
+    }
+
+    impl Fit {
+        /// Nothing the user pasted reached the model, the transcript or a log.
+        fn assert_code_stayed_private(&self) {
+            assert!(self.model.requests().is_empty(), "the model was called");
+            let stored: i64 = self
+                .h
+                .store
+                .db_for_tests()
+                .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(stored, 0, "something was saved in a transcript");
+            let logs = self.h.logged().join("\n");
+            for secret in [CODE, "SECRET-AUTH-CODE", "state=", CLIENT_SECRET]
+                .into_iter()
+                .chain(TOKENS)
+            {
+                assert!(!logs.contains(secret), "{logs}");
+            }
+        }
+
+        async fn connect(&self, user: u64) -> String {
+            let reply = self.h.reply(user, "/connect_health").await;
+            let (_, state) = link_in(&reply);
+            let events = self.h.send(user, &callback_url(&state)).await;
+            assert_eq!(events[0], said(tg_health::CONNECTED), "{events:?}");
+            state
+        }
+    }
+
+    #[test]
+    fn the_health_commands_parse_and_are_in_the_menu() {
+        assert_eq!(parse("/connect_health"), Input::ConnectHealth);
+        assert_eq!(parse("/connect_health@athena_bot"), Input::ConnectHealth);
+        assert_eq!(parse("/disconnect_health"), Input::DisconnectHealth);
+        let names: Vec<&str> = COMMANDS.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"connect_health") && names.contains(&"disconnect_health"));
+        assert!(help("default").contains("/connect_health - "));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_google_health_the_commands_say_so_and_a_pasted_url_is_still_not_a_prompt() {
+        let (h, model) = watched(vec![MockTurn::text("must not be asked")]);
+        assert_eq!(h.reply(1, "/connect_health").await, tg_health::NOT_SET_UP);
+        assert_eq!(
+            h.reply(1, "/disconnect_health").await,
+            tg_health::NOT_SET_UP
+        );
+        let pasted = h.reply(1, &callback_url("whatever")).await;
+        assert_eq!(pasted, tg_health::NOT_SET_UP);
+        // Even a URL on some other host with a code and a state.
+        let other = h
+            .reply(1, "https://example.com/cb?code=abc&state=def")
+            .await;
+        assert_eq!(other, tg_health::NOT_SET_UP);
+        assert!(model.requests().is_empty());
+        let stored: i64 = h
+            .store
+            .db_for_tests()
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_health_sends_a_consent_link_and_stores_only_its_hash() {
+        let f = fit(vec![]).await;
+        let reply = f.h.reply(1, "/connect_health").await;
+        let (link, state) = link_in(&reply);
+        assert!(reply.contains("10 minutes"), "{reply}");
+        assert!(reply.contains(CALLBACK), "{reply}");
+        assert!(reply.contains("never pass it to the AI"), "{reply}");
+        assert!(link.contains("access_type=offline"));
+        assert!(!link.contains("writeonly"));
+        let owner = f.h.user(1).id();
+        let hash = crate::health::hash_state(&state);
+        assert!(
+            f.h.store
+                .health_state_consume(owner, &hash, f.health.now())
+                .unwrap()
+        );
+        f.assert_code_stayed_private();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pasted_callback_connects_and_syncs_without_the_model_or_a_transcript() {
+        let f = fit(vec![MockTurn::text("must not be asked")]).await;
+        f.fake.answer(
+            "steps",
+            200,
+            r#"{"dataPoints":[{"steps":{"interval":{"startTime":"2026-10-09T08:00:00Z"},"count":"42"}}]}"#,
+        );
+        let reply = f.h.reply(1, "/connect_health").await;
+        let (_, state) = link_in(&reply);
+        // Pasted with words around it, as people do.
+        let text = format!("ok here: {} thanks", callback_url(&state));
+        let events = f.h.send(1, &text).await;
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0], said(tg_health::CONNECTED));
+        assert_no_secrets_in(&events);
+        let synced = events[1].said().unwrap();
+        let counted = synced.starts_with("Synced 1 days of the last 14");
+        assert!(counted, "{synced}");
+
+        let exchange = &f.fake.seen_at("/token")[0];
+        assert_eq!(exchange.form["code"], CODE);
+        let owner = f.h.user(1).id();
+        let conn = f.h.store.health_connection(owner).unwrap().unwrap();
+        assert_eq!(conn.status, "connected");
+        assert!(conn.last_synced_at.is_some());
+        assert_eq!(
+            f.h.store
+                .health_days(owner, "2026-10-01", "2026-10-31")
+                .unwrap()
+                .len(),
+            1
+        );
+        f.assert_code_stayed_private();
+        // The same URL again is just a spent link.
+        let again = f.h.reply(1, &text).await;
+        assert_eq!(again, tg_health::BAD_STATE);
+        f.assert_code_stayed_private();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pasted_callback_in_a_files_caption_is_not_a_prompt_either() {
+        let f = fit(vec![MockTurn::text("must not be asked")]).await;
+        let reply = f.h.reply(1, "/connect_health").await;
+        let (_, state) = link_in(&reply);
+        let (chat, rx) = recorder();
+        let incoming = with_file(1, Some(&callback_url(&state)), photo("p", 10));
+        let events = exchange(&f.h, chat, rx, incoming).await;
+        assert_eq!(events[0], said(tg_health::CONNECTED));
+        f.assert_code_stayed_private();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_link_for_someone_else_a_wrong_or_an_expired_state_connects_nothing() {
+        let f = fit(vec![MockTurn::text("must not be asked")]).await;
+        let reply = f.h.reply(1, "/connect_health").await;
+        let (_, state) = link_in(&reply);
+        // Another user pasting it.
+        assert_eq!(
+            f.h.reply(2, &callback_url(&state)).await,
+            tg_health::BAD_STATE
+        );
+        // A made-up state, and a callback with no state at all.
+        assert_eq!(
+            f.h.reply(1, &callback_url("forged")).await,
+            tg_health::BAD_STATE
+        );
+        let bare = format!("{CALLBACK}?code=abc");
+        assert_eq!(f.h.reply(1, &bare).await, tg_health::BAD_STATE);
+        // After the ten minutes.
+        f.clock.set("2026-10-10T10:10:00Z");
+        assert_eq!(
+            f.h.reply(1, &callback_url(&state)).await,
+            tg_health::BAD_STATE
+        );
+        assert!(f.fake.seen().is_empty());
+        for user in [1, 2] {
+            let owner = f.h.user(user).id();
+            assert!(f.h.store.health_connection(owner).unwrap().is_none());
+        }
+        f.assert_code_stayed_private();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn another_users_attempt_does_not_spend_the_link() {
+        let f = fit(vec![MockTurn::text("must not be asked")]).await;
+        let reply = f.h.reply(1, "/connect_health").await;
+        let (_, state) = link_in(&reply);
+        assert_eq!(
+            f.h.reply(2, &callback_url(&state)).await,
+            tg_health::BAD_STATE
+        );
+        // The owner's paste still works with the same link.
+        let events = f.h.send(1, &callback_url(&state)).await;
+        assert_eq!(events[0], said(tg_health::CONNECTED), "{events:?}");
+        let (owner, stranger) = (f.h.user(1).id(), f.h.user(2).id());
+        assert!(f.h.store.health_connection(owner).unwrap().is_some());
+        assert!(f.h.store.health_connection(stranger).unwrap().is_none());
+        f.assert_code_stayed_private();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_link_is_good_up_to_its_last_millisecond() {
+        let f = fit(vec![]).await;
+        let reply = f.h.reply(1, "/connect_health").await;
+        let (_, state) = link_in(&reply);
+        f.clock.set("2026-10-10T10:09:59.999Z");
+        let events = f.h.send(1, &callback_url(&state)).await;
+        assert_eq!(events[0], said(tg_health::CONNECTED), "{events:?}");
+        f.assert_code_stayed_private();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn declining_a_missing_code_and_a_refused_code_each_get_a_clear_reply() {
+        let f = fit(vec![MockTurn::text("must not be asked")]).await;
+        let state_of = |reply: &str| link_in(reply).1;
+        let reply = f.h.reply(1, "/connect_health").await;
+        let denied = format!("{CALLBACK}?error=access_denied&state={}", state_of(&reply));
+        assert_eq!(f.h.reply(1, &denied).await, tg_health::DENIED);
+        let reply = f.h.reply(1, "/connect_health").await;
+        let no_code = format!("{CALLBACK}?state={}", state_of(&reply));
+        assert_eq!(f.h.reply(1, &no_code).await, tg_health::NO_CODE);
+        let reply = f.h.reply(1, "/connect_health").await;
+        f.fake.answer(
+            "token",
+            400,
+            r#"{"error":"invalid_request","error_description":"SECRET-AUTH-CODE"}"#,
+        );
+        let refused = f.h.reply(1, &callback_url(&state_of(&reply))).await;
+        let said_so = refused.starts_with("I could not connect Google Health");
+        assert!(said_so, "{refused}");
+        assert!(refused.contains("invalid_request"), "{refused}");
+        assert!(!refused.contains("SECRET"), "{refused}");
+        assert!(!refused.contains(CLIENT_SECRET), "{refused}");
+        assert!(
+            f.h.logged()
+                .iter()
+                .any(|l| l.contains("connecting Google Health failed"))
+        );
+        f.assert_code_stayed_private();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_database_failure_while_connecting_is_answered_and_logged() {
+        let f = fit(vec![]).await;
+        let reply = f.h.reply(1, "/connect_health").await;
+        let (_, state) = link_in(&reply);
+        f.h.store
+            .db_for_tests()
+            .execute_batch("DROP TABLE health_oauth_states")
+            .unwrap();
+        let events = f.h.send(1, &callback_url(&state)).await;
+        assert!(
+            events[0]
+                .said()
+                .unwrap()
+                .starts_with("I could not connect Google Health")
+        );
+        f.assert_code_stayed_private();
+        // And `/connect_health` itself fails like any storage error.
+        let again = f.h.reply(1, "/connect_health").await;
+        assert_eq!(again, FAILED);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_first_sync_is_logged_and_told() {
+        let f = fit(vec![]).await;
+        f.fake.answer("sleep", 500, "{}");
+        let reply = f.h.reply(1, "/connect_health").await;
+        let (_, state) = link_in(&reply);
+        let events = f.h.send(1, &callback_url(&state)).await;
+        let told = events[1].said().unwrap();
+        let failed = told.contains("first sync failed (Google answered HTTP 500)");
+        assert!(failed, "{told}");
+        assert!(
+            f.h.logged()
+                .iter()
+                .any(|l| l.contains("first Google Health sync"))
+        );
+    }
+
+    #[test]
+    fn the_first_sync_says_what_happened() {
+        let said = |o: Outcome| tg_health::first_sync_message(&o);
+        assert!(
+            said(Outcome::Synced {
+                days: 3,
+                unavailable: vec![]
+            })
+            .starts_with("Synced 3 days")
+        );
+        let some = said(Outcome::Synced {
+            days: 3,
+            unavailable: vec!["sleep".into(), "weight".into()],
+        });
+        assert!(some.contains("did not allow: sleep, weight"), "{some}");
+        assert_eq!(said(Outcome::Revoked), tg_health::REVOKED);
+        assert_eq!(said(Outcome::AlreadyRevoked), tg_health::REVOKED);
+        assert!(said(Outcome::Failed("x".into())).contains("(x)"));
+        for other in [
+            Outcome::NotConnected,
+            Outcome::Running,
+            Outcome::Cooldown("2026-10-10T11:00:00Z".parse().unwrap()),
+        ] {
+            assert!(said(other).contains("did not start"));
+        }
+    }
+
+    #[test]
+    fn disconnecting_is_explained_in_every_case() {
+        use crate::health::sync::Remote;
+        let said = |r| tg_health::disconnect_message(r);
+        assert_eq!(said(None), "Google Health is not connected.");
+        assert!(said(Some(Remote::Revoked)).contains("Google confirmed"));
+        assert!(said(Some(Remote::Failed)).contains("myaccount.google.com/permissions"));
+        assert!(said(Some(Remote::NotNeeded)).contains("already revoked"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disconnect_health_revokes_at_google_and_deletes_the_token() {
+        let f = fit(vec![]).await;
+        assert_eq!(
+            f.h.reply(1, "/disconnect_health").await,
+            "Google Health is not connected."
+        );
+        f.connect(1).await;
+        let owner = f.h.user(1).id();
+        let reply = f.h.reply(1, "/disconnect_health").await;
+        assert!(reply.contains("Google confirmed"), "{reply}");
+        assert_eq!(f.fake.seen_at("/revoke")[0].form["token"], "rt-1");
+        assert!(f.h.store.health_connection(owner).unwrap().is_none());
+        // Google refusing the revoke is said, not hidden.
+        f.connect(1).await;
+        f.fake.answer("revoke", 400, "{}");
+        let reply = f.h.reply(1, "/disconnect_health").await;
+        assert!(reply.contains("could not confirm"), "{reply}");
+        assert!(f.h.store.health_connection(owner).unwrap().is_none());
+    }
+
+    // ---- the daily pass, through the scheduler's system hook ----
+
+    fn collect(rx: &mut mpsc::UnboundedReceiver<Event>) -> Vec<Event> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_daily_pass_syncs_quietly_and_tells_a_revoked_user_once() {
+        use crate::scheduler::Execute;
+        let f = fit(vec![]).await;
+        f.connect(1).await;
+        let (chat, mut rx) = recorder();
+        let jobs = Jobs::new(f.h.app.clone(), move |_| chat.clone());
+        // Connecting synced already: at 15:30 in Kolkata nothing is due.
+        jobs.system(f.health.now()).await;
+        assert!(collect(&mut rx).is_empty());
+        assert_eq!(f.fake.seen_at("/steps/dataPoints").len(), 1);
+        // The next morning it is, and nothing is said when it works.
+        f.clock.set("2026-10-11T00:00:00Z");
+        jobs.system(f.health.now()).await;
+        assert!(collect(&mut rx).is_empty());
+        assert_eq!(f.fake.seen_at("/steps/dataPoints").len(), 2);
+        // The morning after, Google has revoked the access.
+        f.clock.set("2026-10-12T00:00:00Z");
+        f.fake.answer("token", 400, r#"{"error":"invalid_grant"}"#);
+        jobs.system(f.health.now()).await;
+        assert_eq!(collect(&mut rx), [said(tg_health::REVOKED)]);
+        // Revoked users are not tried again, and not told again.
+        f.clock.set("2026-10-13T00:00:00Z");
+        jobs.system(f.health.now()).await;
+        assert!(collect(&mut rx).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_daily_sync_is_logged_and_not_said() {
+        use crate::scheduler::Execute;
+        let f = fit(vec![]).await;
+        f.connect(1).await;
+        f.clock.set("2026-10-11T00:00:00Z");
+        f.fake.answer("sleep", 500, "{}");
+        let (chat, mut rx) = recorder();
+        Jobs::new(f.h.app.clone(), move |_| chat.clone())
+            .system(f.health.now())
+            .await;
+        assert!(collect(&mut rx).is_empty());
+        assert!(
+            f.h.logged()
+                .iter()
+                .any(|l| l.contains("Google Health sync for user") && l.contains("HTTP 500")),
+            "{:?}",
+            f.h.logged()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_daily_pass_logs_a_failure_to_list_users_and_does_nothing_without_health() {
+        use crate::scheduler::Execute;
+        let f = fit(vec![]).await;
+        f.h.store
+            .db_for_tests()
+            .execute_batch("DROP TABLE health_connections")
+            .unwrap();
+        let (chat, mut rx) = recorder();
+        let chat2 = chat.clone();
+        Jobs::new(f.h.app.clone(), move |_| chat.clone())
+            .system(f.health.now())
+            .await;
+        assert!(f.h.logged()[0].starts_with("Google Health daily sync failed"));
+        // No Google Health at all: nothing to do, nothing logged.
+        let plain = harness(vec![]);
+        Jobs::new(plain.app.clone(), move |_| chat2.clone())
+            .system(f.health.now())
+            .await;
+        assert!(plain.logged().is_empty());
+        assert!(collect(&mut rx).is_empty());
     }
 }

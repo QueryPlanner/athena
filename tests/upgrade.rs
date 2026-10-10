@@ -915,7 +915,6 @@ async fn schema_12_gains_user_skills_without_changing_a_row() {
     let (service, _) = tmp.service();
     let db = tmp.raw();
     assert_eq!(user_version(&db), store::SCHEMA_VERSION as i64);
-    assert_eq!(store::SCHEMA_VERSION, 13);
     let after: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
     assert_eq!(after, before);
     for table in NEW {
@@ -946,6 +945,102 @@ async fn schema_12_gains_user_skills_without_changing_a_row() {
     );
     assert_eq!(count(&db, "SELECT COUNT(*) FROM skill_previews"), 0);
 
+    let (agent, _) = mock_agent(&service, [MockTurn::text("noted")]);
+    service
+        .send(&agent, &user, &notes.id, "hello")
+        .await
+        .unwrap();
+    let now: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
+    for ((table, old), new) in TABLES.iter().zip(&before).zip(&now) {
+        assert_eq!(&new[..old.len()], &old[..], "{table}");
+    }
+    assert_eq!(runs(&db, &notes.id), [run_row(0, 1, 1, "ok")]);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM pragma_foreign_key_check"),
+        0
+    );
+}
+
+/// Migration 14 only adds the Google Health tables. Every row of every earlier
+/// table, the two skills of the schema 13 fixture included, survives; a
+/// migrated user can connect, sync a day and read it back; a turn still
+/// appends.
+#[tokio::test]
+async fn schema_13_gains_google_health_without_changing_a_row() {
+    const TABLES: [&str; 18] = [
+        "users",
+        "user_identities",
+        "sessions",
+        "messages",
+        "runs",
+        "selected_sessions",
+        "sandboxes",
+        "browser_links",
+        "browser_states",
+        "compactions",
+        "calorie_logs",
+        "user_settings",
+        "workout_sessions",
+        "workout_sets",
+        "rowing_results",
+        "jobs",
+        "user_skills",
+        "user_skill_files",
+    ];
+    const NEW: [&str; 3] = ["health_connections", "health_oauth_states", "health_daily"];
+    let tmp = from_fixture(include_str!("fixtures/v13_user_skills.sql"));
+    let before: Vec<_> = TABLES.iter().map(|t| dump(&tmp.raw(), t)).collect();
+    assert_eq!(user_version(&tmp.raw()), 13);
+    let sizes: Vec<usize> = before.iter().map(Vec::len).collect();
+    assert_eq!(
+        sizes,
+        [3, 4, 6, 14, 3, 1, 1, 1, 1, 1, 3, 1, 2, 4, 1, 4, 2, 1]
+    );
+
+    let (service, _) = tmp.service();
+    let db = tmp.raw();
+    assert_eq!(user_version(&db), store::SCHEMA_VERSION as i64);
+    assert_eq!(store::SCHEMA_VERSION, 14);
+    let after: Vec<_> = TABLES.iter().map(|t| dump(&db, t)).collect();
+    assert_eq!(after, before);
+    for table in NEW {
+        assert_eq!(count(&db, &format!("SELECT COUNT(*) FROM {table}")), 0);
+    }
+
+    // A migrated user connects, syncs a day, and reads it back.
+    let store = tmp.open();
+    let user = service.user("telegram", "111111").await.unwrap();
+    let now: jiff::Timestamp = "2026-10-10T10:00:00Z".parse().unwrap();
+    let later = now + jiff::SignedDuration::from_mins(10);
+    store
+        .health_state_create(user.id(), "hash", now, later)
+        .unwrap();
+    assert!(store.health_state_consume(user.id(), "hash", now).unwrap());
+    store
+        .health_connect(user.id(), b"sealed", "scope", now)
+        .unwrap();
+    let days = [("2026-10-10".to_string(), r#"{"steps":5}"#.to_string())];
+    assert!(
+        store
+            .health_store_sync(user.id(), "2026-09-27", "2026-10-11", &days, now)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .health_days(user.id(), "2026-10-01", "2026-10-31")
+            .unwrap(),
+        days
+    );
+    assert_eq!(
+        store
+            .health_connection(user.id())
+            .unwrap()
+            .unwrap()
+            .last_synced_at,
+        Some(now)
+    );
+
+    let notes = store.selected_session(&user).unwrap().unwrap();
     let (agent, _) = mock_agent(&service, [MockTurn::text("noted")]);
     service
         .send(&agent, &user, &notes.id, "hello")

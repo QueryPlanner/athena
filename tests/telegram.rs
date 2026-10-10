@@ -581,15 +581,19 @@ async fn a_refused_or_unreachable_api_fails_serve_without_leaking_the_token() {
 /// called with: these tests only use commands. It runs in `dir`, an empty
 /// directory, so a developer's `.env` in the repository never reaches it.
 fn start_binary(dir: &WorkDir, tmp: &TempDb, api: &FakeApi) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_athena"))
-        .arg("telegram")
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_athena"));
+    cmd.arg("telegram")
         .current_dir(dir.path())
         .env("ATHENA_DB", tmp.path())
         .env("TELEGRAM_BOT_TOKEN", token())
         .env("TELEGRAM_API_URL", &api.url)
         .env("OPENROUTER_API_KEY", "unused-by-these-tests")
-        .env_remove("AGENT_MODEL")
-        .stdout(Stdio::null())
+        .env_remove("AGENT_MODEL");
+    // Google Health off, whatever the developer's shell has.
+    for name in GOOGLE_HEALTH_VARS {
+        cmd.env_remove(name);
+    }
+    cmd.stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap()
@@ -656,6 +660,43 @@ async fn the_binary_serves_commands_and_remembers_the_session_across_a_restart()
         sessions(&tmp, "77"),
         [("notes".to_string(), 0), ("work".to_string(), 0)]
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_google_health_the_binary_says_so_and_stores_nothing() {
+    let tmp = TempDb::new();
+    let dir = WorkDir::new();
+    let api = FakeApi::start().await;
+
+    let child = start_binary(&dir, &tmp, &api);
+    polls(&api, 1).await;
+    // Each command is answered before the next is sent, so no turn can overlap.
+    api.push(text_from(77, "/connect_health"));
+    let connect = api.messages_to(77, 1).await;
+    api.push(text_from(77, "/disconnect_health"));
+    let replies = api.messages_to(77, 2).await;
+    let stderr = stop(child, "TERM").await;
+
+    let not_set_up = athena::telegram::health::NOT_SET_UP;
+    assert_eq!(connect, [not_set_up]);
+    assert_eq!(replies, [not_set_up, not_set_up]);
+    // The commands are in the menu the bot registered at startup.
+    let menu = &api.calls_to("setMyCommands")[0].body["commands"];
+    let names: Vec<&str> = menu
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["command"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"connect_health"), "{names:?}");
+    assert!(names.contains(&"disconnect_health"), "{names:?}");
+    // Nothing was said to the model: a turn would have saved a message.
+    let saved: i64 = tmp
+        .raw()
+        .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(saved, 0);
+    assert!(!stderr.contains(&secret()), "{stderr}");
 }
 
 #[test]

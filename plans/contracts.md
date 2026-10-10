@@ -52,6 +52,10 @@ Rules for `serve` and `telegram`:
 | `CLOUDFLARE_ACCOUNT_ID` | telegram | Cloudflare account id (letters and digits). With `CLOUDFLARE_API_TOKEN`, voice notes and audio files are transcribed. **Both unset means voice notes are not prompts; only one set is a startup error.** |
 | `CLOUDFLARE_API_TOKEN` | telegram | Cloudflare API token with Workers AI access; a secret, sent only as `Authorization: Bearer` to the endpoint below |
 | `EXA_API_KEY` | agent | secret, optional. Exa API key, sent only to `https://api.exa.ai/search` as the `x-api-key` header (redirects not followed). **Unset or blank means the `web_search` tool is not registered**; its name stays reserved from MCP tools either way. Results are cut to `policy::MAX_RESULT_BYTES` by the tool itself and wrapped in nonce markers as untrusted web content. Typed into the env file by a human; not a deploy-gate setting. |
+| `GOOGLE_HEALTH_CLIENT_ID` | agent, telegram | Google OAuth client id (Blacki's, unchanged). With the next two, Google Health is on. **All three unset (or blank) means it is off: the three tools exist and say it is not set up, the Telegram commands say so. Some but not all set is a startup error that names the missing variables, never a value.** |
+| `GOOGLE_HEALTH_CLIENT_SECRET` | agent, telegram | secret. Sent only in the body of calls to `https://oauth2.googleapis.com/token`. Typed into the env file by a human. |
+| `GOOGLE_HEALTH_TOKEN_ENCRYPTION_KEY` | agent, telegram | secret. URL-safe base64 of exactly 32 bytes (Blacki's Fernet key has this form); the 32 bytes are the XChaCha20-Poly1305 key for the stored refresh token. Anything else is a startup error. Changing it makes stored tokens unreadable (those connections are marked `revoked`; the user reconnects). |
+| `GOOGLE_HEALTH_REDIRECT_URI` | agent, telegram | optional. The redirect URI registered with the Google OAuth client; default `http://127.0.0.1:8080/integrations/google-health/callback` (Blacki's). `https`, or `http` on `127.0.0.1` or `localhost`; no query or fragment. |
 | `ATHENA_MCP_CONFIG` | agent | path of an `mcp.json` (section "MCP servers"). **Unset means no MCP tools**, and no default path is searched. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | all | OTLP/HTTP base URL; on the VM OpenObserve, `http://<tailnet-ip>:5080/api/default` (`/v1/traces` and `/v1/logs` are appended). **Unset means no OTLP export.** |
 | `OTEL_EXPORTER_OTLP_HEADERS` | all | `Authorization=Basic%20<base64 of OpenObserve root email:password>`, written by `setup-host.sh` into the env file only |
@@ -442,6 +446,143 @@ skipped); non-UTF-8 files are skipped. `SKILL.md` is parsed by
 `custom::skills::parse`, and its `name` must equal the last path segment, or
 the repository's name at the root. Files are stored, not staged into the
 sandbox.
+
+## Google Health
+
+Read-only sleep, activity, heart-rate and body data from the Google Health API
+(v4, the Fitbit successor), synced once a day per user into SQLite and read by
+the model through three tools. Ported from Blacki (`src/blacki/health/`),
+which keeps the same environment variable names.
+
+**Schema** (migration 14, after `user_skills`, 13). All keyed to `users.id`
+(`ON DELETE CASCADE`):
+
+- `health_connections`: `user_id` (primary key), `encrypted_refresh_token`
+  BLOB (`Cipher`: byte `1`, a random 24-byte nonce, then the XChaCha20-Poly1305
+  ciphertext and tag; the user id is authenticated, not stored), `scopes`
+  (space separated, as Google granted them), `status` (`connected` or
+  `revoked`), `connected_at`, `last_synced_at`, `last_attempt_at` (the last
+  sync *started*, success or not: the daily schedule and the manual cooldown
+  both claim it), `last_sync_error`, `updated_at`. Times are UTC milliseconds.
+  A revoked row keeps its token.
+- `health_oauth_states`: `state_hash` (SHA-256 hex of the `state`; primary
+  key), `user_id`, `expires_at`, `created_at`. One live row per user.
+- `health_daily`: `user_id`, `date` (`YYYY-MM-DD`, the user's local day),
+  `metrics` (JSON), `updated_at`; key `(user_id, date)`. Rows survive
+  `/disconnect_health`. Keys of `metrics`, present only when Google reported
+  them: `steps`, `distance_m`, `active_kcal`, `active_min`, `zone_min`
+  (active zone minutes), `resting_hr`, `hr_zone_minutes` (`{zone: minutes}`),
+  `hr_zones` (`[{type, min_bpm, max_bpm}]`), `weight_kg`, `body_fat_pct`,
+  `workouts` (`[{type, minutes, kcal?, zone_min?}]`), `sleep` (`[{minutes,
+  start, end, stages: [{type, minutes}]}]`).
+
+**Connecting ("paste back").** Athena has no HTTPS callback and no new route:
+
+1. `/connect_health` (private chat) stores `sha256(state)` for the user
+   (`state` is 64 random hex digits, valid 10 minutes, one per user) and
+   replies with `https://accounts.google.com/o/oauth2/v2/auth?...`:
+   `response_type=code`, `access_type=offline`, `prompt=consent`,
+   `include_granted_scopes=true`, the redirect URI, the `state`, a PKCE
+   `code_challenge` (S256) and these scopes, all read-only:
+   `googlehealth.activity_and_fitness.readonly`,
+   `googlehealth.health_metrics_and_measurements.readonly`,
+   `googlehealth.sleep.readonly`, `googlehealth.nutrition.readonly`. The PKCE
+   verifier is `sha256(secret, state)` in hex, derived and never stored.
+2. The user approves; the browser goes to the redirect URI (it need not
+   load) and the user pastes that URL into Telegram.
+3. **The auth code never reaches the model.** `Telegram::respond` checks
+   every message's text (a file's or voice note's caption too) before anything
+   else with `health::find_callback`: the first whitespace-separated word,
+   minus surrounding brackets and quotes, that holds the redirect URI's host
+   and path, or both `code=` and `state=`, as it is or percent-encoded. That
+   test runs whether or not Google Health is configured (unconfigured, only
+   the `code=` and `state=` rule applies, and the reply is "not set up"). Such
+   a message is never passed to `Service::send`, never stored in `messages`,
+   never logged, and its parameters are not kept after step 4. A bare code
+   without its URL cannot be recognised.
+4. The `state` is consumed in one statement (`DELETE ... WHERE state_hash AND
+   user_id AND expires_at > now`): single use, bound to the user, not spent by
+   another user's attempt. Then `POST https://oauth2.googleapis.com/token`
+   (form: client id and secret, `code`, `code_verifier`, `grant_type`,
+   `redirect_uri`). A response without a refresh token fails. The token is
+   sealed and stored, `status = connected`, `last_attempt_at` cleared, and the
+   first sync runs at once.
+   A declined, expired, spent or foreign link, a missing code, or Google
+   refusing the code each get a plain reply and store nothing.
+
+**Environment.** Section "Environment variables".
+
+**HTTP.** One `reqwest` client: connect timeout 5 s, total 30 s, redirects not
+followed. The access token travels only in an `Authorization` header marked
+sensitive, the client secret and refresh token only in form bodies, never in a
+URL. Token answers are read up to 64 KiB, a page of data points up to 2 MiB.
+An error is a status and Google's short error code (a word of at most 64
+characters) at most: never a URL, a body or a secret, and no type involved
+prints one with `Debug`. Base URLs are constants (`health::TOKEN_URL`,
+`REVOKE_URL`, `API_BASE`), not settings; tests inject a fake server through
+`health::client::Endpoints`.
+
+**Sync.** `GET https://health.googleapis.com/v4/users/me/dataTypes/<type>/dataPoints`
+with `pageSize=1000`, a `filter` and `pageToken`, for `steps`, `distance`,
+`active-energy-burned`, `active-minutes`, `active-zone-minutes`, `exercise`,
+`sleep`, `daily-resting-heart-rate`, `daily-heart-rate-zones`,
+`time-in-heart-rate-zone`, `weight` and `body-fat` (Blacki's filters). The
+window is the user's last 14 local days ending today (whole days from local
+midnight, so a day with a clock change is its real length). A point goes on
+its civil date, else on its instant in the user's zone (`user_settings`);
+sleep goes on the day it ended. At most 40 pages per type. Access tokens are
+kept in memory until a minute before they expire and never stored; a rotated
+refresh token is sealed and stored.
+
+- A type Google answers 403 for is skipped and reported; its days in the window
+  are replaced by days without it.
+- Any other failure (HTTP error, timeout, too many pages) writes nothing:
+  the old days stay, `last_sync_error` records why, the connection stays
+  `connected`, and the next try is an hour later.
+- On success the window's days are replaced in one transaction that also sets
+  `last_synced_at` and clears the error, only if the connection still
+  exists and is `connected` (a disconnect during a sync is not undone).
+- Only Google's `invalid_grant` on a refresh, or a stored token that cannot be
+  decrypted, sets `status = revoked`. The call that does it reports it; the
+  daily task tells the user once ("send /connect_health").
+
+**Daily sync.** `scheduler::Execute::system(now)` runs on every scheduler tick
+(30 s) beside the jobs and is not a job: no `jobs` row, no lease, none of the
+reminder limits. `Jobs` implements it in `athena telegram` only, so `athena
+serve` never syncs. For each `connected` user (by id) it syncs when it is past
+05:30 on their clock and `last_attempt_at` is before that instant, or when the
+last attempt failed and an hour has passed. The attempt is claimed with a
+compare-and-swap on `last_attempt_at`, and one process syncs a user once at a
+time, so overlapping ticks and processes do not repeat a sync. A run that is
+slow does not delay the next tick; shutdown waits for it (each request has its
+own 30 s timeout).
+
+**Tools** (names in `health::NAMES`, always reserved and always registered with
+the other native tools; the owner is the session's user, no tool takes one):
+
+- `health_status()`: `configured`, `status` (`not_connected`, `connected`,
+  `revoked`), `connected_at`, `last_synced_at` (local time), `last_sync_error`,
+  and a `hint`.
+- `health_summary(days?)`: 1 to 30 local days (default 7) ending today,
+  oldest first: the stored metrics with sleep as `sleep_min` and
+  `sleep_stage_min`, `distance_km`, no `hr_zones`; `averages` over the days
+  that have a value (`steps`, `active_min`, `zone_min`, `resting_hr`,
+  `sleep_min`); `status`, `today`, `last_synced_at`. A user with no connection
+  row gets no days; a revoked one gets the old days with a hint. The daily
+  sync fills 14 days, so a longer window fills over time.
+- `health_sync_now()`: a sync now, refused within an hour of the last attempt
+  of any kind (`status: cooldown`, `retry_after_minutes`).
+
+What `health_summary` returns is personal health data: it goes to the model
+provider and is stored in the session like any tool result.
+
+**Telegram.** `/connect_health` and `/disconnect_health` (private chat only,
+like every command), both in the command menu. Disconnecting asks Google to
+revoke the refresh token (`POST https://oauth2.googleapis.com/revoke`, token
+in the body), then deletes the connection row, so the sealed token is gone,
+and the user's pending links; it says whether Google confirmed. `health_daily`
+rows stay. The preamble tells the model to call `health_summary` for recovery,
+sleep and activity when advising on training.
 
 ## Compaction
 
