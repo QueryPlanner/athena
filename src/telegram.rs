@@ -38,6 +38,7 @@
 //!   reply shows what was understood, and the transcript is in the session.
 //!   The audio is never stored, and one note is transcribed at a time.
 
+pub mod jobs;
 pub mod render;
 pub mod voice;
 
@@ -553,6 +554,16 @@ struct Album {
     last: tokio::time::Instant,
 }
 
+/// Where a turn's text came from.
+enum Origin {
+    /// The user typed it, or captioned the files they sent.
+    Typed,
+    /// The caption of this voice note; its transcript follows.
+    Voice(IncomingVoice),
+    /// A scheduled task: nobody typed it just now.
+    Scheduled,
+}
+
 /// A claim on a user's one turn. Released when dropped, panics included.
 struct Busy {
     users: Arc<Mutex<HashSet<u64>>>,
@@ -912,7 +923,9 @@ impl<R: Run + 'static> Telegram<R> {
             let reply = match app.claim_turn(user_id).await {
                 Ok(Some((busy, user, session))) => {
                     let _busy = busy;
-                    return app.turn(chat, user, session, text, album.files, None).await;
+                    app.turn(chat, user, session, text, album.files, Origin::Typed)
+                        .await;
+                    return;
                 }
                 Ok(None) => BUSY.into(),
                 Err(e) => {
@@ -959,7 +972,8 @@ impl<R: Run + 'static> Telegram<R> {
         while turns.try_join_next().is_some() {}
         turns.spawn(async move {
             let _busy = busy;
-            app.turn(chat, user, session, text, files, voice).await;
+            let origin = voice.map_or(Origin::Typed, Origin::Voice);
+            app.turn(chat, user, session, text, files, origin).await;
         });
         Ok(None)
     }
@@ -1041,7 +1055,8 @@ impl<R: Run + 'static> Telegram<R> {
     /// without a transcript the turn does not run.
     ///
     /// The model call runs in its own task: a panic in it becomes a reply,
-    /// and nothing cancels it once started.
+    /// and nothing cancels it once started. Returns why the reply could not
+    /// be sent, if it could not: the rest of it is not tried.
     async fn turn<C: Chat>(
         &self,
         chat: C,
@@ -1049,23 +1064,23 @@ impl<R: Run + 'static> Telegram<R> {
         session: Session,
         text: String,
         files: Vec<IncomingFile>,
-        voice: Option<IncomingVoice>,
-    ) {
+        origin: Origin,
+    ) -> Option<anyhow::Error> {
         typing(&chat, &self.log).await;
         let typing = tokio::spawn(keep_typing(
             chat.clone(),
             self.typing_every,
             self.log.clone(),
         ));
-        let text = match &voice {
-            None => text,
-            Some(voice) => match self.transcribe(&chat, voice).await {
+        let text = match &origin {
+            Origin::Typed | Origin::Scheduled => text,
+            Origin::Voice(voice) => match self.transcribe(&chat, voice).await {
                 Some(transcript) => spoken(&text, &transcript),
                 None => {
                     typing.abort();
                     let _ = typing.await;
                     say(&chat, &self.log, NOT_HEARD).await;
-                    return;
+                    return None;
                 }
             },
         };
@@ -1078,6 +1093,7 @@ impl<R: Run + 'static> Telegram<R> {
             text,
             files: received,
             outbox: Some(outbox.clone()),
+            scheduled: matches!(origin, Origin::Scheduled),
         };
         let (service, agent) = (self.service.clone(), self.agent.clone());
         let who = user.external_id().to_string();
@@ -1098,8 +1114,10 @@ impl<R: Run + 'static> Telegram<R> {
                 FAILED.into()
             }
         };
+        let mut unsent = None;
         for chunk in chunks(&reply) {
-            if !say_chunk(&chat, &self.log, &chunk).await {
+            if let Err(e) = say_chunk(&chat, &self.log, &chunk).await {
+                unsent = Some(e);
                 break;
             }
         }
@@ -1107,6 +1125,7 @@ impl<R: Run + 'static> Telegram<R> {
         for attachment in outbox.take() {
             deliver(&chat, &self.log, attachment).await;
         }
+        unsent
     }
 }
 
@@ -1162,31 +1181,34 @@ async fn isolated<C: Chat>(chat: &C, log: &Log, work: impl Future<Output = ()> +
 
 /// Send one message; log a failure. Returns whether it was sent.
 async fn say<C: Chat>(chat: &C, log: &Log, text: &str) -> bool {
-    let sent = chat.say(text).await;
-    if let Err(e) = &sent {
-        log(&format!("sending a message failed: {e:#}"));
-    }
-    sent.is_ok()
+    sent(chat, log, text).await.is_ok()
+}
+
+/// [`say`], returning why the message was not sent.
+async fn sent<C: Chat>(chat: &C, log: &Log, text: &str) -> Result<()> {
+    chat.say(text)
+        .await
+        .inspect_err(|e| log(&format!("sending a message failed: {e:#}")))
 }
 
 /// Send one chunk of a reply with its formatting. If Telegram refuses the
 /// formatting, the same text is sent without it: a reply must never be lost
-/// to a formatting error. Returns whether the text was sent.
-async fn say_chunk<C: Chat>(chat: &C, log: &Log, chunk: &Chunk) -> bool {
+/// to a formatting error. Returns why the text was not sent, if it was not.
+async fn say_chunk<C: Chat>(chat: &C, log: &Log, chunk: &Chunk) -> Result<()> {
     if chunk.entities.is_empty() {
-        return say(chat, log, &chunk.text).await;
+        return sent(chat, log, &chunk.text).await;
     }
     match chat.say_formatted(&chunk.text, &chunk.entities).await {
-        Ok(()) => true,
+        Ok(()) => Ok(()),
         Err(e) if e.is::<Refused>() => {
             log(&format!(
                 "sending formatted text failed, sending it as plain text: {e:#}"
             ));
-            say(chat, log, &chunk.text).await
+            sent(chat, log, &chunk.text).await
         }
         Err(e) => {
             log(&format!("sending a message failed: {e:#}"));
-            false
+            Err(e)
         }
     }
 }
@@ -1343,7 +1365,8 @@ pub fn dispatcher<R: Run + 'static>(bot: Bot, app: Arc<Telegram<R>>) -> Telegram
 /// Shut the dispatcher down on the first stop signal from `stop` that
 /// arrives while it is polling; `serve` then waits for the turns in flight.
 /// This is what teloxide's own Ctrl-C handler does, for SIGTERM too. A
-/// signal before polling has started is ignored.
+/// signal before polling has started is ignored. The returned task ends
+/// once it has shut the dispatcher down.
 pub fn stop_on<F: Future<Output = ()> + Send + 'static>(
     token: ShutdownToken,
     stop: impl Fn() -> F + Send + 'static,
@@ -1479,18 +1502,30 @@ pub async fn main(model: &str) -> Result<()> {
         &mcp,
     );
     let app = Arc::new(
-        Telegram::new(service, store, agent, Arc::new(log_warning))
+        Telegram::new(service, store.clone(), agent, Arc::new(log_warning))
             .sandboxes(sandboxes)
             .voice(whisper),
     );
     let bot = config.bot();
     let mut dispatcher = dispatcher(bot.clone(), app.clone());
-    stop_on(dispatcher.shutdown_token(), stop);
+    // The scheduler stops claiming jobs on the signal that stops polling
+    // (`stop_on`'s task ends), or once polling has ended for any other
+    // reason (that task is cancelled below), then finishes its jobs.
+    let signalled = stop_on(dispatcher.shutdown_token(), stop);
+    let stopper = signalled.abort_handle();
+    let scheduler = jobs::scheduler(app.clone(), bot.clone(), store);
+    let scheduler = tokio::spawn(scheduler.run(async move {
+        let _ = signalled.await;
+    }));
     tracing::info!(
         transport = TRANSPORT,
-        "polling for messages; Ctrl-C or SIGTERM stops"
+        "polling for messages and running reminders; Ctrl-C or SIGTERM stops"
     );
     let result = serve(&mut dispatcher, bot, &app).await;
+    stopper.abort();
+    // Job panics are caught and logged inside it; one in the loop itself
+    // has already been printed by the runtime.
+    let _ = scheduler.await;
     mcp.shutdown().await;
     result
 }
@@ -1804,6 +1839,8 @@ mod tests {
         events: mpsc::UnboundedSender<Event>,
         /// Every call fails.
         fail: bool,
+        /// Sending text fails as Telegram does when the user blocked the bot.
+        blocked: bool,
         /// What each file id downloads as; any other id fails.
         files: Arc<std::collections::HashMap<String, Vec<u8>>>,
         /// Sending a photo fails, as Telegram refuses some.
@@ -1833,6 +1870,9 @@ mod tests {
 
         async fn say(&self, text: &str) -> Result<()> {
             self.events.send(Event::Say(text.to_string())).unwrap();
+            if self.blocked {
+                return Err(RequestError::Api(ApiError::BotBlocked).into());
+            }
             if self.fail {
                 bail!("blocked by the user");
             }
@@ -1876,6 +1916,7 @@ mod tests {
             Recorder {
                 events,
                 fail: false,
+                blocked: false,
                 files: Arc::default(),
                 refuse_photos: false,
                 formatting: Formatting::Accepted,
@@ -2550,6 +2591,7 @@ mod tests {
                 saved: Err("this assistant has no sandbox".into()),
             }],
             outbox: None,
+            scheduled: false,
         };
         assert_eq!(prompt, expected.message());
         // The transcript has the note, not the photo.
@@ -3091,5 +3133,407 @@ mod tests {
         let first = h.logged().remove(0);
         assert!(first.starts_with("telegram user 24: storage: "), "{first}");
         assert!(!lock(&h.app.busy).contains(&24));
+    }
+
+    // ---- scheduled jobs ----
+
+    use crate::reminders::{Create, TASK_RUNS_PER_DAY};
+    use crate::scheduler::Execute;
+    use crate::store::Due;
+    use jiff::{SignedDuration, Timestamp};
+    use jobs::{Jobs, notice, permanent, task_prompt};
+
+    /// Saturday 2026-10-10 03:00 UTC, 08:30 in Kolkata.
+    fn t0() -> Timestamp {
+        "2026-10-10T03:00:00Z".parse().unwrap()
+    }
+
+    /// Schedule a reminder for Telegram user `user` and claim it `late`
+    /// past its time.
+    fn due<R: Run + 'static>(
+        h: &Harness<R>,
+        user: u64,
+        args: serde_json::Value,
+        late: i64,
+    ) -> (Due, Timestamp) {
+        let owner = h.store.user(TRANSPORT, &user.to_string()).unwrap().id();
+        let args: Create = serde_json::from_value(args).unwrap();
+        schedule(&h.store, owner, &args);
+        let now = t0() + SignedDuration::from_mins(5 + late);
+        let mut claimed = h.store.claim_jobs(now, 1).unwrap();
+        (claimed.remove(0), now)
+    }
+
+    /// Create a reminder at [`t0`]; a task is confirmed as its user would,
+    /// with its id and code. Returns its id and, for a task, its code.
+    fn schedule(store: &Store, owner: i64, args: &Create) -> (i64, Option<String>) {
+        let shown = store.create_reminder(owner, "s", args, t0()).unwrap();
+        let id = shown["id"].as_i64().unwrap();
+        let code = shown["confirmation_code"].as_str().map(str::to_string);
+        if let Some(code) = &code {
+            let said = format!("confirm #{id} {code}");
+            store
+                .confirm_reminder(owner, "s", id, code, &said, t0())
+                .unwrap();
+        }
+        (id, code)
+    }
+
+    fn note(text: &str) -> serde_json::Value {
+        serde_json::json!({"kind": "notify", "text": text, "in_minutes": 5})
+    }
+
+    fn task(text: &str) -> serde_json::Value {
+        serde_json::json!({"kind": "agent_task", "text": text, "in_minutes": 5})
+    }
+
+    /// Run `job` with every chat recording to `chat`; return what it sent.
+    async fn execute<R: Run + 'static>(
+        h: &Harness<R>,
+        chat: Recorder,
+        mut rx: mpsc::UnboundedReceiver<Event>,
+        job: Due,
+        now: Timestamp,
+    ) -> Vec<Event> {
+        let jobs = Jobs::new(h.app.clone(), move |_| chat.clone());
+        jobs.execute(job, now).await;
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        events
+    }
+
+    /// The job's (status, sent_at, last_error, attempts).
+    fn job_row<R>(h: &Harness<R>, id: i64) -> (String, Option<i64>, Option<String>, i64) {
+        h.store
+            .db_for_tests()
+            .query_row(
+                "SELECT status, sent_at, last_error, attempts FROM jobs WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn only_refusals_for_good_are_permanent() {
+        let api = |e: ApiError| anyhow::Error::from(RequestError::Api(e));
+        assert!(permanent(&api(ApiError::BotBlocked)));
+        assert!(permanent(&api(ApiError::UserDeactivated)));
+        assert!(permanent(&api(ApiError::ChatNotFound)));
+        assert!(permanent(&api(ApiError::CantInitiateConversation)));
+        let forbidden = "Forbidden: bot can't initiate conversation with a user";
+        assert!(permanent(&api(ApiError::Unknown(forbidden.into()))));
+        assert!(!permanent(&api(ApiError::Unknown("Bad Request: x".into()))));
+        assert!(!permanent(&api(ApiError::MessageIsTooLong)));
+        assert!(!permanent(&anyhow::Error::from(RequestError::RetryAfter(
+            teloxide::types::Seconds::from_seconds(1)
+        ))));
+        assert!(!permanent(&anyhow::anyhow!("connection reset")));
+    }
+
+    #[test]
+    fn notices_and_task_prompts_say_when_they_are_late() {
+        assert_eq!(notice("tea", None), "Reminder: tea");
+        assert_eq!(
+            notice("tea", Some("Sat 10 Oct 09:00")),
+            "Reminder (late: it was due Sat 10 Oct 09:00): tea"
+        );
+        let on_time = task_prompt(3, "check", "Sat 10 Oct 09:00", false);
+        assert!(on_time.starts_with("Scheduled task #3, which the user confirmed earlier, was due Sat 10 Oct 09:00. Do it now"));
+        assert!(on_time.ends_with("\n\ncheck"));
+        assert!(task_prompt(3, "check", "x", true).contains("was due x, and it is running late."));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reminder_is_sent_and_recorded_or_noted_late() {
+        let h = harness(vec![]);
+        let (job, now) = due(&h, 51, note("stand up"), 0);
+        let (chat, rx) = recorder();
+        let events = execute(&h, chat, rx, job, now).await;
+        assert_eq!(events, [said("Reminder: stand up")]);
+        assert_eq!(
+            job_row(&h, 1),
+            ("done".into(), Some(now.as_millisecond()), None, 0)
+        );
+
+        // Ten minutes late: 08:35 in Kolkata was its time.
+        let (job, now) = due(&h, 51, note("drink water"), 10);
+        let (chat, rx) = recorder();
+        let events = execute(&h, chat, rx, job, now).await;
+        assert_eq!(
+            events,
+            [said(
+                "Reminder (late: it was due Sat 10 Oct 08:35): drink water"
+            )]
+        );
+        assert!(h.logged().is_empty(), "{:?}", h.logged());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_blocked_bot_fails_the_reminder_and_other_errors_retry() {
+        let h = harness(vec![]);
+        let (job, now) = due(&h, 52, note("a"), 0);
+        let (mut chat, rx) = recorder();
+        chat.blocked = true;
+        execute(&h, chat, rx, job, now).await;
+        let (status, sent, error, _) = job_row(&h, 1);
+        assert_eq!((status.as_str(), sent), ("failed", None));
+        assert!(error.unwrap().contains("blocked"));
+
+        let (job, now) = due(&h, 52, note("b"), 0);
+        let (mut chat, rx) = recorder();
+        chat.fail = true;
+        execute(&h, chat, rx, job, now).await;
+        assert_eq!(
+            job_row(&h, 2),
+            ("active".into(), None, Some("blocked by the user".into()), 1)
+        );
+        let logged = h.logged();
+        assert!(logged.iter().all(|m| m.contains("failed")), "{logged:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn jobs_that_cannot_be_delivered_fail_with_a_reason() {
+        let h = harness(vec![]);
+        let (job, now) = due(&h, 53, note("a"), 0);
+        let unknown = Due {
+            kind: "health_sync".into(),
+            ..job.clone()
+        };
+        let (chat, rx) = recorder();
+        assert!(execute(&h, chat, rx, unknown, now).await.is_empty());
+        assert_eq!(
+            job_row(&h, 1).2.as_deref(),
+            Some("this build cannot run jobs of kind `health_sync`")
+        );
+
+        let (job, now) = due(&h, 53, note("b"), 0);
+        let (chat, rx) = recorder();
+        let homeless = Due { chat: None, ..job };
+        assert!(execute(&h, chat, rx, homeless, now).await.is_empty());
+        assert_eq!(
+            job_row(&h, 2).2.as_deref(),
+            Some("the user has no Telegram chat to deliver to")
+        );
+
+        let (job, now) = due(&h, 53, note("c"), 0);
+        h.store
+            .db_for_tests()
+            .execute(
+                "INSERT INTO user_settings VALUES (?1, 'Gone/Away', 0)",
+                [job.owner],
+            )
+            .unwrap();
+        let (chat, rx) = recorder();
+        assert!(execute(&h, chat, rx, job, now).await.is_empty());
+        let (status, _, error, _) = job_row(&h, 3);
+        assert_eq!(status, "failed");
+        assert!(error.unwrap().contains("no longer resolves"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_storage_failure_is_logged() {
+        let h = harness(vec![]);
+        let (job, now) = due(&h, 54, note("a"), 0);
+        h.store
+            .db_for_tests()
+            .execute_batch("ALTER TABLE jobs RENAME TO gone")
+            .unwrap();
+        let (chat, rx) = recorder();
+        assert_eq!(execute(&h, chat, rx, job, now).await, [said("Reminder: a")]);
+        let logged = h.logged();
+        assert!(logged[0].starts_with("scheduled job 1: "), "{logged:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_task_runs_as_a_turn_in_the_current_session_and_is_recorded_first() {
+        let h = harness(vec![MockTurn::text("**3** headlines")]);
+        h.send(55, "/new news").await;
+        let (job, now) = due(
+            &h,
+            55,
+            serde_json::json!({"kind": "agent_task",
+            "text": "summarise the news", "repeat": "daily", "time": "08:35"}),
+            0,
+        );
+        let (chat, rx) = recorder();
+        let events = execute(&h, chat, rx, job, now).await;
+        assert_eq!(events[0], Event::Typing);
+        assert!(matches!(&events[1], Event::Formatted(text, _) if text == "3 headlines"));
+        assert_eq!(h.sessions(55), [("news".to_string(), 2)]);
+        let prompt = h
+            .store
+            .load(&h.store.selected_session(&h.user(55)).unwrap().unwrap().id)
+            .unwrap()[0]
+            .rag_text()
+            .unwrap();
+        assert_eq!(
+            prompt,
+            task_prompt(1, "summarise the news", "Sat 10 Oct 08:35", false)
+        );
+        let (status, sent, _, _) = job_row(&h, 1);
+        assert_eq!(
+            (status.as_str(), sent),
+            ("active", Some(now.as_millisecond()))
+        );
+        assert!(!lock(&h.app.busy).contains(&55));
+    }
+
+    /// A scheduled turn has no user message, so nothing in it can confirm a
+    /// task, even with the id and code in its own prompt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scheduled_turn_cannot_confirm_a_task() {
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call(
+                "c",
+                "reminder_confirm",
+                serde_json::json!({"id": 1, "code": "ABCDEFGH"}),
+            ),
+            MockTurn::text("tried"),
+        ]);
+        let scripted = model.clone();
+        let h = harness_with(move |s| {
+            agent::configure_persistent(
+                AgentBuilder::new(scripted).memory(s.memory()),
+                None,
+                &crate::custom::Custom::default(),
+                &crate::mcp::Mcp::none(),
+                s.memory().store().clone(),
+                None,
+            )
+        });
+        let owner = h.store.user(TRANSPORT, "60").unwrap().id();
+        h.store
+            .db_for_tests()
+            .execute(
+                "INSERT INTO jobs (user_id, kind, payload, next_run_at, status, created_at,
+                                   updated_at, confirm_code, confirm_session, confirm_expires_at)
+                 VALUES (?1, 'agent_task', 'x', ?2, 'pending', 0, 0, 'ABCDEFGH', 's', ?2)",
+                rusqlite::params![
+                    owner,
+                    (t0() + SignedDuration::from_hours(1)).as_millisecond()
+                ],
+            )
+            .unwrap();
+        let (job, now) = due(&h, 60, task("confirm #1 ABCDEFGH"), 0);
+        let (chat, rx) = recorder();
+        execute(&h, chat, rx, job, now).await;
+
+        let request = &model.requests()[1];
+        let result = serde_json::to_string(request.chat_history.last().unwrap()).unwrap();
+        assert!(result.contains("Not confirmed"), "{result}");
+        assert_eq!(job_row(&h, 1).0, "pending");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_task_waits_while_its_user_is_mid_turn_then_is_skipped() {
+        let h = harness(vec![]);
+        let _running = Busy::claim(&h.app.busy, 56).unwrap();
+        let (job, now) = due(&h, 56, task("a"), 0);
+        let (chat, rx) = recorder();
+        assert!(execute(&h, chat, rx, job, now).await.is_empty());
+        let lease: i64 = h
+            .store
+            .db_for_tests()
+            .query_row("SELECT lease_until FROM jobs WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(lease, (now + SignedDuration::from_mins(1)).as_millisecond());
+
+        let (job, now) = due(&h, 56, task("b"), 31);
+        let (chat, rx) = recorder();
+        let events = execute(&h, chat, rx, job, now).await;
+        // The longest overdue first: the first task, now 31 minutes late.
+        assert_eq!(
+            events,
+            [said(
+                "I skipped scheduled task #1: you were in a conversation with me for 30 minutes past its time."
+            )]
+        );
+        let (status, sent, error, _) = job_row(&h, 1);
+        assert_eq!((status.as_str(), sent), ("done", None));
+        assert!(error.unwrap().starts_with("skipped"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tasks_past_the_daily_limit_are_skipped() {
+        let h = harness(vec![]);
+        let (job, now) = due(&h, 57, task("a"), 0);
+        for _ in 0..TASK_RUNS_PER_DAY {
+            h.store
+                .db_for_tests()
+                .execute(
+                    "INSERT INTO jobs (user_id, kind, payload, next_run_at, status, sent_at,
+                                       created_at, updated_at)
+                     VALUES (?1, 'agent_task', 'x', 0, 'done', ?2, 0, 0)",
+                    rusqlite::params![job.owner, now.as_millisecond() - 1000],
+                )
+                .unwrap();
+        }
+        let (chat, rx) = recorder();
+        let events = execute(&h, chat, rx, job, now).await;
+        assert_eq!(
+            events,
+            [said(
+                "I skipped scheduled task #1: you can have at most 20 scheduled tasks run in 24 hours."
+            )]
+        );
+        assert_eq!(job_row(&h, 1).0, "done");
+        assert_eq!(job_row(&h, 1).1, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_task_whose_reply_cannot_reach_the_user_stops() {
+        let h = harness(vec![MockTurn::text("done")]);
+        let (job, now) = due(
+            &h,
+            58,
+            serde_json::json!({"kind": "agent_task",
+            "text": "x", "repeat": "daily", "time": "08:35"}),
+            0,
+        );
+        let (mut chat, rx) = recorder();
+        chat.blocked = true;
+        execute(&h, chat, rx, job, now).await;
+        let (status, sent, error, _) = job_row(&h, 1);
+        assert_eq!(
+            (status.as_str(), sent),
+            ("failed", Some(now.as_millisecond()))
+        );
+        assert!(error.unwrap().contains("blocked"));
+
+        // Any other failure to send the reply leaves the task to run again.
+        let h = harness(vec![MockTurn::text("done")]);
+        let (job, now) = due(
+            &h,
+            58,
+            serde_json::json!({"kind": "agent_task",
+            "text": "x", "repeat": "daily", "time": "08:35"}),
+            0,
+        );
+        let (mut chat, rx) = recorder();
+        chat.fail = true;
+        execute(&h, chat, rx, job, now).await;
+        assert_eq!(job_row(&h, 1).0, "active");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_task_that_cannot_find_its_session_is_logged() {
+        let h = harness(vec![]);
+        let (job, now) = due(&h, 59, task("a"), 0);
+        h.store
+            .db_for_tests()
+            .execute_batch("DROP TABLE selected_sessions")
+            .unwrap();
+        let (chat, rx) = recorder();
+        assert!(execute(&h, chat, rx, job, now).await.is_empty());
+        let logged = h.logged();
+        assert!(
+            logged[0].starts_with("scheduled job 1: storage: "),
+            "{logged:?}"
+        );
     }
 }

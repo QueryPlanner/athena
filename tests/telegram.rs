@@ -1303,3 +1303,104 @@ async fn a_bad_request_teloxide_has_no_name_for_also_resends_the_text_plain() {
         "{logged:?}"
     );
 }
+
+/// Schedule a reminder for Telegram user `user`, as of two minutes ago.
+fn overdue(tmp: &TempDb, user: &str, args: serde_json::Value) -> i64 {
+    let store = tmp.open();
+    let owner = store.user("telegram", user).unwrap().id();
+    let args: athena::reminders::Create = serde_json::from_value(args).unwrap();
+    let earlier = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(2);
+    let shown = store.create_reminder(owner, "s", &args, earlier).unwrap();
+    let id = shown["id"].as_i64().unwrap();
+    // A task is confirmed as its user would, with its id and code.
+    if let Some(code) = shown["confirmation_code"].as_str() {
+        let said = format!("confirm #{id} {code}");
+        store
+            .confirm_reminder(owner, "s", id, code, &said, earlier)
+            .unwrap();
+    }
+    id
+}
+
+fn job_status(tmp: &TempDb, id: i64) -> (String, Option<String>) {
+    tmp.raw()
+        .query_row(
+            "SELECT status, last_error FROM jobs WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_binary_delivers_a_due_reminder_and_stops_its_scheduler_on_sigterm() {
+    let tmp = TempDb::new();
+    let dir = WorkDir::new();
+    let api = FakeApi::start().await;
+    let id = overdue(
+        &tmp,
+        "88",
+        json!({"kind": "notify", "text": "water the plants", "in_minutes": 1}),
+    );
+
+    let child = start_binary(&dir, &tmp, &api);
+    let sent = api.messages_to(88, 1).await;
+    let stderr = stop(child, "TERM").await;
+
+    assert_eq!(sent, ["Reminder: water the plants"]);
+    assert!(stderr.contains("running reminders"), "{stderr}");
+    assert_eq!(job_status(&tmp, id), ("done".into(), None));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reminders_go_through_the_bot_api_and_a_block_stops_them() {
+    let tmp = TempDb::new();
+    let api = FakeApi::start().await;
+    let (app, _) = app(&tmp, |s| {
+        mock_agent(s, [MockTurn::text("the news is quiet")]).0
+    });
+    let blocked = overdue(
+        &tmp,
+        "91",
+        json!({"kind": "notify", "text": "a", "repeat": "daily", "time": "00:00"}),
+    );
+    // Due now, whatever the time of day.
+    tmp.raw()
+        .execute("UPDATE jobs SET next_run_at = 0 WHERE id = ?1", [blocked])
+        .unwrap();
+    // Its send is refused for good.
+    api.fail_next(
+        "sendMessage",
+        json!({"ok": false, "error_code": 403,
+               "description": "Forbidden: bot was blocked by the user"}),
+    );
+
+    let scheduler = telegram::jobs::scheduler(app.clone(), bot(&api.url), tmp.open())
+        .every(std::time::Duration::from_millis(10));
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let running = tokio::spawn(scheduler.run(async move {
+        let _ = stopped.await;
+    }));
+    api.wait_for("the blocked reminder", |calls| {
+        calls
+            .iter()
+            .any(|c| c.method == "sendMessage" && c.chat_id() == 91)
+    })
+    .await;
+    // Scheduled while the loop runs: a later poll finds it.
+    let task = overdue(
+        &tmp,
+        "92",
+        json!({"kind": "agent_task", "text": "check the news", "in_minutes": 1}),
+    );
+    let reply = api.messages_to(92, 1).await;
+    stop.send(()).unwrap();
+    running.await.unwrap();
+
+    assert_eq!(reply, ["the news is quiet"]);
+    assert_eq!(job_status(&tmp, task), ("done".into(), None));
+    let (status, error) = job_status(&tmp, blocked);
+    assert_eq!(status, "failed");
+    assert!(error.unwrap().contains("blocked"));
+    assert_eq!(sessions(&tmp, "92"), [("default".to_string(), 2)]);
+}

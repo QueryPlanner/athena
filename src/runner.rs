@@ -21,11 +21,20 @@ use std::future::{Future, IntoFuture};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conversation(pub String);
 
-/// The tool context for one run in `conversation`. With an `outbox`, the
-/// run's tools can send the user files through it.
-pub fn tool_context(conversation: &str, outbox: Option<&Outbox>) -> ToolContext {
+/// The text the user sent to start a run, as the transport received it.
+/// Tools that need the user's own consent check it here: the model can
+/// relay a request to the user, but it cannot write the user's message.
+/// `user_skills` looks for a confirmation code in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserText(pub String);
+
+/// The tool context for one run in `conversation`, started by the user's
+/// `text`. With an `outbox`, the run's tools can send the user files
+/// through it.
+pub fn tool_context(conversation: &str, text: &str, outbox: Option<&Outbox>) -> ToolContext {
     let mut context = ToolContext::new();
     context.insert(Conversation(conversation.to_string()));
+    context.insert(UserText(text.to_string()));
     if let Some(outbox) = outbox {
         context.insert(outbox.clone());
     }
@@ -39,6 +48,9 @@ pub struct Request {
     pub text: String,
     pub files: Vec<File>,
     pub outbox: Option<Outbox>,
+    /// Set by the scheduler: nobody typed `text` just now, so the turn's
+    /// tools see an empty [`UserText`] and nothing can be confirmed in it.
+    pub scheduled: bool,
 }
 
 impl From<&str> for Request {
@@ -69,6 +81,12 @@ impl Request {
     /// Whether there is nothing to answer: no text and no files.
     pub fn is_empty(&self) -> bool {
         self.text.trim().is_empty() && self.files.is_empty()
+    }
+
+    /// What the user typed to start this turn, for [`UserText`]: the text,
+    /// or nothing for a scheduled turn.
+    pub fn user_text(&self) -> &str {
+        if self.scheduled { "" } else { &self.text }
     }
 
     /// The user message the model is given: the text, a note on each file
@@ -149,7 +167,11 @@ impl Run for Agent {
         let mut turn = self
             .prompt(request.message())
             .conversation(conversation)
-            .tool_context(tool_context(conversation, request.outbox.as_ref()));
+            .tool_context(tool_context(
+                conversation,
+                request.user_text(),
+                request.outbox.as_ref(),
+            ));
         if let Some(context) = context {
             turn = turn.add_hook(context);
         }
@@ -185,7 +207,7 @@ impl RunStream for Agent {
         let mut turn = self
             .stream_prompt(prompt)
             .conversation(conversation)
-            .tool_context(tool_context(conversation, None));
+            .tool_context(tool_context(conversation, prompt, None));
         if let Some(context) = context {
             turn = turn.add_hook(context);
         }
@@ -432,6 +454,7 @@ mod tests {
                 file("blob", None, b"??", Ok("/tmp/in/blob")),
             ],
             outbox: None,
+            scheduled: false,
         };
         let text = "what is this?\n\n\
             [The user attached `shot.png` (image/png, 12 bytes). It is in your sandbox at \
@@ -491,14 +514,27 @@ mod tests {
 
     #[test]
     fn the_tool_context_carries_the_outbox_only_when_there_is_one() {
-        let without = tool_context("s", None);
+        let without = tool_context("s", "hi", None);
         assert_eq!(
             without.get::<Conversation>(),
             Some(&Conversation("s".into()))
         );
         assert!(without.get::<Outbox>().is_none());
+        assert_eq!(without.get::<UserText>(), Some(&UserText("hi".into())));
+        // A scheduled turn's text was not typed by the user just now.
+        let typed = Request::from("hi");
+        assert_eq!(typed.user_text(), "hi");
+        let scheduled = Request {
+            scheduled: true,
+            ..typed
+        };
+        assert_eq!(scheduled.user_text(), "");
         let outbox = Outbox::default();
-        assert!(tool_context("s", Some(&outbox)).get::<Outbox>().is_some());
+        assert!(
+            tool_context("s", "hi", Some(&outbox))
+                .get::<Outbox>()
+                .is_some()
+        );
     }
 
     #[test]
