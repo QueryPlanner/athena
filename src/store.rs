@@ -27,6 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod calories;
 mod jobs;
 mod timezone;
+mod user_skills;
 mod workouts;
 
 pub use jobs::Due;
@@ -497,6 +498,45 @@ const MIGRATIONS: &[&str] = &[
      );
      CREATE INDEX jobs_due ON jobs (status, next_run_at);
      CREATE INDEX jobs_by_owner ON jobs (user_id, status);",
+    // 13: each user's own skills, reached only through tools (never the
+    // preamble). `origin` is `github` for a skill installed from a public
+    // repository, pinned to the commit `source_sha`, or `user` for one
+    // created in a conversation. A removed skill keeps its row with
+    // `deleted_at` set until a skill of the same name replaces it.
+    // `skill_previews` holds a previewed install or create until
+    // `skill_confirm` saves it: bound to the user and session, short-lived.
+    "CREATE TABLE user_skills (
+         id          INTEGER PRIMARY KEY AUTOINCREMENT,
+         user_id     INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+         name        TEXT NOT NULL,
+         description TEXT NOT NULL,
+         body        TEXT NOT NULL,
+         origin      TEXT NOT NULL CHECK (origin IN ('github', 'user')),
+         source_repo TEXT,
+         source_path TEXT,
+         source_sha  TEXT,
+         created_at  INTEGER NOT NULL,
+         updated_at  INTEGER NOT NULL,
+         deleted_at  INTEGER,
+         UNIQUE (user_id, name),
+         CHECK ((origin = 'github') = (source_repo IS NOT NULL
+             AND source_path IS NOT NULL AND source_sha IS NOT NULL))
+     );
+     CREATE TABLE user_skill_files (
+         skill_id INTEGER NOT NULL REFERENCES user_skills (id) ON DELETE CASCADE,
+         path     TEXT NOT NULL,
+         content  TEXT NOT NULL,
+         PRIMARY KEY (skill_id, path)
+     );
+     CREATE TABLE skill_previews (
+         user_id    INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+         preview_id TEXT NOT NULL,
+         session_id TEXT NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+         payload    TEXT NOT NULL,
+         created_at INTEGER NOT NULL,
+         expires_at INTEGER NOT NULL,
+         PRIMARY KEY (user_id, preview_id)
+     );",
 ];
 
 /// The schema version this build writes.
@@ -572,6 +612,35 @@ const EXPECTED_COLUMNS: &[(&str, &[&str])] = &[
     ),
     ("messages", &["session_id", "seq", "json"]),
     ("runs", RUN_COLUMNS),
+    (
+        "user_skills",
+        &[
+            "id",
+            "user_id",
+            "name",
+            "description",
+            "body",
+            "origin",
+            "source_repo",
+            "source_path",
+            "source_sha",
+            "created_at",
+            "updated_at",
+            "deleted_at",
+        ],
+    ),
+    ("user_skill_files", &["skill_id", "path", "content"]),
+    (
+        "skill_previews",
+        &[
+            "user_id",
+            "preview_id",
+            "session_id",
+            "payload",
+            "created_at",
+            "expires_at",
+        ],
+    ),
     ("users", &["id", "transport", "external_id", "created_at"]),
     ("user_settings", &["user_id", "timezone", "updated_at"]),
     (
@@ -1615,9 +1684,12 @@ mod tests {
                 "sandboxes",
                 "selected_sessions",
                 "sessions",
+                "skill_previews",
                 "sqlite_sequence",
                 "user_identities",
                 "user_settings",
+                "user_skill_files",
+                "user_skills",
                 "users",
                 "workout_sessions",
                 "workout_sets"

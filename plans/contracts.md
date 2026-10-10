@@ -83,7 +83,7 @@ Claude Code and Claude Desktop use (`src/mcp.rs`).
   A server that fails is a warning; its tools are missing.
 - One connection per server serves every user and session of the process.
 - A tool keeps its server's name. A name that a built-in tool
-  (`agent::reserved_tool_names`: `add`, `read_skill`, `web_search`, the calorie tools, the workout tools, `now`, `timezone_set`, the reminder tools, the sandbox tools) or an earlier server (name order) has, that
+  (`agent::reserved_tool_names`: `add`, `read_skill`, `web_search`, the calorie tools, the workout tools, `now`, `timezone_set`, the reminder tools, the user skill tools, the sandbox tools) or an earlier server (name order) has, that
   is not 1 to 64 of `[A-Za-z0-9_-]`, or an input schema that is not of type
   object, is skipped with a warning, as are a server's tools past the first
   `MAX_TOOLS_PER_SERVER`. Descriptions are cut to `MAX_DESCRIPTION_BYTES`.
@@ -329,11 +329,10 @@ activates it only if the run's `runner::UserText`, the text the user sent
 to start this turn, contains the code and the id as whole words (any case,
 `#12` and `12` alike), in the same session, before expiry; the code then
 stops working. A one-off whose time passed meanwhile is refused; a repeat
-moves to its next run. `runner::UserText` is the same type as the per-user
-skills PR (#42) adds to the tool context: `runner::tool_context(conversation,
-text, outbox)` inserts it, from `Request::user_text()`, which is empty for a
-turn the scheduler starts (`Request::scheduled`), so a scheduled task can
-never confirm one.
+moves to its next run. `runner::tool_context(conversation, text, outbox)`
+inserts `UserText`, from `Request::user_text()`, which is empty for a turn the
+scheduler starts (`Request::scheduled`), so a scheduled task can never
+confirm one. Only reminders use it; the per-user skills do not.
 
 Times are the user's wall clock (`Store::timezone`). A one-off is stored as
 the instant it names; a local time a daylight-saving change skips is
@@ -376,6 +375,73 @@ without one fails the job.
   fail.
 - SIGINT or SIGTERM stops claiming when it stops polling (or when polling
   ends for any other reason); jobs already started finish before exit.
+
+## User skills
+
+Schema migration 13 (after `jobs`, 12) adds three tables in `ATHENA_DB`, all
+keyed to `users.id` (`ON DELETE CASCADE`):
+
+- `user_skills`: `id` (AUTOINCREMENT), `user_id`, `name`, `description`,
+  `body`, `origin` (`github` or `user`), `source_repo` (`owner/name`),
+  `source_path` (empty for the root), `source_sha` (40 hex), `created_at`,
+  `updated_at`, nullable `deleted_at`. `(user_id, name)` is unique; the three
+  `source_*` columns are set exactly when `origin` is `github`. A confirmed
+  skill of an existing name, removed or not, replaces every column and file.
+- `user_skill_files`: `skill_id`, `path` (relative to the skill), `content`
+  (UTF-8 text); key `(skill_id, path)`.
+- `skill_previews`: `user_id`, `preview_id`, `session_id`, `payload` (the
+  previewed `user_skills::SkillRecord` as JSON), `created_at`, `expires_at`;
+  key `(user_id, preview_id)`.
+
+Tools (registered with the calorie tools, whenever a persistent agent is built;
+names always reserved): `skill_list()`, `skill_read(name, file?)`,
+`skill_install(repo, path?, ref?)`, `skill_create(name, description, body?)`,
+`skill_confirm(preview_id)`, `skill_remove(name)`. The owner is the session's
+user (`runner::Conversation`); no tool takes a user. The preamble never lists
+these skills: when the tools are registered it ends with
+`user_skills::PREAMBLE`, which only points at them and tells the agent to show
+the preview and call `skill_confirm` only after the user explicitly agrees in
+the chat.
+
+Two-step add: `skill_install` and `skill_create` save nothing. They stage the
+record for `PREVIEW_TTL_MS` (10 minutes) under an opaque `preview_id` (`pv_`
+and 16 random hex digits) and return a preview: name, description, source
+repository and pinned commit, file list with sizes, the skipped files, the
+body's first 1000 characters, whether it replaces a skill, and the id.
+`skill_confirm(preview_id)` saves the staged record only if the id is the
+user's, from the same session and unexpired; a preview is single use. At most
+`MAX_PENDING` (5) staged per user, the oldest dropped; at most
+`MAX_USER_SKILLS` (64) live skills per user.
+
+Nothing in the code checks that the user agreed. The only thing between a
+preview and a saved skill is the model asking: content that talks the model
+into calling `skill_confirm` can add a skill (see `known-limits`). Containing
+that is the job of the rest of the design: the preview step, the id's
+expiry and single use, the session and user binding, the size limits, GitHub
+text labelled untrusted, and skills only ever being read, never run.
+(`runner::UserText` stays: reminders use it.)
+
+`skill_read` returns the text between two lines of a delimiter made per call
+(`=====skill-<uuid>=====`), after a label: GitHub skills are marked untrusted
+third-party content with their repository and commit; created skills are the
+user's notes. `skill_remove` sets `deleted_at`.
+
+GitHub (`user_skills::github`): `https://api.github.com`, no credentials, so
+public repositories only (60 requests an hour per IP). `repo` is `owner/name`
+or `https://github.com/owner/name[.git]`; owner, name, ref and every path
+segment are 1 to 100 of `[A-Za-z0-9._-]`, not `.` or `..`; a ref may not start
+with `.` or `-` and defaults to `HEAD`. Requests: `GET
+/repos/{o}/{r}/commits/{ref}` (`Accept: application/vnd.github.sha`) for the
+SHA, then `GET /repos/{o}/{r}/contents/{path}?ref={sha}` for listings and,
+with `Accept: application/vnd.github.raw`, files. No redirects, 20 s timeout,
+`User-Agent: athena`. Only entries of type `file` and `dir` with safe names are
+read, paths are rebuilt from the requested path and entry names. Limits:
+`SKILL.md` and each file 64 KiB (a larger other file is skipped), 32 files
+besides `SKILL.md`, 256 KiB in all, 8 directories, depth 3 (deeper ones
+skipped); non-UTF-8 files are skipped. `SKILL.md` is parsed by
+`custom::skills::parse`, and its `name` must equal the last path segment, or
+the repository's name at the root. Files are stored, not staged into the
+sandbox.
 
 ## Compaction
 

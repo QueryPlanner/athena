@@ -1,4 +1,4 @@
-user_version 12
+user_version 13
 
 table browser_links
   token TEXT NOT NULL PK1
@@ -129,6 +129,17 @@ table sessions
   unique index (id) from pk
   unique index (user_id, name) from u
 
+table skill_previews
+  user_id INTEGER NOT NULL PK1
+  preview_id TEXT NOT NULL PK2
+  session_id TEXT NOT NULL
+  payload TEXT NOT NULL
+  created_at INTEGER NOT NULL
+  expires_at INTEGER NOT NULL
+  foreign key session_id REFERENCES sessions (id)
+  foreign key user_id REFERENCES users (id)
+  unique index (user_id, preview_id) from pk
+
 table user_identities
   transport TEXT NOT NULL PK1
   external_id TEXT NOT NULL PK2
@@ -142,6 +153,29 @@ table user_settings
   timezone TEXT NOT NULL
   updated_at INTEGER NOT NULL
   foreign key user_id REFERENCES users (id)
+
+table user_skill_files
+  skill_id INTEGER NOT NULL PK1
+  path TEXT NOT NULL PK2
+  content TEXT NOT NULL
+  foreign key skill_id REFERENCES user_skills (id)
+  unique index (skill_id, path) from pk
+
+table user_skills
+  id INTEGER PK1
+  user_id INTEGER NOT NULL
+  name TEXT NOT NULL
+  description TEXT NOT NULL
+  body TEXT NOT NULL
+  origin TEXT NOT NULL
+  source_repo TEXT
+  source_path TEXT
+  source_sha TEXT
+  created_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL
+  deleted_at INTEGER
+  foreign key user_id REFERENCES users (id)
+  unique index (user_id, name) from u
 
 table users
   id INTEGER PK1
