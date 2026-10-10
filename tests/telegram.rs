@@ -71,26 +71,43 @@ fn app<R: Run + 'static>(
     )
 }
 
+type Settle = Box<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>;
+
 /// A running bot: `serve` in a task, stopped through its shutdown token.
 struct Running {
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
     stop: teloxide::dispatching::ShutdownToken,
+    settle: Settle,
 }
 
 async fn run<R: Run + 'static>(api: &FakeApi, app: Arc<Telegram<R>>) -> Running {
     let bot = bot(&api.url);
     let mut dispatcher = telegram::dispatcher(bot.clone(), app.clone());
     let stop = dispatcher.shutdown_token();
+    let settle_app = app.clone();
+    let settle: Settle = Box::new(move || {
+        let app = settle_app.clone();
+        Box::pin(async move { app.finish().await })
+    });
     let task = tokio::spawn(async move { telegram::serve(&mut dispatcher, bot, &app).await });
     // Polling has started once the first long poll arrives.
     api.wait_for("the first getUpdates", |calls| {
         calls.iter().any(|c| c.method == "getUpdates")
     })
     .await;
-    Running { task, stop }
+    Running { task, stop, settle }
 }
 
 impl Running {
+    /// Wait until every turn started so far has finished, which includes
+    /// giving up the user's busy slot. The bot's reply reaches the fake API
+    /// before the turn ends, so a follow-up sent on seeing the reply could
+    /// otherwise be refused as BUSY. Call this between a turn's reply and
+    /// the same user's next message.
+    async fn settled(&self) {
+        (self.settle)().await;
+    }
+
     async fn stop(self) -> anyhow::Result<()> {
         self.stop.shutdown().unwrap().await;
         self.task.await.unwrap()
@@ -135,6 +152,7 @@ async fn messages_and_commands_round_trip_through_the_bot_api() {
 
     api.push(text_from(1, "hello"));
     assert_eq!(api.messages_to(1, 1).await, ["hello back"]);
+    bot.settled().await;
     api.push(text_from(1, "/new work"));
     api.push(text_from(1, "remember this"));
     // A turn replies on its own; wait for it before asking for the list.
@@ -208,6 +226,7 @@ async fn a_linked_api_continues_the_telegram_session_and_survives_a_restart() {
     api.push(text_from(42, "/new notes"));
     api.push(text_from(42, "telegram message"));
     api.messages_to(42, 2).await;
+    bot.settled().await;
     api.push(text_from(42, "/link my-api"));
     let replies = api.messages_to(42, 3).await;
     assert!(replies[2].contains("X-Athena-User: my-api"), "{replies:?}");
@@ -401,7 +420,7 @@ async fn shutdown_waits_for_a_turn_in_flight_to_reply() {
         started,
         gate: gate.clone(),
     });
-    let Running { task, stop } = run(&api, app).await;
+    let Running { task, stop, .. } = run(&api, app).await;
 
     api.push(text_from(1, "long job"));
     starts.recv().await.unwrap();
@@ -843,9 +862,11 @@ async fn files_that_cannot_be_fetched_or_saved_are_described_to_the_model() {
         None,
     ));
     api.messages_to(12, 1).await;
+    running.settled().await;
     // Telegram does not know the file.
     api.push(media_from(12, ("document", document("gone", None)), None));
     api.messages_to(12, 2).await;
+    running.settled().await;
     api.push(media_from(12, ("document", document("liar", None)), None));
     api.messages_to(12, 3).await;
     running.stop().await.unwrap();
@@ -960,9 +981,11 @@ async fn voice_notes_and_audio_files_become_turns_through_cloudflare() {
     let (kind, file) = note("voice", "vn", "audio/ogg");
     api.push(media_from(40, (&kind, file), Some("/new cardio")));
     api.messages_to(40, 1).await;
+    running.settled().await;
     let (kind, file) = note("audio", "au", "audio/mpeg");
     api.push(media_from(40, (&kind, file), None));
     api.messages_to(40, 2).await;
+    running.settled().await;
     let (kind, file) = note("voice", "liar", "audio/ogg");
     api.push(media_from(40, (&kind, file), None));
     let replies = api.messages_to(40, 3).await;
