@@ -18,6 +18,10 @@ anyhow = "1.0.104"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "matched-path", "tokio"] }
 dotenvy = "0.15.7"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+# Time zones and DST for each user's local time (src/timezone.rs). Default
+# features read the system tzdb (/usr/share/zoneinfo); `tzdb-bundle-always`
+# embeds a copy that is used only when the host has none.
+jiff = { version = "0.2.37", features = ["tzdb-bundle-always"] }
 libc = "0.2.189"
 opentelemetry = { version = "0.33.0", default-features = false, features = ["trace", "logs"] }
 opentelemetry-appender-tracing = "0.33.0"
