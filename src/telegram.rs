@@ -30,8 +30,16 @@
 //!   them until none has come for [`ALBUM_WAIT`], then runs one turn.
 //! - Files the turn's tools send (`send_photo`, `send_file`) follow the
 //!   reply. A photo Telegram refuses is sent again as a file.
+//! - A voice note or an audio file is transcribed by Cloudflare Workers AI
+//!   ([`voice`]) when `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` are
+//!   set, and otherwise answered with [`NOT_TEXT`]. Its caption, then the
+//!   transcript, is the prompt: an ordinary text turn, the user's one turn
+//!   claimed while it is transcribed. The transcript is not echoed back; the
+//!   reply shows what was understood, and the transcript is in the session.
+//!   The audio is never stored, and one note is transcribed at a time.
 
 pub mod render;
+pub mod voice;
 
 use crate::agent;
 use crate::media::{self, Attachment, File, Kind, Outbox};
@@ -59,6 +67,7 @@ use teloxide::update_listeners::Polling;
 use teloxide::{ApiError, Bot, RequestError, dptree};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use voice::{VOICE_LIMIT, VOICE_SECONDS, Whisper};
 
 /// The transport name every Telegram user is stored under.
 pub const TRANSPORT: &str = "telegram";
@@ -98,6 +107,10 @@ pub const DOWNLOAD_LIMIT: usize = 20 * 1024 * 1024;
 /// Files downloaded at once, across every user.
 const DOWNLOADS: usize = 4;
 
+/// Voice notes downloaded and transcribed at once, across every user. One,
+/// so a burst of notes cannot hold many copies of audio and base64 at once.
+const VOICES: usize = 1;
+
 /// How long an album is collected after its latest item arrived. Telegram
 /// sends the items of an album as separate messages in quick succession and
 /// never says how many there are.
@@ -109,6 +122,12 @@ pub const ALBUM_LIMIT: usize = 10;
 pub const BUSY: &str =
     "Still working on your last message. Send this one again once I have replied.";
 pub const NOT_TEXT: &str = "I read text, photos and files, not this kind of message.";
+/// [`NOT_TEXT`] when voice notes are transcribed.
+pub const NOT_TEXT_OR_VOICE: &str =
+    "I read text, voice notes, photos and files, not this kind of message.";
+/// The reply to a voice note that could not be downloaded or transcribed.
+pub const NOT_HEARD: &str =
+    "I could not transcribe that voice note. Try again, or send it as text.";
 pub const SWITCH_USAGE: &str = "Usage: /switch NAME. /sessions lists your sessions.";
 pub const LINK_USAGE: &str = "Usage: /link API_USER_ID. Choose a never-used API user ID.";
 pub const FAILED: &str = "Something went wrong on my side. Try again in a moment.";
@@ -429,6 +448,48 @@ pub struct Incoming {
     pub files: Vec<IncomingFile>,
     /// The album (Telegram's `media_group_id`) the message belongs to.
     pub album: Option<String>,
+    /// The voice note or audio file the message carries.
+    pub voice: Option<IncomingVoice>,
+}
+
+/// A voice note or audio file in a message, not yet downloaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingVoice {
+    /// Telegram's `file_id`, for `getFile`.
+    pub id: String,
+    /// As Telegram reports it; 0 if it does not.
+    pub size: u64,
+    /// As the sender's client reports it.
+    pub seconds: u32,
+}
+
+/// Why `voice` is not transcribed, if it is not, known before it is
+/// downloaded: it is larger or longer than the limits.
+pub fn unheard(voice: &IncomingVoice) -> Option<String> {
+    const MB: u64 = 1024 * 1024;
+    if voice.size > VOICE_LIMIT as u64 {
+        return Some(format!(
+            "That voice note is {} MB; I can transcribe up to {} MB.",
+            voice.size.div_ceil(MB),
+            VOICE_LIMIT as u64 / MB
+        ));
+    }
+    if voice.seconds > VOICE_SECONDS {
+        return Some(format!(
+            "That voice note is {} minutes long; I can transcribe up to {} minutes.",
+            voice.seconds.div_ceil(60),
+            VOICE_SECONDS / 60
+        ));
+    }
+    None
+}
+
+/// The prompt a voice note makes: its caption, if any, then the transcript.
+pub fn spoken(caption: &str, transcript: &str) -> String {
+    match caption.trim() {
+        "" => transcript.to_string(),
+        caption => format!("{caption}\n\n{transcript}"),
+    }
 }
 
 /// A photo or file in a message, not yet downloaded.
@@ -464,6 +525,10 @@ pub struct Telegram<R> {
     sandboxes: Option<Arc<Sandboxes>>,
     /// Permits for [`DOWNLOADS`].
     downloads: Arc<Semaphore>,
+    /// Transcribes voice notes; none without Cloudflare settings.
+    whisper: Option<Arc<Whisper>>,
+    /// Permits for [`VOICES`].
+    voices: Arc<Semaphore>,
     log: Log,
     typing_every: Duration,
     /// Users with a turn running.
@@ -518,6 +583,8 @@ impl<R: Run + 'static> Telegram<R> {
             agent: Arc::new(agent),
             sandboxes: None,
             downloads: Arc::new(Semaphore::new(DOWNLOADS)),
+            whisper: None,
+            voices: Arc::new(Semaphore::new(VOICES)),
             log,
             typing_every: TYPING_EVERY,
             busy: Arc::default(),
@@ -531,6 +598,13 @@ impl<R: Run + 'static> Telegram<R> {
     /// tools use.
     pub fn sandboxes(mut self, sandboxes: Option<Arc<Sandboxes>>) -> Self {
         self.sandboxes = sandboxes;
+        self
+    }
+
+    /// Transcribe voice notes with `whisper`; without one they are not
+    /// prompts.
+    pub fn voice(mut self, whisper: Option<Arc<Whisper>>) -> Self {
+        self.whisper = whisper;
         self
     }
 
@@ -610,6 +684,20 @@ impl<R: Run + 'static> Telegram<R> {
         user_id: u64,
         incoming: Incoming,
     ) -> Result<Option<String>, service::Error> {
+        if let Some(voice) = incoming.voice {
+            // Like a file's caption, a voice note's is never a command.
+            if self.whisper.is_none() {
+                return Ok(Some(NOT_TEXT.into()));
+            }
+            if let Some(why) = unheard(&voice) {
+                return Ok(Some(why));
+            }
+            let user = self.service.user(TRANSPORT, &user_id.to_string()).await?;
+            let text = incoming.text.unwrap_or_default();
+            return self
+                .start_turn(chat, user, user_id, text, Vec::new(), Some(voice))
+                .await;
+        }
         if !incoming.files.is_empty() {
             // A caption is never a command: the file is what was sent.
             if let Some(big) = incoming
@@ -626,11 +714,15 @@ impl<R: Run + 'static> Telegram<R> {
             let user = self.service.user(TRANSPORT, &user_id.to_string()).await?;
             let text = incoming.text.unwrap_or_default();
             return self
-                .start_turn(chat, user, user_id, text, incoming.files)
+                .start_turn(chat, user, user_id, text, incoming.files, None)
                 .await;
         }
         let Some(text) = incoming.text.as_deref() else {
-            return Ok(Some(NOT_TEXT.into()));
+            let reply = match self.whisper {
+                Some(_) => NOT_TEXT_OR_VOICE,
+                None => NOT_TEXT,
+            };
+            return Ok(Some(reply.into()));
         };
         let user = self.service.user(TRANSPORT, &user_id.to_string()).await?;
         let reply = match parse(text) {
@@ -650,7 +742,7 @@ impl<R: Run + 'static> Telegram<R> {
             Input::Unknown(cmd) => format!("Unknown command /{cmd}.\n\n{}", command_list()),
             Input::Text(prompt) => {
                 return self
-                    .start_turn(chat, user, user_id, prompt.into(), Vec::new())
+                    .start_turn(chat, user, user_id, prompt.into(), Vec::new(), None)
                     .await;
             }
         };
@@ -820,7 +912,7 @@ impl<R: Run + 'static> Telegram<R> {
             let reply = match app.claim_turn(user_id).await {
                 Ok(Some((busy, user, session))) => {
                     let _busy = busy;
-                    return app.turn(chat, user, session, text, album.files).await;
+                    return app.turn(chat, user, session, text, album.files, None).await;
                 }
                 Ok(None) => BUSY.into(),
                 Err(e) => {
@@ -846,9 +938,9 @@ impl<R: Run + 'static> Telegram<R> {
         Ok(Some((busy, user, session)))
     }
 
-    /// Start a turn for `text` and `files` in the user's current session,
-    /// unless one of theirs is already running. Returns what to reply now,
-    /// if anything.
+    /// Start a turn for `text`, `files` and `voice` in the user's current
+    /// session, unless one of theirs is already running. Returns what to
+    /// reply now, if anything.
     async fn start_turn<C: Chat>(
         self: &Arc<Self>,
         chat: &C,
@@ -856,6 +948,7 @@ impl<R: Run + 'static> Telegram<R> {
         user_id: u64,
         text: String,
         files: Vec<IncomingFile>,
+        voice: Option<IncomingVoice>,
     ) -> Result<Option<String>, service::Error> {
         let Some(busy) = Busy::claim(&self.busy, user_id) else {
             return Ok(Some(BUSY.into()));
@@ -866,7 +959,7 @@ impl<R: Run + 'static> Telegram<R> {
         while turns.try_join_next().is_some() {}
         turns.spawn(async move {
             let _busy = busy;
-            app.turn(chat, user, session, text, files).await;
+            app.turn(chat, user, session, text, files, voice).await;
         });
         Ok(None)
     }
@@ -920,8 +1013,32 @@ impl<R: Run + 'static> Telegram<R> {
         received
     }
 
+    /// The text spoken in `voice`, or `None` after logging why not. One
+    /// note at a time is downloaded and transcribed, and its audio is gone
+    /// when this returns.
+    async fn transcribe<C: Chat>(&self, chat: &C, voice: &IncomingVoice) -> Option<String> {
+        let whisper = self.whisper.as_ref()?;
+        // Cannot fail: the semaphores are never closed.
+        let _voice = self.voices.acquire().await.expect("voices is never closed");
+        let download = self
+            .downloads
+            .acquire()
+            .await
+            .expect("downloads is never closed");
+        let audio = chat.download(&voice.id, VOICE_LIMIT).await;
+        drop(download);
+        let heard = match audio {
+            Ok(audio) => whisper.transcribe(audio).await,
+            Err(e) => Err(e.context("downloading it from Telegram failed")),
+        };
+        heard
+            .inspect_err(|e| (self.log)(&format!("transcribing a voice note failed: {e:#}")))
+            .ok()
+    }
+
     /// Run one turn and send its reply, then the files its tools sent,
-    /// showing "typing..." meanwhile.
+    /// showing "typing..." meanwhile. A voice note is transcribed first, and
+    /// without a transcript the turn does not run.
     ///
     /// The model call runs in its own task: a panic in it becomes a reply,
     /// and nothing cancels it once started.
@@ -932,6 +1049,7 @@ impl<R: Run + 'static> Telegram<R> {
         session: Session,
         text: String,
         files: Vec<IncomingFile>,
+        voice: Option<IncomingVoice>,
     ) {
         typing(&chat, &self.log).await;
         let typing = tokio::spawn(keep_typing(
@@ -939,6 +1057,18 @@ impl<R: Run + 'static> Telegram<R> {
             self.typing_every,
             self.log.clone(),
         ));
+        let text = match &voice {
+            None => text,
+            Some(voice) => match self.transcribe(&chat, voice).await {
+                Some(transcript) => spoken(&text, &transcript),
+                None => {
+                    typing.abort();
+                    let _ = typing.await;
+                    say(&chat, &self.log, NOT_HEARD).await;
+                    return;
+                }
+            },
+        };
         let mut received = Vec::with_capacity(files.len());
         for file in files {
             received.push(self.receive(&chat, &session, file).await);
@@ -1234,18 +1364,23 @@ async fn on_message<R: Run + 'static>(
     app: Arc<Telegram<R>>,
 ) -> Result<(), Infallible> {
     let files = files(&message);
+    let voice = voice_note(&message);
     let incoming = Incoming {
         chat_id: message.chat.id.0,
         private: message.chat.is_private(),
         user_id: message.from.as_ref().map(|user| user.id.0),
-        // A caption only counts with the photo or file it came with: a
-        // captioned video is not a prompt, and its caption not a command.
+        // A caption only counts with the photo, file or voice note it came
+        // with: a captioned video is not a prompt, and its caption not a
+        // command.
         text: message
             .text()
-            .or(message.caption().filter(|_| !files.is_empty()))
+            .or(message
+                .caption()
+                .filter(|_| !files.is_empty() || voice.is_some()))
             .map(str::to_string),
         files,
         album: message.media_group_id().map(|id| id.0.clone()),
+        voice,
     };
     let chat = TelegramChat {
         bot,
@@ -1274,6 +1409,17 @@ fn files(message: &Message) -> Vec<IncomingFile> {
         size: doc.file.size.into(),
     });
     photo.into_iter().chain(document).collect()
+}
+
+/// The voice note or audio file in `message`.
+fn voice_note(message: &Message) -> Option<IncomingVoice> {
+    let voice = message.voice().map(|v| (&v.file, v.duration));
+    let audio = message.audio().map(|a| (&a.file, a.duration));
+    voice.or(audio).map(|(file, duration)| IncomingVoice {
+        id: file.id.0.clone(),
+        size: file.size.into(),
+        seconds: duration.seconds(),
+    })
 }
 
 fn bot_commands() -> Vec<BotCommand> {
@@ -1316,6 +1462,7 @@ pub async fn serve<R: Run + 'static>(
 pub async fn main(model: &str) -> Result<()> {
     let stop = shutdown::listen()?;
     let config = Config::from_env()?;
+    let whisper = Whisper::from_env()?.map(Arc::new);
     let client = agent::client()?;
     let store = Store::open(&store::path())?;
     let compactor = crate::compaction::from_env(model)?;
@@ -1324,8 +1471,11 @@ pub async fn main(model: &str) -> Result<()> {
     let sandboxes = agent::sandboxes_from_env(&store)?;
     let mcp = agent::connect_mcp(&log_warning).await;
     let agent = agent::build_with(&client, model, service.memory(), sandboxes.clone(), &mcp);
-    let app =
-        Arc::new(Telegram::new(service, store, agent, Arc::new(log_warning)).sandboxes(sandboxes));
+    let app = Arc::new(
+        Telegram::new(service, store, agent, Arc::new(log_warning))
+            .sandboxes(sandboxes)
+            .voice(whisper),
+    );
     let bot = config.bot();
     let mut dispatcher = dispatcher(bot.clone(), app.clone());
     stop_on(dispatcher.shutdown_token(), stop);
@@ -1771,6 +1921,7 @@ mod tests {
             text: Some(text.into()),
             files: vec![],
             album: None,
+            voice: None,
         }
     }
 
@@ -2033,6 +2184,7 @@ mod tests {
             text: Some("hello everyone".into()),
             files: vec![],
             album: None,
+            voice: None,
         };
         let channel = Incoming {
             chat_id: 5,
@@ -2041,6 +2193,7 @@ mod tests {
             text: Some("post".into()),
             files: vec![],
             album: None,
+            voice: None,
         };
         let sticker = Incoming {
             text: None,
@@ -2462,6 +2615,226 @@ mod tests {
             h.logged(),
             ["downloading a file from Telegram failed: file not found"]
         );
+    }
+
+    // ---- voice notes ----
+
+    const OGG: &[u8] = b"OggS\0\x02 a short voice note";
+    const CF_TOKEN: &str = "cf-test-token-not-real";
+
+    fn voice_note(id: &str, size: u64, seconds: u32) -> IncomingVoice {
+        IncomingVoice {
+            id: id.into(),
+            size,
+            seconds,
+        }
+    }
+
+    /// A voice note from `user`, captioned `caption`.
+    fn spoke(user: u64, caption: Option<&str>, voice: IncomingVoice) -> Incoming {
+        Incoming {
+            text: caption.map(str::to_string),
+            voice: Some(voice),
+            ..from(user, "")
+        }
+    }
+
+    /// A harness that transcribes with a fake Cloudflare, and that fake.
+    async fn listening(
+        turns: Vec<MockTurn>,
+    ) -> (
+        Harness<Agent>,
+        MockCompletionModel,
+        voice::fake::FakeCloudflare,
+    ) {
+        let cf = voice::fake::FakeCloudflare::start().await;
+        let (mut h, model) = watched(turns);
+        let whisper = Whisper::new("acct1", CF_TOKEN, &cf.url).unwrap();
+        Arc::get_mut(&mut h.app).unwrap().whisper = Some(Arc::new(whisper));
+        (h, model, cf)
+    }
+
+    /// A recorder that downloads `id` as [`OGG`].
+    fn with_audio(id: &str) -> (Recorder, mpsc::UnboundedReceiver<Event>) {
+        let (mut chat, rx) = recorder();
+        chat.files = Arc::new([(id.to_string(), OGG.to_vec())].into());
+        (chat, rx)
+    }
+
+    #[test]
+    fn a_voice_notes_prompt_is_its_caption_then_its_transcript() {
+        assert_eq!(spoken("", "log squats"), "log squats");
+        assert_eq!(spoken(" \n", "log squats"), "log squats");
+        assert_eq!(spoken(" leg day: ", "log squats"), "leg day:\n\nlog squats");
+    }
+
+    #[test]
+    fn a_voice_note_over_the_size_or_length_limit_is_refused_by_name() {
+        assert_eq!(
+            unheard(&voice_note("v", VOICE_LIMIT as u64, VOICE_SECONDS)),
+            None
+        );
+        // Size unknown: only the length is checked before the download.
+        assert_eq!(unheard(&voice_note("v", 0, 1)), None);
+        assert_eq!(
+            unheard(&voice_note("v", VOICE_LIMIT as u64 + 1, 1)).unwrap(),
+            "That voice note is 3 MB; I can transcribe up to 2 MB."
+        );
+        assert_eq!(
+            unheard(&voice_note("v", 10, VOICE_SECONDS + 1)).unwrap(),
+            "That voice note is 6 minutes long; I can transcribe up to 5 minutes."
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_voice_note_is_transcribed_and_answered_as_a_text_turn() {
+        let (h, model, cf) =
+            listening(vec![MockTurn::text("logged"), MockTurn::text("again")]).await;
+        cf.answer(200, &voice::fake::heard(" log five sets of squats "));
+        let (chat, rx) = with_audio("v1");
+
+        let note = spoke(20, Some(" leg day: "), voice_note("v1", 9, 4));
+        let events = exchange(&h, chat, rx, note).await;
+
+        assert_eq!(events, [Event::Typing, said("logged")]);
+        let prompt = model.requests()[0].chat_history.last().unwrap().clone();
+        assert_eq!(
+            prompt.rag_text().unwrap(),
+            "leg day:\n\nlog five sets of squats"
+        );
+        let seen = cf.seen();
+        assert_eq!(seen[0].body["audio"], media::base64(OGG));
+        assert_eq!(
+            seen[0].authorization.as_deref(),
+            Some(&*format!("Bearer {CF_TOKEN}"))
+        );
+        // The transcript is stored as the user's message; the audio is not.
+        assert_eq!(h.sessions(20), [("default".to_string(), 2)]);
+        let stored: Vec<String> = h
+            .store
+            .db_for_tests()
+            .prepare("SELECT json FROM messages")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(stored[0].contains("log five sets of squats"), "{stored:?}");
+        assert!(stored.iter().all(|m| !m.contains(&media::base64(OGG))));
+
+        // A caption that looks like a command is part of the prompt.
+        let (chat, rx) = with_audio("v1");
+        let events = exchange(
+            &h,
+            chat,
+            rx,
+            spoke(20, Some("/new x"), voice_note("v1", 9, 4)),
+        )
+        .await;
+        assert_eq!(events, [Event::Typing, said("again")]);
+        let prompt = model.requests()[1].chat_history.last().unwrap().clone();
+        assert_eq!(prompt.rag_text().unwrap(), "/new x\n\nhello there");
+        assert_eq!(h.selected(20), None);
+        assert!(h.logged().is_empty(), "{:?}", h.logged());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_cloudflare_a_voice_note_is_not_a_prompt() {
+        let h = harness(vec![]);
+        let (chat, rx) = with_audio("v1");
+        let events = exchange(&h, chat, rx, spoke(21, Some("hi"), voice_note("v1", 9, 4))).await;
+        assert_eq!(events, [said(NOT_TEXT)]);
+        assert!(h.sessions(21).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn with_cloudflare_other_messages_name_voice_notes_and_big_notes_are_refused() {
+        let (h, _model, cf) = listening(vec![]).await;
+        let sticker = Incoming {
+            text: None,
+            ..from(22, "")
+        };
+        let (chat, rx) = recorder();
+        assert_eq!(
+            exchange(&h, chat, rx, sticker).await,
+            [said(NOT_TEXT_OR_VOICE)]
+        );
+
+        for note in [
+            voice_note("v1", VOICE_LIMIT as u64 + 1, 4),
+            voice_note("v1", 9, VOICE_SECONDS + 1),
+        ] {
+            let (chat, rx) = with_audio("v1");
+            let events = exchange(&h, chat, rx, spoke(22, None, note.clone())).await;
+            assert_eq!(events, [said(&unheard(&note).unwrap())]);
+        }
+        assert!(cf.seen().is_empty());
+        assert!(h.sessions(22).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_note_that_cannot_be_fetched_or_transcribed_is_answered_and_logged() {
+        let (h, model, cf) = listening(vec![]).await;
+        cf.answer(
+            401,
+            r#"{"success": false, "errors": [{"message": "Authentication error"}]}"#,
+        );
+        let (chat, rx) = with_audio("v1");
+        let events = exchange(&h, chat, rx, spoke(23, None, voice_note("v1", 9, 4))).await;
+        assert_eq!(events, [Event::Typing, said(NOT_HEARD)]);
+
+        let (chat, rx) = with_audio("v1");
+        let events = exchange(&h, chat, rx, spoke(23, None, voice_note("gone", 9, 4))).await;
+        assert_eq!(events, [Event::Typing, said(NOT_HEARD)]);
+
+        assert_eq!(cf.seen().len(), 1);
+        assert!(model.requests().is_empty());
+        assert_eq!(h.sessions(23), [("default".to_string(), 0)]);
+        assert!(!lock(&h.app.busy).contains(&23));
+        assert_eq!(
+            h.logged(),
+            [
+                "transcribing a voice note failed: Cloudflare answered HTTP 401 without success: \
+                 Authentication error",
+                "transcribing a voice note failed: downloading it from Telegram failed: \
+                 file not found"
+            ]
+        );
+        assert!(h.logged().iter().all(|l| !l.contains(CF_TOKEN)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_note_is_transcribed_at_a_time_and_its_sender_is_busy_meanwhile() {
+        let (h, _model, cf) = listening(vec![MockTurn::text("one"), MockTurn::text("two")]).await;
+        cf.park();
+        let (first, mut first_rx) = with_audio("v1");
+        let (second, mut second_rx) = with_audio("v1");
+
+        h.app
+            .handle(first, spoke(30, None, voice_note("v1", 9, 4)))
+            .await;
+        h.app
+            .handle(second, spoke(31, None, voice_note("v1", 9, 4)))
+            .await;
+        cf.arrived(1).await;
+
+        // The first note holds the one permit, so the second waits for it.
+        assert_eq!(h.app.voices.available_permits(), 0);
+        assert_eq!(cf.seen().len(), 1);
+        assert_eq!(h.now(30, "hi").await, [said(BUSY)]);
+
+        cf.release(2);
+        h.app.finish().await;
+        assert_eq!(cf.seen().len(), 2);
+        let mut replies = Vec::new();
+        for rx in [&mut first_rx, &mut second_rx] {
+            while let Ok(e) = rx.try_recv() {
+                replies.extend(e.said().map(str::to_string));
+            }
+        }
+        replies.sort();
+        assert_eq!(replies, ["one", "two"]);
+        assert_eq!(h.app.voices.available_permits(), VOICES);
     }
 
     /// An agent whose tools queued `attachments` during the turn.

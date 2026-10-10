@@ -49,6 +49,8 @@ Rules for `serve` and `telegram`:
 | `ATHENA_SANDBOX_IMAGE` | agent | default `ghcr.io/queryplanner/athena-sandbox:latest` |
 | `ATHENA_SANDBOX_TIMEOUT_SECS` | agent | default `1800`, minimum 60 |
 | `ATHENA_PUBLIC_URL` | agent | base of sign-in links, e.g. `http://100.124.202.79:18080`; default `http://$ATHENA_ADDR` (so `serve` and `telegram` agree from the one env file). Must be http(s); required when `ATHENA_ADDR` is unspecified (`0.0.0.0`, `[::]`). |
+| `CLOUDFLARE_ACCOUNT_ID` | telegram | Cloudflare account id (letters and digits). With `CLOUDFLARE_API_TOKEN`, voice notes and audio files are transcribed. **Both unset means voice notes are not prompts; only one set is a startup error.** |
+| `CLOUDFLARE_API_TOKEN` | telegram | Cloudflare API token with Workers AI access; a secret, sent only as `Authorization: Bearer` to the endpoint below |
 | `ATHENA_MCP_CONFIG` | agent | path of an `mcp.json` (section "MCP servers"). **Unset means no MCP tools**, and no default path is searched. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | all | OTLP/HTTP base URL; on the VM OpenObserve, `http://<tailnet-ip>:5080/api/default` (`/v1/traces` and `/v1/logs` are appended). **Unset means no OTLP export.** |
 | `OTEL_EXPORTER_OTLP_HEADERS` | all | `Authorization=Basic%20<base64 of OpenObserve root email:password>`, written by `setup-host.sh` into the env file only |
@@ -256,6 +258,8 @@ preamble tells the agent to call `now` before reasoning about dates. No env var.
 | Reply format | `sendMessage` with plain `text` and `entities` (UTF-16 offsets), no `parse_mode`; model Markdown rendered by `telegram::render::render`; a chunk answered "Bad Request" is resent as plain text without entities | `telegram/render.rs`, `telegram.rs` |
 | Message limit | 4096 UTF-16 units after parsing (`telegram::MESSAGE_LIMIT`), at most 8 messages (`telegram::MAX_CHUNKS`) | Bot API |
 | Download limit | 20 MB (`telegram::DOWNLOAD_LIMIT`) | Bot API |
+| Voice notes | `voice` and `audio` messages; refused before download over 2 MB (`telegram::voice::VOICE_LIMIT`) or 5 minutes (`VOICE_SECONDS`), and the download stops past 2 MB; one at a time (`telegram::VOICES`); audio never stored | `telegram.rs` |
+| Transcription | `POST https://api.cloudflare.com/client/v4/accounts/<CLOUDFLARE_ACCOUNT_ID>/ai/run/@cf/openai/whisper-large-v3-turbo`, JSON `{"audio": <base64>, "task": "transcribe"}`; needs HTTP 2xx, `success: true` and a non-blank `result.text`; connect timeout 5 s, total 90 s, no redirects, answer read up to 256 KiB | `telegram/voice.rs` |
 | Albums | collected by `(user, media_group_id)` until 2 s pass with no new item (`telegram::ALBUM_WAIT`), at most 10 items, one turn | `telegram.rs` |
 | Upload limits | photo 10 MB, document 50 MB, caption 1024 chars, 10 files a turn | `sandbox::tools`, `media::MAX_ATTACHMENTS` |
 | Image shown to the model | PNG, JPEG, GIF, WebP up to 3.75 MB; 4 a request | `media` |

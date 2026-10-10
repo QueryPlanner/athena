@@ -117,6 +117,8 @@ set it), else the crate version with `-dev`.
 | `ATHENA_SKILLS_DIR` | all | unset | Directory of Agent Skills; see Instructions and skills |
 | `TELEGRAM_BOT_TOKEN` | `telegram` | none, required | Bot token from @BotFather |
 | `TELEGRAM_API_URL` | `telegram` | `https://api.telegram.org` | Bot API server; the tests point it at a fake one |
+| `CLOUDFLARE_ACCOUNT_ID` | `telegram` | unset | With `CLOUDFLARE_API_TOKEN`, transcribe voice notes; see Telegram |
+| `CLOUDFLARE_API_TOKEN` | `telegram` | unset | Cloudflare API token allowed to run Workers AI |
 
 `athena serve` and `athena telegram` stop the same way on SIGINT (Ctrl-C)
 and SIGTERM (`kill`, `docker stop`, systemd): they take no new work, let the
@@ -211,6 +213,18 @@ again as a file. The photos of an album arrive as separate messages; the
 bot collects them until 2 seconds pass with no new one, then runs one turn
 for all of them, with the album's caption as the text. See "Images and
 files" below.
+
+A voice note or an audio file is a prompt when `CLOUDFLARE_ACCOUNT_ID` and
+`CLOUDFLARE_API_TOKEN` are both set (setting only one stops the bot at
+startup). The bot downloads it and sends it to Cloudflare Workers AI's
+`@cf/openai/whisper-large-v3-turbo`, and the transcript, after the caption
+if there is one, is the prompt. The transcript is not sent back to you; the
+reply shows what was understood, and the transcript is stored in the session
+like typed text. The audio is never stored. Notes up to 2 MB and 5 minutes
+are transcribed, one at a time across all users; a larger or longer one is
+refused with a reply, and one that cannot be transcribed is answered "I
+could not transcribe that voice note". The token goes to Cloudflare only, as
+a header, and is never logged.
 
 While the model works the bot shows "typing...". The model writes Markdown
 and the bot renders it for Telegram: bold, italic, strikethrough, `code`,
@@ -1168,9 +1182,16 @@ log events never include prompt or reply text.
   more, but that is not checked here. Raw HTML is shown as written. Table widths use an
   approximation of Unicode's East Asian Width, so some emoji and rare
   scripts can misalign a grid.
-- Edited messages, stickers, voice notes and other messages that are neither
-  text, a photo nor a file are not prompts. Edits are ignored; the rest get
-  "I read text, photos and files, not this kind of message."
+- Edited messages, stickers, video notes and other messages that are neither
+  text, a photo, a file nor a voice note are not prompts. Edits are ignored;
+  the rest get "I read text, voice notes, photos and files, not this kind of
+  message." Without the Cloudflare settings, voice notes and audio files are
+  not prompts either, and the reply leaves out voice notes.
+- Voice notes are transcribed by Cloudflare, so their audio leaves the
+  machine, and every user who can reach the bot spends the owner's Workers
+  AI credit; there is no per-user cap. Each audio file of an album is its own
+  turn, so the second gets the busy reply. A transcription may take up to
+  90 seconds before the turn starts, which counts toward the stop timeout.
 - An album is collected until 2 seconds pass with no new item from it, so
   its reply starts 2 seconds late. An item that Telegram delivers later than
   that becomes a turn of its own, or gets the busy reply if the album's turn

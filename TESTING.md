@@ -350,6 +350,11 @@ throwaway database.
    shows. Then ask for a 300-line code block: it continues in a second
    message, monospace in both. This is the one check no fake can make: it
    shows how real clients render the entities.
+   8b. With `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` set, send a
+   voice note ("Remember the code word OTTER-4410"), then an MP3 or M4A as
+   an audio file. Each is answered as if typed; `/sessions` counts two more
+   messages for each. This is the one check that real Telegram audio
+   formats are accepted by Cloudflare; the tests use a fake.
 9. Press Ctrl-C, start the bot again, send `/sessions`: `default` is still
    marked. `/usage` lists both sessions.
 10. Add the bot to a group and send a message there: the bot says nothing,
