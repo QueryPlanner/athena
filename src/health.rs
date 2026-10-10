@@ -1,5 +1,6 @@
 //! Google Health: read-only recovery, sleep and activity data, synced once a
-//! day into `health_daily` and read by the model through three tools.
+//! day into `health_daily` and `health_points` and read by the model through
+//! six tools.
 //!
 //! How a user connects ("paste back"). Athena has no HTTPS callback, so it
 //! reuses the redirect URI already registered for Blacki's Google OAuth client
@@ -25,6 +26,8 @@
 
 pub mod catalog;
 pub mod client;
+pub mod data;
+pub mod export;
 pub mod normalize;
 pub mod points;
 pub mod sync;
@@ -92,9 +95,16 @@ pub const BACKFILL_FLOOR_DAYS: i64 = 3 * 365;
 /// A data type is done after this many empty chunks in a row (12 weeks).
 pub const BACKFILL_EMPTY_CHUNKS: i64 = 12;
 
-/// The names of the three tools. `agent::reserved_tool_names` includes them
+/// The names of the tools. `agent::reserved_tool_names` includes them
 /// whether or not Google Health is configured.
-pub const NAMES: [&str; 3] = ["health_status", "health_summary", "health_sync_now"];
+pub const NAMES: [&str; 6] = [
+    "health_status",
+    "health_summary",
+    "health_sync_now",
+    data::SIZE,
+    data::POINTS,
+    data::EXPORT,
+];
 
 /// A token, code or client secret. It has no `Display`, and its `Debug`
 /// shows nothing.

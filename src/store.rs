@@ -27,6 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod brief;
 mod calories;
 mod health;
+mod health_data;
 mod jobs;
 mod timezone;
 mod user_skills;
@@ -34,6 +35,9 @@ mod workouts;
 
 pub use brief::{Brief, BriefCandidate};
 pub use health::{Backfill, Candidate, Claim, Connection as HealthConnection, PointRow};
+pub use health_data::{
+    After, BatchQuery, Page, PageQuery, PointRecord, TypeSize, Window as HealthWindow,
+};
 pub use jobs::Due;
 
 /// One turn: the model calls it made and what they cost.

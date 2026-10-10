@@ -402,8 +402,9 @@ On the VM, a human adds `EXA_API_KEY=...` to `/etc/athena/<env>.env` with
 With `GOOGLE_HEALTH_CLIENT_ID`, `GOOGLE_HEALTH_CLIENT_SECRET` and
 `GOOGLE_HEALTH_TOKEN_ENCRYPTION_KEY` set (the values Blacki uses), a Telegram
 user can connect their Google Health (the Fitbit successor) read-only, and the
-agent gets `health_status`, `health_summary(days)` and `health_sync_now`. It
-uses them for sleep, recovery and activity when you ask what to train.
+agent gets `health_status`, `health_summary(days)`, `health_sync_now` and, for
+the raw points, `health_data_size`, `health_points` and `health_export` (below).
+It uses them for sleep, recovery and activity when you ask what to train.
 Without the three settings the tools say it is not set up, and setting only
 some stops startup, naming the missing ones.
 
@@ -425,8 +426,24 @@ those data types are skipped. Anyone connected before this must send
 (`health_points`), and your history is fetched in the background, a few weeks
 more each day, back three years. That is a lot of rows (minute-level heart rate
 alone is about 525,000 a year): see `plans/contracts.md` for the numbers, and
-note `athena backup` includes it. The model sees per-day totals and summaries,
-not the raw points; `health_summary` can be asked for just some `metrics`.
+note `athena backup` includes it. `health_summary` gives per-day totals and
+summaries and can be asked for just some `metrics`.
+
+The model reaches the raw points in three steps, as the question needs.
+`health_data_size` says how many points of each type there are, from when to
+when, and roughly how many bytes. `health_points(type, from, to)` returns a
+page of points (at most 500, about 56 KiB), for a workout or a night. For
+months of data, `health_export` builds a SQLite file in the conversation's
+sandbox (`/tmp/athena-data/health.sqlite`, tables `points` and `meta`, views
+`heart_rate`, `steps`, `weight`, `sleep`, `hrv`, `spo2`) straight from the
+database, so the points never pass through the model, which then queries the
+file with python3 or `run_code` (the sandbox has no `sqlite3` command). It is
+refused above 128 MiB of data (narrow the types or dates: minute-level heart
+rate passes that at about ten months), only runs when you ask in a message (not
+in a daily brief or reminder task), and the file is gone when the sandbox
+expires after 30 idle minutes. Points returned by `health_points` go to the
+model provider and are stored in the conversation, and an export puts your
+health history in a sandbox that has internet access: see Known limits.
 
 `athena telegram` syncs the last 14 days once a day, after 05:30 your time
 (`timezone_set`), and `health_sync_now` allows one more an hour. If Google
@@ -784,10 +801,11 @@ Caddy or Tailscale settings, and never overwrites a file holding secrets.
                        HTTP client, stream parser, quoting and the tools
     src/policy.rs      the tool-call argument-size hook
     src/search.rs      web_search: Exa's search API, when EXA_API_KEY is set
+    src/untrusted.rs   nonce markers and the size fit for untrusted tool results
     src/brief.rs       daily training brief: tools, due time, fixed prompt
     src/health.rs      Google Health: settings, token encryption, the pasted
                        callback; health/ has the Google client, the daily
-                       aggregation, the sync and the three tools
+                       aggregation, the sync, the tools and the raw-point export
     src/custom.rs      the owner's instructions file and skills; custom/ has
                        the front matter parser and the skills and read_skill
     src/user_skills.rs each user's own skills and their tools; user_skills/

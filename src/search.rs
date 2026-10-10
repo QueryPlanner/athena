@@ -12,8 +12,8 @@
 //! it is wrapped in markers carrying a fresh nonce, which a page cannot
 //! forge, and the result says to treat it as data.
 
-use crate::policy::MAX_RESULT_BYTES;
 use crate::sandbox::stream::split_at_boundary;
+use crate::untrusted::{fit, nonce};
 use reqwest::header::HeaderValue;
 use rig_agent::tool::{Tool, ToolContext, ToolExecutionError};
 use serde::Deserialize;
@@ -36,8 +36,6 @@ const MAX_FIELD_BYTES: usize = 800;
 /// The most of Exa's response that is read. Ten results with highlights are
 /// a few tens of KiB; this only stops an endless body.
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
-/// Room kept for the notice that says how much was left out.
-const NOTICE_BYTES: usize = 128;
 
 /// The `web_search` tool, holding the key.
 pub struct WebSearch {
@@ -204,7 +202,7 @@ impl Tool for WebSearch {
             .fetch(query, results)
             .await
             .map_err(ToolExecutionError::other)?;
-        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let nonce = nonce();
         render(query, &body, &nonce).map_err(ToolExecutionError::other)
     }
 }
@@ -275,22 +273,10 @@ fn render(query: &str, body: &Value, nonce: &str) -> Result<String, String> {
     Ok(fit(&head, &text, &tail))
 }
 
-/// `head`, `text` and `tail` in at most [`MAX_RESULT_BYTES`]: `text` is cut
-/// when it does not fit, and a notice says how much was left out.
-fn fit(head: &str, text: &str, tail: &str) -> String {
-    if head.len() + text.len() + tail.len() <= MAX_RESULT_BYTES {
-        return format!("{head}{text}{tail}");
-    }
-    let room = MAX_RESULT_BYTES - head.len() - tail.len() - NOTICE_BYTES;
-    let (kept, omitted) = split_at_boundary(text, room);
-    let notice = format!("\n[{omitted} bytes of results left out]\n");
-    debug_assert!(notice.len() <= NOTICE_BYTES);
-    format!("{head}{kept}{notice}{tail}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::MAX_RESULT_BYTES;
     use axum::http::{HeaderMap, StatusCode};
     use std::sync::{Arc, Mutex};
 
@@ -451,7 +437,7 @@ mod tests {
         let query = "q".repeat(MAX_QUERY_BYTES);
         let out = render(&query, &body, "n").unwrap();
         assert!(out.len() <= MAX_RESULT_BYTES, "{}", out.len());
-        let floor = MAX_RESULT_BYTES - NOTICE_BYTES - 8;
+        let floor = MAX_RESULT_BYTES - crate::untrusted::NOTICE_BYTES - 8;
         assert!(out.len() > floor, "{}", out.len());
         assert!(out.ends_with("<<<END_WEB_CONTENT n>>>"));
         let notice = out.lines().rev().nth(1).unwrap();

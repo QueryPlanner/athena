@@ -52,7 +52,7 @@ Rules for `serve` and `telegram`:
 | `CLOUDFLARE_ACCOUNT_ID` | telegram | Cloudflare account id (letters and digits). With `CLOUDFLARE_API_TOKEN`, voice notes and audio files are transcribed. **Both unset means voice notes are not prompts; only one set is a startup error.** |
 | `CLOUDFLARE_API_TOKEN` | telegram | Cloudflare API token with Workers AI access; a secret, sent only as `Authorization: Bearer` to the endpoint below |
 | `EXA_API_KEY` | agent | secret, optional. Exa API key, sent only to `https://api.exa.ai/search` as the `x-api-key` header (redirects not followed). **Unset or blank means the `web_search` tool is not registered**; its name stays reserved from MCP tools either way. Results are cut to `policy::MAX_RESULT_BYTES` by the tool itself and wrapped in nonce markers as untrusted web content. Typed into the env file by a human; not a deploy-gate setting. |
-| `GOOGLE_HEALTH_CLIENT_ID` | agent, telegram | Google OAuth client id (Blacki's, unchanged). With the next two, Google Health is on. **All three unset (or blank) means it is off: the three tools exist and say it is not set up, the Telegram commands say so. Some but not all set is a startup error that names the missing variables, never a value.** |
+| `GOOGLE_HEALTH_CLIENT_ID` | agent, telegram | Google OAuth client id (Blacki's, unchanged). With the next two, Google Health is on. **All three unset (or blank) means it is off: the six tools exist and say it is not set up, the Telegram commands say so. Some but not all set is a startup error that names the missing variables, never a value.** |
 | `GOOGLE_HEALTH_CLIENT_SECRET` | agent, telegram | secret. Sent only in the body of calls to `https://oauth2.googleapis.com/token`. Typed into the env file by a human. |
 | `GOOGLE_HEALTH_TOKEN_ENCRYPTION_KEY` | agent, telegram | secret. URL-safe base64 of exactly 32 bytes (Blacki's Fernet key has this form); the 32 bytes are the XChaCha20-Poly1305 key for the stored refresh token. Anything else is a startup error. Changing it makes stored tokens unreadable (those connections are marked `revoked`; the user reconnects). |
 | `GOOGLE_HEALTH_REDIRECT_URI` | agent, telegram | optional. The redirect URI registered with the Google OAuth client; default `http://127.0.0.1:8080/integrations/google-health/callback` (Blacki's). `https`, or `http` on `127.0.0.1` or `localhost`; no query or fragment. |
@@ -451,7 +451,7 @@ sandbox.
 
 Read-only sleep, activity, heart-rate and body data from the Google Health API
 (v4, the Fitbit successor), synced once a day per user into SQLite and read by
-the model through three tools. Ported from Blacki (`src/blacki/health/`),
+the model through six tools. Ported from Blacki (`src/blacki/health/`),
 which keeps the same environment variable names.
 
 **Schema** (migration 14, after `user_skills`, 13; `health_points` and `health_backfill` are migration 16, after the daily brief, 15). All keyed to `users.id`
@@ -516,8 +516,8 @@ which keeps the same environment variable names.
   a few hundred bytes with its index. Other minute types (steps, distance,
   energy, altitude, active minutes, SpO2) add a similar order each; ECG points
   carry their waveform (tens of KB each). Budget gigabytes for years of data
-  per user. A later change adds the tools that read it; the model does not see
-  this table today.
+  per user. The model reads it only through `health_data_size`,
+  `health_points` and `health_export` (below).
 - `health_backfill` (migration 16): `user_id`, `data_type`, `oldest_date` (the
   earliest local day fetched so far), `done`, `empty_run`, `last_error`,
   `updated_at`; key `(user_id, data_type)`. Reconnecting deletes the user's
@@ -663,8 +663,9 @@ time, so overlapping ticks and processes do not repeat a sync. A run that is
 slow does not delay the next tick; shutdown waits for it (each request has its
 own 30 s timeout).
 
-**Tools** (names in `health::NAMES`, always reserved and always registered with
-the other native tools; the owner is the session's user, no tool takes one):
+**Tools** (names in `health::NAMES`: the first three here and the three raw
+point tools below, always reserved and always registered with the other native
+tools; the owner is the session's user, no tool takes one):
 
 - `health_status()`: `configured`, `status` (`not_connected`, `connected`,
   `revoked`), `connected_at`, `last_synced_at` (local time), `last_sync_error`,
@@ -687,6 +688,113 @@ the other native tools; the owner is the session's user, no tool takes one):
 
 What `health_summary` returns is personal health data: it goes to the model
 provider and is stored in the session like any tool result.
+
+**Raw point tools** (`health::data`, `health::export`; all three act for the
+session's owner and filter every query by `user_id`; none takes a user).
+`from` and `to` are inclusive civil dates `YYYY-MM-DD` with the same meaning as
+`health_summary`'s days (the `civil_date` column); `from` after `to`, or a
+malformed date, is an error. `types` are names from `health::catalog::SPECS`
+(the 40 kebab-case data types, never taken from `SELECT DISTINCT`); an unknown
+name is an error listing the valid ones; absent or empty means all. A date
+window is turned into an indexed `start_ms` band in the owner's *current*
+zone, widened by 2 days on each side (`store::health_data::BAND_DAYS`: the
+zone can have changed since the point was synced), and `civil_date` then
+decides exactly. Rows with a NULL `civil_date` appear only when no date is
+given; rows with a NULL `start_ms` are found by `civil_date` alone.
+
+- `health_data_size(types?, from?, to?)`: per type with points: `rows`,
+  `first` and `last` (local time of the earliest and latest `start_ms`, from
+  the index) with `first_date` and `last_date`, `approx_bytes` (rows times the
+  mean stored value size over a sample of at most 500 points, never a SUM over
+  the table), and `types_without_points`, `total_rows`, `approx_total_bytes`.
+  One short store query at a time.
+- `health_points(type, from?, to?, limit?, cursor?)`: `limit` 1 to 500
+  (default 100). Order is `start_ms`, then `id`, points with no `start_ms`
+  last (by `id`): the index order, so no sort. Each point is `{start, end,
+  date, source, value}` with times in the owner's zone and `value` the *parsed*
+  JSON of the type's own field (`catalog` `field`), without Google's `name` and
+  `dataSource`. For `electrocardiogram` every array longer than 64 items is
+  replaced by `{"samples_omitted": n}` and every string over 4096 bytes by
+  `{"samples_omitted_bytes": n}` (JSON is never cut mid-string); any other
+  value over 16 KiB is `{"omitted_bytes": n}`. The points JSON is at most 56
+  KiB (`data::ROWS_BYTES`, under the 64 KiB tool-result policy): a page stops
+  before the point that would pass it and returns `next_cursor`. One page
+  reads at most 2 MiB of stored values. `next_cursor` is opaque (URL-safe
+  base64 of `{t: type, f: from, to, s: last start_ms or null, i: last id}`);
+  passing it with a different type, from or to, or a malformed one, is an
+  error. The result says that points a sync changes between pages (an upsert
+  keeps the row's `id` but can change `start_ms` and `civil_date`) can repeat
+  or be skipped. When the byte limit stops a page the last point may be the
+  last one, so a final page can come back empty with no cursor.
+  The result is text: a header, the points JSON between `<<<HEALTH_DATA
+  <nonce>>>>` and `<<<END_HEALTH_DATA <nonce>>>>` markers (fresh 32-hex nonce
+  per result, `untrusted::nonce`), and after the end marker a line with
+  `returned` and `next_cursor`. The header says the content is untrusted data
+  (values include text the user typed: food names, notes, moods), as
+  `web_search` does; both use `untrusted::fit` to stay within
+  `policy::MAX_RESULT_BYTES`. Like `health_summary`, the result goes to the
+  model provider and is stored in the session.
+- `health_export(types?, from?, to?)`: builds a SQLite file in the session's
+  sandbox. Refused (error, nothing read) when the turn's `UserText` is empty
+  or absent (scheduled turns: the daily brief and `agent_task`; follows
+  `reminder_confirm`), when there is no sandbox (`OPEN_SANDBOX_URL` unset: the
+  tool is still registered), when no points match, and when the stored size
+  estimate (`approx_bytes` summed) is over 128 MiB
+  (`data::MAX_EXPORT_BYTES`; also checked against the bytes actually uploaded).
+  Minute-level heart rate alone passes 128 MiB at about 10 months, so a full
+  history needs narrower `types` or dates.
+  - Transport: points are read in batches by `id` (`WHERE user_id = ? [AND
+    data_type IN (...)] [window] AND id > ? ORDER BY id LIMIT n`, `NOT
+    INDEXED` so the planner walks the table by `id` instead of sorting per
+    batch) of at most 2000 points and 2 MiB of stored values
+    (`export::BATCH_ROWS`, `BATCH_BYTES`), each batch one short store call,
+    the connection free between batches. Each batch is projected as above and
+    appended to NDJSON, `{"t": type, "k": point_key, "s": start_ms, "e":
+    end_ms, "d": civil_date, "src": source, "v": projected value}` per line.
+    At 4 MiB (`export::CHUNK_BYTES`) the chunk is uploaded with
+    `Sandboxes::write_file` to `/tmp/athena-data/.export-<nonce>/chunk-NNNNN.ndjson`.
+    `write_file` buffers the body and each upload has the sandbox client's 30 s
+    request timeout, so 4 MiB needs at least 1.1 Mbit/s. Host memory is one
+    chunk plus one batch; nothing touches the host's disk.
+  - Before the chunks: `mkdir -p <dir> && chmod 700 /tmp/athena-data <dir>`
+    (`Sandboxes::command`), then `load.py` (`src/health/export_loader.py`,
+    `include_str!`, standard library only) and `meta.json` are uploaded to
+    `<dir>`. After: `python3 <dir>/load.py <dir> /tmp/athena-data/health.sqlite`
+    (`export::DB_PATH`, 15 minute limit). The loader builds
+    `<dir>/health.sqlite.tmp` (inside the nonce directory, so two exports in
+    one session cannot collide), indexes it, chmods it 0600, `os.replace`s it
+    onto the destination (atomic), removes `<dir>`, and prints one JSON line
+    `{"rows": {type: n}, "bytes": n}`. On failure it exits 1 with the reason
+    on stderr, leaves the destination alone and removes `<dir>`; the host also
+    `rm -rf`s `<dir>` when any step fails.
+  - Schema: `points(data_type, point_key, start_ms, end_ms, civil_date,
+    source, value TEXT)` with `UNIQUE (data_type, point_key)` written with
+    `INSERT OR REPLACE`, indexes `(data_type, civil_date)` and `(data_type,
+    start_ms)`; `meta(key, value)` with `exported_at`, `zone`, `types`,
+    `from`, `to` and `rows`; views `heart_rate(start_ms, civil_date, source,
+    bpm)`, `steps(.., count)`, `weight(.., kg)`, `sleep(start_ms, end_ms, ..,
+    minutes)`, `hrv(.., rmssd_ms)` and `spo2(.., percent)` over `heart-rate`
+    (`beatsPerMinute`), `steps` (`count`), `weight` (`weightGrams`/1000),
+    `sleep` (`summary.minutesAsleep`, else the interval), `heart-rate-variability`
+    (`rootMeanSquareOfSuccessiveDifferencesMilliseconds`) and
+    `oxygen-saturation` (`percentage`), each cast to a number because Google
+    sends 64-bit integers as strings. `export::schema()` is the copy of this
+    that the result carries; a test compares it with the loader's real schema.
+  - Result: never a value. `path`, `rows` per type, `total_rows`,
+    `file_bytes`, `from`, `to`, `timezone`, `tables`, `views`, `columns`,
+    `meta`, `how_to_query` (there is no `sqlite3` CLI in the image; use
+    `python3 -c "import sqlite3 ..."` or `run_code`; loading all raw JSON into
+    pandas can exhaust the sandbox's 1 GiB), `expires` (the file lives only in
+    that session's sandbox, deleted after 30 idle minutes) and a `privacy`
+    note.
+  - Exfiltration note: `health_export` puts the user's whole health history
+    in a sandbox that runs as root with internet egress and that any tailnet
+    device able to reach OpenSandbox can read, until the sandbox expires.
+    That is why it needs a typed user message, is refused on scheduled turns,
+    and is described to the model as "only when the user asked". It does not
+    stop prompt injection in a page the model reads in the same session from
+    asking the model to send the file; the preamble and the sandbox's
+    accepted-risk note (`sandbox.rs`) apply.
 
 **Telegram.** `/connect_health` and `/disconnect_health` (private chat only,
 like every command), both in the command menu. Disconnecting asks Google to
@@ -807,6 +915,7 @@ two within 24 h; east: one skipped) since the claim is by local date.
 | Name | Value | Owner |
 |---|---|---|
 | Inbox in each sandbox | `/tmp/athena-inbox/<8 hex>-<safe name>` (`sandbox::INBOX_DIR`) | `Sandboxes::stage` |
+| Health export in each sandbox | `/tmp/athena-data/health.sqlite` (`health::export::DB_PATH`), built through `/tmp/athena-data/.export-<nonce>/` (chunks, `load.py`, `meta.json`; removed when done) | `health_export` |
 | Browser state in each sandbox | `/tmp/athena-browser-state.json` (`sandbox::login::STATE_PATH`), agent-browser `state save` JSON | `sandbox::login` |
 | Sign-in page screenshot | `/tmp/athena-viewer.png` (`sandbox::login::SCREEN_PATH`) | `Sandboxes::screen` |
 | Sign-in tables | `browser_links(token, session_id, url, expires_at)`, links valid 1 h; `browser_states(user_id, state, saved_at)`, one per user | `store.rs` migration 6 |

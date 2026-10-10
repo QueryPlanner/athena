@@ -73,7 +73,12 @@ impl FakeSandbox {
             startup: Mutex::new(vec!["Running".into()]),
             ..Default::default()
         });
-        let app = Router::new().fallback(handle).with_state(inner.clone());
+        // Uploads are whole chunks of an export, several MiB: axum's default
+        // 2 MiB limit on the multipart body would refuse them.
+        let app = Router::new()
+            .fallback(handle)
+            .layer(axum::extract::DefaultBodyLimit::disable())
+            .with_state(inner.clone());
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
